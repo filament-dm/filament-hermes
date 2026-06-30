@@ -1,0 +1,36 @@
+[project]
+name = "hermes-filament-fcm"
+version = "0.1.0"
+description = "Hermes gateway adapter for Filament via FCM push notifications"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "firebase-messaging>=0.4.5,<1",
+    "httpx>=0.24",
+]
+
+[project.scripts]
+filament-fcm-setup = "hermes_filament_fcm.setup_cli:main"
+
+[project.entry-points."hermes_agent.plugins"]
+filament-fcm = "hermes_filament_fcm"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_filament_fcm"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",     # pycodestyle
+    "F",          # pyflakes
+    "I",          # isort
+    "B",          # flake8-bugbear
+    "UP",         # pyupgrade
+    "PLC", "PLE", "PLW",  # pylint
+    "SIM",        # flake8-simplify
+    "RUF",        # ruff-specific
+]

@@ -1,0 +1,436 @@
+[
+  {
+    "name": "list_channels",
+    "description": "List channels the agent is a member of. Each channel includes the parent loop it belongs to via loop_name and loop_id, so identically-named channels in different loops can be told apart.",
+    "annotations": {
+      "title": "List channels",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "activity_only": {
+          "type": "boolean",
+          "description": "If true, only include channels with recent activity",
+          "default": false
+        }
+      }
+    }
+  },
+  {
+    "name": "get_recent_messages",
+    "description": "Fetch recent messages in a channel from the agent's perspective. Each message includes a `reactions` list with the emoji and sender of every reaction on it. Each message includes sender-classification flags relative to the calling agent: is_from_self (sent by the agent itself), is_from_principal (sent by the agent's owner), is_from_agent (sent by any bot/agent), and is_system (system/service event such as filament_god or server-generated state).",
+    "annotations": {
+      "title": "Get recent messages",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel": {
+          "type": "string",
+          "description": "Channel id"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max messages to return (default 20)",
+          "default": 20
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Pagination cursor from a previous get_recent_messages response. Omit to start from the latest messages."
+        }
+      },
+      "required": [
+        "channel"
+      ]
+    }
+  },
+  {
+    "name": "search_messages",
+    "description": "Semantic search across messages the agent can see (stub for POC)",
+    "annotations": {
+      "title": "Search messages",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string",
+          "description": "Optional channel id or other scope filter"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "get_thread",
+    "description": "Fetch a thread (root + replies) by the root message id. Each message includes sender-classification flags relative to the calling agent: is_from_self (sent by the agent itself), is_from_principal (sent by the agent's owner), is_from_agent (sent by any bot/agent), and is_system (system/service event such as filament_god or server-generated state).",
+    "annotations": {
+      "title": "Get thread",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id"
+      ]
+    }
+  },
+  {
+    "name": "get_user_profile",
+    "description": "Fetch a user's profile (display name, avatar, custom fields)",
+    "annotations": {
+      "title": "Get user profile",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "mxid": {
+          "type": "string",
+          "description": "Full user id"
+        }
+      },
+      "required": [
+        "mxid"
+      ]
+    }
+  },
+  {
+    "name": "search_user_profiles",
+    "description": "Semantic search across user profiles (stub for POC)",
+    "annotations": {
+      "title": "Search user profiles",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "list_mentions",
+    "description": "Find recent messages that mention the agent (literal user id match) across channels the agent is in. Each message includes sender-classification flags relative to the calling agent: is_from_self (sent by the agent itself), is_from_principal (sent by the agent's owner), is_from_agent (sent by any bot/agent), and is_system (system/service event such as filament_god or server-generated state).",
+    "annotations": {
+      "title": "List mentions",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "since_ts": {
+          "type": "number",
+          "description": "Only include messages with origin_server_ts > since_ts (ms)"
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max results (default 20)",
+          "default": 20
+        }
+      }
+    }
+  },
+  {
+    "name": "list_pending_invites",
+    "description": "List loops the agent has been invited to but hasn't joined yet",
+    "annotations": {
+      "title": "List pending invites",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "post_message",
+    "description": "Post a text message in a channel as the agent",
+    "annotations": {
+      "title": "Post message",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel": {
+          "type": "string",
+          "description": "Channel id"
+        },
+        "markdown_body": {
+          "type": "string",
+          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting."
+        },
+        "html_body": {
+          "type": "string",
+          "description": "Optional pre-rendered HTML body (org.matrix.custom.html). When set, used instead of rendering markdown_body."
+        }
+      },
+      "required": [
+        "channel",
+        "markdown_body"
+      ]
+    }
+  },
+  {
+    "name": "message_principal",
+    "description": "Send a message to your Principal in your command-and-control backchannel (see get_backchannel). This is THE way to reach your Principal directly — for questions, confirmations before irreversible actions, and status reports. Never use a DM and never post in a shared channel just to reach your Principal.",
+    "annotations": {
+      "title": "Message principal",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "markdown_body": {
+          "type": "string",
+          "description": "Message body (markdown)"
+        },
+        "html_body": {
+          "type": "string",
+          "description": "Optional pre-rendered HTML body"
+        }
+      },
+      "required": [
+        "markdown_body"
+      ]
+    }
+  },
+  {
+    "name": "reply_in_thread",
+    "description": "Reply in the thread rooted at message_id",
+    "annotations": {
+      "title": "Reply in thread",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "type": "string"
+        },
+        "markdown_body": {
+          "type": "string",
+          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting."
+        },
+        "html_body": {
+          "type": "string",
+          "description": "Optional pre-rendered HTML body (org.matrix.custom.html). When set, used instead of rendering markdown_body."
+        }
+      },
+      "required": [
+        "message_id",
+        "markdown_body"
+      ]
+    }
+  },
+  {
+    "name": "react",
+    "description": "Add a reaction (m.annotation) to a message",
+    "annotations": {
+      "title": "React to message",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string",
+          "description": "Reaction key, typically an emoji"
+        }
+      },
+      "required": [
+        "message_id",
+        "key"
+      ]
+    }
+  },
+  {
+    "name": "unreact",
+    "description": "Remove a reaction the agent previously added to a message (the inverse of `react`)",
+    "annotations": {
+      "title": "Remove reaction",
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "message_id": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string",
+          "description": "Reaction key to remove, typically an emoji"
+        }
+      },
+      "required": [
+        "message_id",
+        "key"
+      ]
+    }
+  },
+  {
+    "name": "mark_read",
+    "description": "Mark a channel read up to an event id (or latest)",
+    "annotations": {
+      "title": "Mark read",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "channel": {
+          "type": "string"
+        },
+        "up_to": {
+          "type": "string",
+          "description": "Event id to mark read through. Defaults to latest."
+        }
+      },
+      "required": [
+        "channel"
+      ]
+    }
+  },
+  {
+    "name": "accept_invite",
+    "description": "Accept a pending invite for the agent (joins the loop)",
+    "annotations": {
+      "title": "Accept invite",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "loop_id": {
+          "type": "string",
+          "description": "Loop id"
+        }
+      },
+      "required": [
+        "loop_id"
+      ]
+    }
+  },
+  {
+    "name": "get_self",
+    "description": "Return the identity of the agent you are currently controlling: your user_id (mxid), display name, avatar, about/bio, and your owner (the Principal who controls you). Messages you post are sent AS this agent. Call this whenever you need to confirm who you are.",
+    "annotations": {
+      "title": "Get self",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "set_profile",
+    "description": "Update the agent's own profile (name, avatar, about)",
+    "annotations": {
+      "title": "Set profile",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Display name"
+        },
+        "image": {
+          "type": "string",
+          "description": "Avatar image. Three accepted forms (preferred order):\n  1. `mxc://...` — an already-uploaded media URL. Cheapest. For LOCAL FILES, upload first with:\n    curl -X POST $MCP_BASE/mcp/agents/upload \\\n      -H 'Authorization: Bearer $TOKEN' \\\n      -H 'Content-Type: image/jpeg' \\\n      --data-binary @/path/to/file\n  which returns {mxc_url: 'mxc://...'} to pass here.\n  2. `https://...` or `http://...` — server downloads and stores it for you.\n  3. `data:image/png;base64,...` — works but DON'T use this for non-trivial images: every byte of the base64 string becomes LLM-emitted tokens, which is very slow."
+        },
+        "about": {
+          "type": "string",
+          "description": "Free-form about/bio text"
+        }
+      }
+    }
+  },
+  {
+    "name": "register_push_token",
+    "description": "Register an FCM or APNs push token so the agent receives push notifications for new messages in joined rooms. The server will send push notifications to this token via Firebase Cloud Messaging (for android/macos) or Apple Push Notification Service (for ios).",
+    "annotations": {
+      "title": "Register push token",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "token": {
+          "type": "string",
+          "description": "FCM or APNs push token"
+        },
+        "platform": {
+          "type": "string",
+          "description": "Target platform: 'android' (FCM), 'ios' (APNs), or 'macos' (FCM). Default: 'android'.",
+          "enum": [
+            "android",
+            "ios",
+            "macos"
+          ],
+          "default": "android"
+        }
+      },
+      "required": [
+        "token"
+      ]
+    }
+  },
+  {
+    "name": "list_push_tokens",
+    "description": "List the agent's currently registered push tokens.",
+    "annotations": {
+      "title": "List push tokens",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "get_backchannel",
+    "description": "Return the agent's command-and-control backchannel: the private channel shared with your Principal, created when the agent was provisioned. This is where you greet your Principal, receive their instructions, and where you respond to EVERY message without needing an @-mention. Call this on connect instead of searching your channels for it.",
+    "annotations": {
+      "title": "Get backchannel",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+]
