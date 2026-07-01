@@ -860,7 +860,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         directly — no wake policy, no standing-instructions framing, full
         command authority."""
         body = self._strip_mention(msg.body) if msg.body else msg.body
-        thread_id = msg.thread_id or msg.event_id
+        # In the backchannel we default to replying on the main timeline: a
+        # top-level message (msg.thread_id is None) gets a normal channel reply,
+        # while a message the principal posted *inside* a thread keeps the reply
+        # in that thread. (Elsewhere/reactive turns still thread off the message.)
+        thread_id = msg.thread_id
         source = self.build_source(
             chat_id=msg.room_id,
             chat_name=msg.room_name,
