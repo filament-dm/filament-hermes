@@ -144,7 +144,7 @@ so Filament shows a single presence.
   slice by a deterministic zone rule (control process: backchannel + principal DMs; data
   process: other loops). The existing `_seen_events` dedup is per-process and won't
   coordinate across them — the partition must be deterministic, and only the claiming
-  process adds the 👀/✅ reactions.
+  process adds (and later removes) the 👀 reaction.
 - **Capability boundary = which tools each process registers** (in `register()`),
   independent of token scope. Ideally also mint a reduced-scope token for the data process
   if the agents-api supports it (defense in depth).
