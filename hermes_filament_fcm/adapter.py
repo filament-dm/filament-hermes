@@ -51,10 +51,10 @@ logger = logging.getLogger("gateway.filament_fcm")
 _DEFAULT_MCP_URL = "https://api.filament.dm/mcp/agents"
 _MAX_MESSAGE_LENGTH = 16000
 
-# Reactions the adapter adds to every handled turn (👀 on start, ✅ on
+# Reactions the adapter adds to every handled turn (👀 on start, removed on
 # complete). They must never be treated as wake triggers — otherwise the
 # agent's own processing reactions would re-wake it in an infinite loop.
-_PROCESSING_REACTIONS = ("👀", "✅")
+_PROCESSING_REACTIONS = ("👀",)
 
 # ENG-429: the JSON-RPC error code agents_mcp returns while an agent is reserved
 # but not finalized (connect token valid, account not created yet).
@@ -908,9 +908,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 "filament-fcm: duplicate reaction %s — skipping", reaction.event_id
             )
             return
-        # Never wake on our own reactions, nor on the 👀/✅ processing markers we
+        # Never wake on our own reactions, nor on the 👀 processing marker we
         # add to every handled turn — otherwise the agent would re-wake itself
-        # in an infinite loop if either were configured as a trigger.
+        # in an infinite loop if it were configured as a trigger.
         if self._user_id and reaction.sender == self._user_id:
             logger.info("filament-fcm: ignoring our own reaction %s", reaction.key)
             return
@@ -1017,11 +1017,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         current_zone.set("data")
         await self.handle_message(event)
 
-    # ── Processing lifecycle (👀 / ✅ reactions) ────────────────────
+    # ── Processing lifecycle (👀 reaction) ─────────────────────────
     # The gateway calls these hooks around the agent turn. We add an "eyes"
-    # reaction when the agent starts working on a message and a checkmark
-    # when the turn finishes (no redact tool available via MCP, so both
-    # reactions are additive and permanent).
+    # reaction when the agent starts working on a message and remove it when
+    # the turn finishes, so the 👀 marker is present only while in flight.
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         target = getattr(event, "message_id", None)
@@ -1039,6 +1038,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not target or not self._filament_api:
             return
         try:
-            await self._filament_api.react(message_id=target, key="✅")
+            await self._filament_api.unreact(message_id=target, key="👀")
         except Exception:
-            logger.debug("filament-fcm: failed to add ✅ reaction", exc_info=True)
+            logger.debug("filament-fcm: failed to remove 👀 reaction", exc_info=True)

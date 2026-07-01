@@ -270,6 +270,16 @@ class FilamentAPI:
             },
         )
 
+    async def unreact(self, message_id: str, key: str) -> dict[str, Any]:
+        """Remove a reaction the agent previously added to a message."""
+        return await self.call_tool(
+            "unreact",
+            {
+                "message_id": message_id,
+                "key": key,
+            },
+        )
+
     async def get_self(self) -> dict[str, Any]:
         """Get the authenticated agent's own profile (mxid, display name)."""
         return await self.call_tool("get_self", {})
