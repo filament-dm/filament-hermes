@@ -8,7 +8,7 @@ supposed to handle enabling it.
 This script:
   1. Adds 'filament-fcm' to plugins.enabled in config.yaml
   2. Runs the interactive setup (prompts for token, senders, URL)
-  3. Offers to restart the gateway
+  3. Restarts the gateway
 
 Usage:
     filament-fcm-setup
@@ -295,8 +295,8 @@ def _run_interactive_setup() -> bool:
     return True
 
 
-def _offer_restart() -> None:
-    """Offer to restart the gateway, launched DETACHED so setup can exit.
+def _restart_gateway() -> None:
+    """Restart the gateway immediately, launched DETACHED so setup can exit.
 
     When no service manager (systemd/launchd) is configured, ``hermes gateway
     restart`` runs the gateway in the FOREGROUND — it prints its banner and
@@ -307,9 +307,7 @@ def _offer_restart() -> None:
     in the background (logs go to ~/.hermes/logs/gateway.log). Under a service
     manager the command simply exits on its own, which is equally fine.
     """
-    if not prompt_yes_no("Restart the gateway now?", True):
-        print_info("Restart skipped. Run: hermes gateway restart")
-        return
+    print_info("Restarting the gateway...")
 
     try:
         subprocess.Popen(
@@ -367,7 +365,7 @@ def main() -> None:
     print()
 
     if ready:
-        _offer_restart()
+        _restart_gateway()
 
     print()
     print_info("Setup complete." if ready else "Setup incomplete.")
