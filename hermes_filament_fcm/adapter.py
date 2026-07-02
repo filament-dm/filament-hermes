@@ -43,7 +43,12 @@ from .fcm_client import (
     ReactionMessage,
 )
 from .filament_api import FilamentAPI
-from .reactive import InstructionsStore, WakePolicyStore, current_zone
+from .reactive import (
+    InstructionsStore,
+    WakePolicyStore,
+    current_zone,
+    is_system_sender,
+)
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
 logger = logging.getLogger("gateway.filament_fcm")
@@ -960,15 +965,35 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + the event data, framed so the data is acted upon
         per the instructions but never treated as instructions to the agent."""
-        instructions = self._instructions_store.read()
+        instructions = self._instructions_store.read_effective()
         # trigger is partly attacker-controlled (reaction.key), so sanitize it
         # before it goes into the trusted framing.
         safe_trigger = _sanitize_meta(trigger)
+        # A message wake authored by the local filament_god is a genuine system
+        # notice (membership/administrative). Mark it in the trusted framing so
+        # the standing instructions can suppress it without trusting the body —
+        # anything that merely *looks* like a membership notice but isn't marked
+        # carries the typist's own id and is handled by its content instead.
+        #
+        # filament_god authors exactly one kind of timeline message: the
+        # "X vouched for Y to join <loop>" announcement. Its other actions are
+        # state events, redactions, kicks, and power-level edits, none of which
+        # arrive as a reactive message wake. So marking every god-authored
+        # message wake as a system notice is safe today. If it ever gains a
+        # second timeline message that the principal WOULD want to see, gate
+        # this on the notice shape too, so the new one isn't suppressed.
+        is_system = data is not None and is_system_sender(sender, self._user_id)
         signal = (
             "[WAKE-UP SIGNAL]\n"
             f"channel: {_sanitize_meta(channel_name)} ({channel})\n"
             f"sender: {_sanitize_meta(sender_name)} ({sender})  tier: data\n"
-            f"trigger: {safe_trigger}"
+            + (
+                "system-notice: yes — automated membership/administrative "
+                "notice from the Filament service\n"
+                if is_system
+                else ""
+            )
+            + f"trigger: {safe_trigger}"
             + (f" on message {target_event_id}" if target_event_id else "")
         )
         # data is None for a reaction wake (no body); a message wake always
