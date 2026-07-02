@@ -337,7 +337,10 @@ class FilamentFCMClient:
         try:
             await self._push_client.start()
         except asyncio.CancelledError:
-            logger.info("FCM push listener cancelled")
+            # A cancelled start must propagate to the caller and must not arm
+            # death detection — the receiver was never up.
+            logger.info("FCM push listener start cancelled")
+            raise
         except Exception:
             logger.exception("FCM push listener error")
 
