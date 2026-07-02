@@ -270,15 +270,19 @@ class FilamentFCMClient:
         on_ping: Callable[[dict], Any] | None = None,
         on_invite: Callable[["InviteMessage"], Any] | None = None,
         on_reaction: Callable[["ReactionMessage"], Any] | None = None,
+        on_receiver_dead: Callable[[str], Any] | None = None,
     ) -> None:
         self._config = config
         self._on_message = on_message
         self._on_ping = on_ping
         self._on_invite = on_invite
         self._on_reaction = on_reaction
+        self._on_receiver_dead = on_receiver_dead
         self._credential_store = credentials
         self._push_client = None
         self._fcm_token: str | None = None
+        self._stopped = False
+        self._death_reported = False
 
     @property
     def fcm_token(self) -> str | None:
@@ -320,7 +324,7 @@ class FilamentFCMClient:
         return self._fcm_token
 
     async def start(self) -> None:
-        """Start listening for push notifications.
+        """Start listening for push notifications and arm death detection.
 
         The underlying library spawns internal asyncio tasks and returns.
         Call ``stop()`` to cancel them.
@@ -337,13 +341,51 @@ class FilamentFCMClient:
         except Exception:
             logger.exception("FCM push listener error")
 
+        self._watch_receiver_tasks()
+
     async def stop(self) -> None:
         """Stop the FCM push listener by cancelling its internal tasks."""
+        self._stopped = True
         if self._push_client is not None and hasattr(self._push_client, "tasks"):
             for task in self._push_client.tasks:
                 if not task.done():
                     task.cancel()
         logger.info("FCM push listener stopped")
+
+    # ── Death detection ────────────────────────────────────────────
+    #
+    # The library gives up in two ways, and both end at least one of its
+    # internal tasks: _terminate() (sequential-error abort, heartbeat
+    # loss, connect-retry exhaustion during a reset) cancels them all,
+    # while an INITIAL connect that exhausts its retries just ends the
+    # listen task — without _terminate(), leaving do_listen True and the
+    # monitor task sleeping forever. Neither state recovers on its own,
+    # so any internal task finishing before stop() means the receiver is
+    # no longer listening and the owner must be told.
+
+    def _watch_receiver_tasks(self) -> None:
+        """Attach done-callbacks that report receiver death upward."""
+        tasks = getattr(self._push_client, "tasks", None)
+        if not tasks:
+            logger.warning("filament-fcm: no push client tasks to watch")
+            return
+        for task in tasks:
+            task.add_done_callback(self._on_push_task_done)
+
+    def _on_push_task_done(self, task: asyncio.Task) -> None:
+        if self._stopped or self._death_reported:
+            return
+        self._death_reported = True
+        if task.cancelled():
+            detail = "internal task cancelled"
+        else:
+            exc = task.exception()
+            detail = (
+                f"internal task crashed: {exc!r}" if exc else "internal task exited"
+            )
+        logger.error("FCM push receiver died (%s)", detail)
+        if self._on_receiver_dead is not None:
+            self._on_receiver_dead(detail)
 
     # ── Dispatch table ─────────────────────────────────────────────
     #
