@@ -332,6 +332,10 @@ class FilamentFCMClient:
         if self._push_client is None:
             raise RuntimeError("Call checkin_or_register() before start()")
 
+        # A client restarted after stop() must detect deaths again.
+        self._stopped = False
+        self._death_reported = False
+
         logger.info("Starting FCM push listener")
 
         try:

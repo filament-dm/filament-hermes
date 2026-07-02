@@ -189,3 +189,22 @@ def test_no_callback_is_safe():
         await _settle()  # must not raise
 
     asyncio.run(scenario())
+
+
+def test_restart_after_stop_rearms_death_detection():
+    async def scenario():
+        deaths: list[str] = []
+        client = await _started_client(on_receiver_dead=deaths.append)
+        await client.stop()
+        await _settle()
+        assert deaths == []
+
+        # Restarting the same client must detect deaths again.
+        await client.checkin_or_register()
+        await client.start()
+        client._push_client.terminate()
+        await _settle()
+        assert len(deaths) == 1
+        await client.stop()
+
+    asyncio.run(scenario())
