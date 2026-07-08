@@ -29,7 +29,7 @@ from typing import Any, Callable, ClassVar
 
 from firebase_messaging import FcmPushClient, FcmRegisterConfig
 
-from .credentials import CredentialStore
+from .credentials import CredentialStore, ReceivedPersistentIds
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -277,6 +277,7 @@ class FilamentFCMClient:
         self._on_invite = on_invite
         self._on_reaction = on_reaction
         self._credential_store = credentials
+        self._received_ids = ReceivedPersistentIds(credentials)
         self._push_client = None
         self._fcm_token: str | None = None
 
@@ -306,11 +307,17 @@ class FilamentFCMClient:
         def on_notification(data: dict, persistent_id: str, obj: Any = None) -> None:
             self._handle_notification(data, persistent_id)
 
+        # Seed the client with the ids of pushes we've already received so
+        # the MCS login tells Google not to redeliver them. Without this,
+        # a push whose ack never flushed (e.g. the /restart that killed the
+        # previous gateway) is redelivered on every connect — and a
+        # redelivered /restart restarts the gateway in an infinite loop.
         self._push_client = FcmPushClient(
             callback=on_notification,
             fcm_config=fcm_config,
             credentials=saved_creds,
             credentials_updated_callback=on_credentials_updated,
+            received_persistent_ids=self._received_ids.ids,
         )
 
         self._fcm_token = await self._push_client.checkin_or_register()
@@ -376,6 +383,15 @@ class FilamentFCMClient:
             list(data.keys()) if isinstance(data, dict) else type(data).__name__,
             persistent_id,
         )
+
+        # Record the id (durably, before dispatch — handling this push may
+        # kill the process) and drop redeliveries we've already processed.
+        if not self._received_ids.record(persistent_id):
+            logger.info(
+                "filament-fcm: dropping already-processed push (persistent_id=%s)",
+                persistent_id,
+            )
+            return
 
         if not isinstance(data, dict):
             logger.warning("filament-fcm: unexpected notification type: %s", type(data))
