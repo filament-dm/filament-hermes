@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar
 
@@ -262,6 +263,11 @@ def _build_reaction(env: Envelope) -> "ReactionMessage | None":
 class FilamentFCMClient:
     """Manages FCM registration and message reception for a Filament agent."""
 
+    # How many recent persistent_ids to remember for redelivery dedup. The
+    # window only has to outlast a reconnect/restart burst; a redelivered
+    # message beyond it is re-processed (bounded memory over a false negative).
+    _MAX_SEEN_PERSISTENT_IDS: ClassVar[int] = 256
+
     def __init__(
         self,
         config: FCMConfig,
@@ -279,6 +285,13 @@ class FilamentFCMClient:
         self._credential_store = credentials
         self._push_client = None
         self._fcm_token: str | None = None
+        # Recently-processed persistent_ids, persisted through the credential
+        # store so redelivery dedup survives the restart a /restart triggers.
+        self._seen_persistent_ids: deque[str] = deque(
+            credentials.load_seen_persistent_ids(),
+            maxlen=self._MAX_SEEN_PERSISTENT_IDS,
+        )
+        self._seen_persistent_id_set: set[str] = set(self._seen_persistent_ids)
 
     @property
     def fcm_token(self) -> str | None:
@@ -364,6 +377,26 @@ class FilamentFCMClient:
         "io.filament.ping": "_dispatch_ping",
     }
 
+    def _is_redelivered(self, persistent_id: str) -> bool:
+        """Record ``persistent_id`` and report whether we had already seen it.
+
+        MCS redelivers an unacknowledged message with the same persistent_id
+        after a reconnect — including the ``/restart`` that tore the gateway
+        down before its ack flushed. The adapter's event-id dedup is in-memory
+        and resets on restart, so without a persisted guard a redelivered
+        ``/restart`` re-runs on every boot and the gateway loops. Recording the
+        id here — before the message is dispatched — means a message that
+        restarts the process is still remembered on the next boot and dropped.
+        """
+        if persistent_id in self._seen_persistent_id_set:
+            return True
+        self._seen_persistent_ids.append(persistent_id)  # deque evicts oldest
+        self._seen_persistent_id_set = set(self._seen_persistent_ids)
+        self._credential_store.save_seen_persistent_ids(
+            list(self._seen_persistent_ids)
+        )
+        return False
+
     def _handle_notification(self, data: dict, persistent_id: str) -> None:
         """Called by firebase-messaging when a push arrives.
 
@@ -376,6 +409,14 @@ class FilamentFCMClient:
             list(data.keys()) if isinstance(data, dict) else type(data).__name__,
             persistent_id,
         )
+
+        if persistent_id and self._is_redelivered(persistent_id):
+            logger.info(
+                "filament-fcm: skipping already-processed FCM message "
+                "(persistent_id=%s)",
+                persistent_id,
+            )
+            return
 
         if not isinstance(data, dict):
             logger.warning("filament-fcm: unexpected notification type: %s", type(data))

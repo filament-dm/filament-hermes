@@ -61,3 +61,20 @@ class CredentialStore:
     def save_fcm_credentials(self, creds: dict[str, Any]) -> None:
         """Persist FCM registration credentials."""
         self._write_json("fcm_credentials.json", creds)
+
+    def load_seen_persistent_ids(self) -> list[str]:
+        """Load the recently-processed FCM ``persistent_id`` list.
+
+        Persisted so message-level idempotency survives a gateway restart (an
+        MCS redelivery arrives in a fresh process). Returns oldest-first.
+        """
+        data = self._read_json("seen_persistent_ids.json")
+        if isinstance(data, dict):
+            ids = data.get("ids")
+            if isinstance(ids, list):
+                return [str(x) for x in ids]
+        return []
+
+    def save_seen_persistent_ids(self, ids: list[str]) -> None:
+        """Persist the recently-processed FCM ``persistent_id`` list."""
+        self._write_json("seen_persistent_ids.json", {"ids": list(ids)})
