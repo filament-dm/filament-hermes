@@ -93,8 +93,10 @@ export VIRTUAL_ENV="$VENV"
 export HERMES_HOME="$HERMES_HOME"
 PY="$VENV/bin/python"
 
-# uv ships with Hermes; fall back to one on PATH.
+# uv ships with Hermes: $HERMES_HOME/bin/uv on user installs, /usr/local/bin/uv
+# on Docker/cloud images. Fall back to one on PATH.
 UV="$HERMES_HOME/bin/uv"
+[ -x "$UV" ] || UV=/usr/local/bin/uv
 [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
 [ -n "$UV" ] || err "uv not found — install Hermes Agent first (expected $HERMES_HOME/bin/uv)."
 
