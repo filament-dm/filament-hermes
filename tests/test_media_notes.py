@@ -341,11 +341,12 @@ class _FakeDownloadAPI:
         self._error = error
         self.calls = []
 
-    async def download_media(self, mxc_url, timeout_ms=None):
+    async def download_media(self, mxc_url, dest, timeout_ms=None):
         self.calls.append(mxc_url)
         if self._error:
             raise RuntimeError("HTTP 502")
-        return self._data
+        Path(dest).write_bytes(self._data)
+        return len(self._data)
 
 
 def _run_download(api, args, tmp_path, monkeypatch):
@@ -410,11 +411,18 @@ def test_safe_filename():
 # ── FilamentAPI.download_media ───────────────────────────────────────
 
 
-class _FakeResponse:
-    def __init__(self, status_code=200, content=b"img", text=""):
+class _FakeStreamResponse:
+    def __init__(self, status_code=200, chunks=(b"img",), body=b""):
         self.status_code = status_code
-        self.content = content
-        self.text = text
+        self._chunks = chunks
+        self._body = body
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aread(self):
+        return self._body
 
 
 class _FakeHTTPClient:
@@ -422,9 +430,20 @@ class _FakeHTTPClient:
         self._response = response
         self.requests = []
 
-    async def get(self, url, params=None, headers=None, follow_redirects=False):
-        self.requests.append({"url": url, "params": params, "headers": headers})
-        return self._response
+    def stream(self, method, url, params=None, headers=None, follow_redirects=False):
+        self.requests.append(
+            {"method": method, "url": url, "params": params, "headers": headers}
+        )
+        response = self._response
+
+        class _CM:
+            async def __aenter__(self):
+                return response
+
+            async def __aexit__(self, *args):
+                return False
+
+        return _CM()
 
 
 def _api_with_fake_client(response):
@@ -435,24 +454,32 @@ def _api_with_fake_client(response):
     return api, client
 
 
-def test_api_download_media_sends_both_params():
+def test_api_download_media_streams_to_dest(tmp_path):
     """Current servers take mxc_url; older ones only understand mxc — both
-    are sent so one request works everywhere."""
-    api, client = _api_with_fake_client(_FakeResponse(content=b"pixels"))
-    data = asyncio.run(api.download_media("mxc://hs/abc"))
-    assert data == b"pixels"
+    are sent so one request works everywhere. The body is streamed to disk
+    chunk by chunk rather than buffered whole."""
+    api, client = _api_with_fake_client(_FakeStreamResponse(chunks=(b"pix", b"els")))
+    dest = tmp_path / "out.bin"
+    written = asyncio.run(api.download_media("mxc://hs/abc", str(dest)))
+    assert written == 6
+    assert dest.read_bytes() == b"pixels"
+    assert not dest.with_name("out.bin.part").exists()
     req = client.requests[0]
+    assert req["method"] == "GET"
     assert req["url"] == "https://hs.example/mcp/agents/media"
     assert req["params"]["mxc_url"] == "mxc://hs/abc"
     assert req["params"]["mxc"] == "mxc://hs/abc"
     assert req["headers"]["Authorization"] == "Bearer fmcp_test"
 
 
-def test_api_download_media_raises_on_error():
-    api, _ = _api_with_fake_client(_FakeResponse(status_code=401, text="nope"))
+def test_api_download_media_raises_on_error_and_leaves_no_file(tmp_path):
+    api, _ = _api_with_fake_client(_FakeStreamResponse(status_code=401, body=b"nope"))
+    dest = tmp_path / "out.bin"
     try:
-        asyncio.run(api.download_media("mxc://hs/abc"))
+        asyncio.run(api.download_media("mxc://hs/abc", str(dest)))
     except RuntimeError as exc:
         assert "401" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+    assert not dest.exists()
+    assert not dest.with_name("out.bin.part").exists()

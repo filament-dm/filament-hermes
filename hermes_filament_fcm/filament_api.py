@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -319,9 +320,9 @@ class FilamentAPI:
     # exposed in the LLM's tool list.
 
     async def download_media(
-        self, mxc_url: str, timeout_ms: int | None = None
-    ) -> bytes:
-        """GET /mcp/agents/media — fetch an attachment's raw bytes by mxc URL.
+        self, mxc_url: str, dest: str, timeout_ms: int | None = None
+    ) -> int:
+        """GET /mcp/agents/media — stream an attachment's raw bytes to *dest*.
 
         MCP tool results are JSON, so media bytes never flow through
         tools/call: the read tools (get_thread, get_recent_messages, ...)
@@ -330,23 +331,42 @@ class FilamentAPI:
         param on current servers; older deployments only understand ``mxc``,
         so both are sent.
 
-        Raises on any non-200 response.
+        The response is streamed to disk chunk by chunk (media can be a large
+        video/document — buffering it whole could spike the gateway's
+        memory), first into ``<dest>.part`` and renamed into place only on
+        success, so a failed download never leaves a truncated file at
+        *dest*. Returns the number of bytes written. Raises on any non-200
+        response.
         """
         url = self._mcp_url.rstrip("/") + "/media"
         params: dict[str, Any] = {"mxc_url": mxc_url, "mxc": mxc_url}
         if timeout_ms is not None:
             params["timeout_ms"] = timeout_ms
-        resp = await self._client_for_loop().get(
-            url,
-            params=params,
-            headers={"Authorization": f"Bearer {self._mcp_token}"},
-            follow_redirects=True,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"media download failed: HTTP {resp.status_code} {resp.text[:200]}"
-            )
-        return resp.content
+        tmp = f"{dest}.part"
+        written = 0
+        try:
+            async with self._client_for_loop().stream(
+                "GET",
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {self._mcp_token}"},
+                follow_redirects=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    detail = (await resp.aread())[:200]
+                    raise RuntimeError(
+                        f"media download failed: HTTP {resp.status_code} "
+                        f"{detail.decode(errors='replace')}"
+                    )
+                with open(tmp, "wb") as f:
+                    async for chunk in resp.aiter_bytes():
+                        f.write(chunk)
+                        written += len(chunk)
+            os.replace(tmp, dest)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+        return written
 
     async def heartbeat(self) -> None:
         """POST /mcp/agents/heartbeat — periodic keep-alive.
