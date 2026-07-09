@@ -95,6 +95,12 @@ class PushMessage:
     is_mention: bool  # server flagged this as an @-mention of the agent
     is_everyone_mention: bool  # @everyone / @here
     raw: dict  # the full PushPayload dict
+    # False when the payload carried no text content (branch.content == null).
+    # DirectPusher sends that for non-text messages — an image/file attachment
+    # without a caption arrives as content: null (ENG-603). The push never
+    # includes media details, so a False here tells the adapter to fetch the
+    # event via the agents API and describe any attachments to the agent.
+    has_content: bool = True
 
 
 @dataclass
@@ -199,10 +205,17 @@ def _build_push_message(env: Envelope) -> PushMessage | None:
         return None
 
     # Extract message body from branch.content (Filament payload format)
-    # or fall back to branch.body (legacy format).
+    # or fall back to branch.body (legacy format). content == null means a
+    # non-text message (e.g. an image/file with no caption): the push carries
+    # no media details at all (ENG-603), so flag it via has_content=False and
+    # let the adapter fetch the event's attachments from the agents API.
     content = branch.get("content")
+    has_content = True
     if isinstance(content, dict):
         body = content.get("text", content.get("body", ""))
+    elif "content" in branch and content is None:
+        body = ""
+        has_content = False
     else:
         body = branch.get("body", "")
 
@@ -219,6 +232,7 @@ def _build_push_message(env: Envelope) -> PushMessage | None:
         is_mention=bool(branch.get("is_mention_of_recipient", False)),
         is_everyone_mention=bool(branch.get("is_everyone_mention", False)),
         raw=env.payload,
+        has_content=has_content,
     )
 
 

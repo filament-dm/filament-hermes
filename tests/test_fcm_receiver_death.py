@@ -83,6 +83,12 @@ class _MemoryCredentials:
     def save_fcm_credentials(self, creds):
         pass
 
+    def load_received_persistent_ids(self):
+        return []
+
+    def save_received_persistent_ids(self, ids):
+        pass
+
 
 def _make_client(**kwargs):
     return fcm_client.FilamentFCMClient(

@@ -31,6 +31,7 @@ from typing import Any
 
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
 from .filament_api import FilamentAPI
+from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .reactive import InstructionsStore, WakePolicyStore, current_zone
 from .setup_cli import _enable_plugin, _run_interactive_setup
 
@@ -228,6 +229,12 @@ def register(ctx: Any) -> None:
             "'[rechat] re-shared by <user>; original author hidden'.\n"
             "- Replies, threads, and emoji reactions behave the way you'd "
             "expect.\n"
+            "- Messages can carry image/file attachments. You'll see them "
+            "as an '[attachment: ...]' note with the filename, type, and "
+            "mxc:// url (the 'media' block of get_thread / "
+            "get_recent_messages has the same details). Use the "
+            "download_media tool with that mxc url to save the file to "
+            "local disk, then work with it using your other tools.\n"
             "SENDING MESSAGES:\n"
             "Your replies to incoming messages are delivered "
             "automatically -- you do not need to call any tool to "
@@ -298,6 +305,20 @@ def register(ctx: Any) -> None:
         registered,
         skipped,
     )
+
+    # Media bytes never flow through MCP tools/call (results are JSON) — they
+    # come from the /mcp/agents/media side-channel. Register a local
+    # download_media tool wrapping it so the agent can save attachments to
+    # disk (ENG-603). If the server ever grows a tool by that name, it wins.
+    if all(t.get("name") != "download_media" for t in all_tools):
+        ctx.register_tool(
+            name="download_media",
+            toolset="filament",
+            schema=DOWNLOAD_MEDIA_SCHEMA,
+            handler=make_download_media_handler(api),
+            is_async=True,
+            description=DOWNLOAD_MEDIA_SCHEMA["description"],
+        )
 
     _register_reactive_tools(ctx)
 
