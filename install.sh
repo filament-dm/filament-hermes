@@ -194,12 +194,33 @@ S6_SVC="$(command -v s6-svc 2>/dev/null || true)"
 if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
   S6_SVC=/command/s6-svc
 fi
+
+# Restart a live service slot (control FIFO present); false if absent.
+restart_slot() {
+  [ -d "$1" ] && [ -p "$1/supervise/control" ] || return 1
+  info "Restarting supervised gateway ($(basename "$1")) so the plugin loads ..."
+  "$S6_SVC" -t "$1" || true
+}
+
 if [ -n "$S6_SVC" ]; then
-  for SVCDIR in /run/service/gateway-* /run/service/hermes-gateway-*; do
-    [ -d "$SVCDIR" ] || continue
-    # Only poke slots the supervisor has actually brought up.
-    [ -p "$SVCDIR/supervise/control" ] || continue
-    info "Restarting supervised gateway ($(basename "$SVCDIR")) so the plugin loads ..."
-    "$S6_SVC" -t "$SVCDIR" || true
+  # Each profile is an independent HERMES_HOME (the default profile at the
+  # root, named ones under <root>/profiles/<name>), and the wizard only
+  # configured this one — leave other profiles' gateways alone.
+  if [ "$(basename "$(dirname "$HERMES_HOME")")" = profiles ]; then
+    HERMES_PROFILE="$(basename "$HERMES_HOME")"
+  else
+    HERMES_PROFILE=default
+  fi
+
+  RESTARTED=0
+  for SVCDIR in "/run/service/gateway-$HERMES_PROFILE" "/run/service/hermes-gateway-$HERMES_PROFILE"; do
+    if restart_slot "$SVCDIR"; then RESTARTED=1; fi
   done
+  if [ "$RESTARTED" = 0 ]; then
+    # This provider names its slots differently — restart every live
+    # gateway rather than leave the plugin unloaded.
+    for SVCDIR in /run/service/gateway-* /run/service/hermes-gateway-*; do
+      restart_slot "$SVCDIR" || true
+    done
+  fi
 fi
