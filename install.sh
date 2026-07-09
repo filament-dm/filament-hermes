@@ -105,20 +105,27 @@ UV="$HERMES_HOME/bin/uv"
 # runtime installs to a writable dir it puts on sys.path at startup
 # (HERMES_LAZY_INSTALL_TARGET, e.g. /opt/data/lazy-packages). Install there
 # so the gateway can import the plugin after restart.
-SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+#
+# HERMES_DISABLE_LAZY_INSTALLS=1 (set by the image) also counts as sealed:
+# when running as root the writability test passes even though the venv
+# must not be mutated — writes would land in the container's image layer
+# and be lost on recreate.
+SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
 SEALED=0
-[ -w "$SITE" ] || SEALED=1
+if [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = "1" ] || { [ -n "$SITE" ] && [ ! -w "$SITE" ]; }; then
+  SEALED=1
+fi
 
 LAZY_TARGET="${HERMES_LAZY_INSTALL_TARGET:-}"
 TARGET_ARGS=()
 PYPATH_PREFIX=""
 if [ "$SEALED" = 1 ] && [ -n "$LAZY_TARGET" ]; then
   mkdir -p "$LAZY_TARGET"
-  info "Hermes venv at $VENV is read-only — installing hermes-filament-fcm into $LAZY_TARGET ..."
+  info "Hermes venv at $VENV is sealed — installing hermes-filament-fcm into $LAZY_TARGET ..."
   TARGET_ARGS=(--target "$LAZY_TARGET")
   PYPATH_PREFIX="$LAZY_TARGET"
 elif [ "$SEALED" = 1 ]; then
-  err "Hermes venv at $VENV is read-only and HERMES_LAZY_INSTALL_TARGET is not set — nowhere to install."
+  err "Hermes venv at $VENV is sealed (read-only or lazy installs disabled) and HERMES_LAZY_INSTALL_TARGET is not set — nowhere to install."
 else
   info "Installing hermes-filament-fcm into $VENV ..."
 fi
