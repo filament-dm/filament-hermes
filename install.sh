@@ -176,3 +176,30 @@ if [ -t 1 ] && [ -r /dev/tty ]; then
 else
   run_setup
 fi
+
+# --- Force a supervised restart ------------------------------------------
+# On Docker/cloud images the gateway runs under an s6 supervisor
+# (s6-supervise gateway-<profile>). The setup wizard's `hermes gateway
+# restart` can't reliably cycle it there: the wizard runs inside the
+# gateway's own process tree, so it can neither SIGTERM itself cleanly nor
+# reach the supervisor — s6 just keeps (or respawns) the OLD process, which
+# started before the plugin was installed and never loads the Filament
+# adapter. Ask the supervisor directly to bounce the service so the new
+# process picks up the plugin and the saved .env.
+#
+# s6-overlay keeps its binaries in /command, which is rarely on PATH.
+# -t sends SIGTERM and the supervisor respawns the service — the same
+# action as upstream's S6ServiceManager.restart. No-op outside s6 images.
+S6_SVC="$(command -v s6-svc 2>/dev/null || true)"
+if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
+  S6_SVC=/command/s6-svc
+fi
+if [ -n "$S6_SVC" ]; then
+  for SVCDIR in /run/service/gateway-* /run/service/hermes-gateway-*; do
+    [ -d "$SVCDIR" ] || continue
+    # Only poke slots the supervisor has actually brought up.
+    [ -p "$SVCDIR/supervise/control" ] || continue
+    info "Restarting supervised gateway ($(basename "$SVCDIR")) so the plugin loads ..."
+    "$S6_SVC" -t "$SVCDIR" || true
+  done
+fi
