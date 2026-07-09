@@ -24,6 +24,7 @@ HERMES_HOME_DEFAULTED=0
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 
 err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
 [ -n "${CONNECT_TOKEN:-}" ] || err \
@@ -195,11 +196,16 @@ if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
   S6_SVC=/command/s6-svc
 fi
 
-# Restart a live service slot (control FIFO present); false if absent.
+# Restart a live service slot. Returns false only when no live slot exists
+# (a control FIFO is absent) — that's what gates the caller's naming-mismatch
+# fallback. An s6-svc failure still counts as "slot found": falling back to
+# other profiles' slots can't fix it (same s6-svc, same permissions) and
+# would only bounce gateways the wizard never touched — so warn instead.
 restart_slot() {
   [ -d "$1" ] && [ -p "$1/supervise/control" ] || return 1
   info "Restarting supervised gateway ($(basename "$1")) so the plugin loads ..."
-  "$S6_SVC" -t "$1" || true
+  "$S6_SVC" -t "$1" \
+    || warn "could not restart $(basename "$1") — restart it manually: $S6_SVC -t $1"
 }
 
 if [ -n "$S6_SVC" ]; then
