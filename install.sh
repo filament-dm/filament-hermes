@@ -19,6 +19,8 @@
 set -euo pipefail
 
 REPO="${FILAMENT_FCM_REPO:-git+https://github.com/filament-dm/filament-hermes.git}"
+HERMES_HOME_DEFAULTED=0
+[ -n "${HERMES_HOME:-}" ] || HERMES_HOME_DEFAULTED=1
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 
 err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -78,6 +80,14 @@ fi
 Checked \$VIRTUAL_ENV, $HERMES_HOME/hermes-agent/venv, /usr/local/lib/hermes-agent/venv, \
 /opt/hermes/.venv, and the 'hermes' command on PATH. If your venv lives elsewhere, \
 re-run with VIRTUAL_ENV=/path/to/venv."
+
+# Docker/cloud images keep the data tree at /opt/data (the image sets
+# HERMES_HOME=/opt/data itself, so this only matters under a stripped
+# environment). $HOME/.hermes would be the wrong tree there — config.yaml
+# and .env must land where the supervised gateway reads them.
+if [ "$HERMES_HOME_DEFAULTED" = 1 ] && [ "$VENV" = /opt/hermes/.venv ] && [ -d /opt/data ]; then
+  HERMES_HOME=/opt/data
+fi
 
 export VIRTUAL_ENV="$VENV"
 export HERMES_HOME="$HERMES_HOME"
