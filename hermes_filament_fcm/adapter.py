@@ -91,6 +91,45 @@ def _sanitize_meta(value: str, limit: int = 80) -> str:
     return flat[:limit]
 
 
+def _summarize_media(media: Any) -> str | None:
+    """Render a message's attachment metadata as a bracketed note for the
+    agent, or None if there are no attachments.
+
+    Push payloads never include media (ENG-603): an uncaptioned image arrives
+    with content=null and a captioned one carries only the caption, so without
+    this note the agent has no idea an attachment exists. The metadata comes
+    from the get_thread tool; filenames are sender-controlled, so they're
+    sanitized before being placed in the note.
+    """
+    if not isinstance(media, list):
+        return None
+    items = []
+    for m in media:
+        if not isinstance(m, dict):
+            continue
+        name = _sanitize_meta(str(m.get("filename") or "unnamed"))
+        details = [
+            _sanitize_meta(str(v))
+            for v in (m.get("msgtype"), m.get("mimetype"))
+            if v
+        ]
+        width, height = m.get("width"), m.get("height")
+        if width and height:
+            details.append(f"{width}x{height}")
+        size = m.get("size")
+        if isinstance(size, int):
+            details.append(f"{size} bytes")
+        items.append(f"{name} ({', '.join(details)})" if details else name)
+    if not items:
+        return None
+    return (
+        "[attachment: "
+        + "; ".join(items)
+        + " — you can see attachment metadata only; media content is not "
+        "available through your tools yet]"
+    )
+
+
 class FCMFilamentAdapter(BasePlatformAdapter):
     """Filament gateway adapter using FCM push for message reception."""
 
@@ -218,6 +257,53 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             flags=re.IGNORECASE,
         )
         return body.strip()
+
+    async def _media_note(self, msg: PushMessage) -> str | None:
+        """Describe *msg*'s attachments, or None if it has none (ENG-603).
+
+        The push payload never carries media: an uncaptioned attachment
+        arrives as content=null (has_content False), and a captioned one is
+        indistinguishable from plain text. So for every message that reaches
+        the agent, fetch the event via get_thread and summarize any
+        attachments. When the payload had no content and the lookup can't
+        confirm media (fetch failed, or none found), fall back to a generic
+        non-text notice so the agent at least knows something arrived.
+        """
+        if msg.has_content and not (msg.body or "").strip():
+            return None  # genuinely empty text message — nothing to look up
+        note = None
+        try:
+            result = await self._filament_api.get_thread(msg.event_id)
+            data = self._filament_api.parse_tool_result(result)
+            target = None
+            if isinstance(data, dict):
+                root = data.get("root") or {}
+                if root.get("event_id") == msg.event_id:
+                    target = root
+                else:
+                    # The pushed message may be a reply inside the thread.
+                    for reply in data.get("replies") or []:
+                        if (
+                            isinstance(reply, dict)
+                            and reply.get("event_id") == msg.event_id
+                        ):
+                            target = reply
+                            break
+            if isinstance(target, dict):
+                note = _summarize_media(target.get("media"))
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not fetch media details for %s",
+                msg.event_id,
+                exc_info=True,
+            )
+        if note is None and not msg.has_content:
+            return (
+                "[non-text message — it may contain an attachment or other "
+                "rich content the push notification did not include; use "
+                "get_thread on this message id for details]"
+            )
+        return note
 
     # ── Control vs reactive plane ────────────────────────────────────
 
@@ -840,6 +926,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             return
 
+        # The push never includes attachments (ENG-603): describe any media on
+        # the event so the agent knows it exists. Only for admitted wakes, so
+        # skipped messages don't cost an API call.
+        data = self._strip_mention(msg.body or "")
+        media_note = await self._media_note(msg)
+        if media_note:
+            data = f"{data}\n{media_note}" if data else media_note
+
         await self._wake(
             channel=msg.room_id,
             channel_name=msg.room_name,
@@ -848,7 +942,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             trigger="message",
             # Always a string (never None) so a message — even an empty/
             # mention-only one — is never mistaken for a reaction in _wake.
-            data=self._strip_mention(msg.body or ""),
+            data=data,
             target_event_id=msg.event_id,
             thread_id=msg.thread_id or msg.event_id,
             raw=msg.raw,
@@ -859,6 +953,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         directly — no wake policy, no standing-instructions framing, full
         command authority."""
         body = self._strip_mention(msg.body) if msg.body else msg.body
+        # The push never includes attachments (ENG-603): describe any media on
+        # the event so the agent knows it exists (an uncaptioned image would
+        # otherwise arrive as an empty message).
+        media_note = await self._media_note(msg)
+        if media_note:
+            body = f"{body}\n{media_note}" if body else media_note
         # In the backchannel we default to replying on the main timeline: a
         # top-level message (msg.thread_id is None) gets a normal channel reply,
         # while a message the principal posted *inside* a thread keeps the reply

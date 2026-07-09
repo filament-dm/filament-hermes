@@ -260,6 +260,15 @@ class FilamentAPI:
             },
         )
 
+    async def get_thread(self, message_id: str) -> dict[str, Any]:
+        """Fetch a thread (root + replies) by message id.
+
+        Works for bare (non-threaded) messages too — the message comes back
+        as the root with no replies. Used to look up attachment metadata for
+        media messages, which push payloads never include (ENG-603).
+        """
+        return await self.call_tool("get_thread", {"message_id": message_id})
+
     async def react(self, message_id: str, key: str) -> dict[str, Any]:
         """Add a reaction (emoji) to a message."""
         return await self.call_tool(
