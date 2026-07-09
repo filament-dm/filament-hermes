@@ -268,9 +268,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         attachments. When the payload had no content and the lookup can't
         confirm media (fetch failed, or none found), fall back to a generic
         non-text notice so the agent at least knows something arrived.
+
+        The lookup runs even when the body is empty or whitespace-only: a
+        media message with a blank caption still carries a content dict
+        (has_content True), so skipping empty-body messages would drop its
+        attachment note.
         """
-        if msg.has_content and not (msg.body or "").strip():
-            return None  # genuinely empty text message — nothing to look up
         note = None
         try:
             result = await self._filament_api.get_thread(msg.event_id)

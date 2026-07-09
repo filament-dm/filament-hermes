@@ -292,11 +292,20 @@ def test_media_note_plain_text_returns_none():
     assert note is None
 
 
-def test_media_note_skips_fetch_for_empty_text_message():
+def test_media_note_blank_caption_still_finds_attachment():
+    """A media message with a whitespace-only caption has a content dict
+    (has_content True) and an empty body — the lookup must still run, or the
+    attachment would be dropped."""
+    api = _FakeAPI(thread={"root": {"event_id": "$evt", "media": _MEDIA}})
+    note = asyncio.run(_make_adapter(api)._media_note(_push_msg(body="  ")))
+    assert "photo.png" in note
+    assert api.calls == ["$evt"]
+
+
+def test_media_note_empty_text_without_media_returns_none():
     api = _FakeAPI(thread={"root": {"event_id": "$evt"}})
     note = asyncio.run(_make_adapter(api)._media_note(_push_msg(body="")))
     assert note is None
-    assert api.calls == []
 
 
 def test_media_note_contentless_fetch_failure_falls_back():
