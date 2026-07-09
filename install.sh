@@ -106,17 +106,25 @@ UV="$HERMES_HOME/bin/uv"
 # (HERMES_LAZY_INSTALL_TARGET, e.g. /opt/data/lazy-packages). Install there
 # so the gateway can import the plugin after restart.
 #
-# HERMES_DISABLE_LAZY_INSTALLS=1 (set by the image) also counts as sealed:
-# when running as root the writability test passes even though the venv
-# must not be mutated — writes would land in the container's image layer
-# and be lost on recreate.
+# The writability test alone can't be trusted here: as root it passes even
+# on the sealed image venv, and writes there land in the container's image
+# layer — lost on recreate. So /opt/hermes/.venv is sealed by definition,
+# and HERMES_DISABLE_LAZY_INSTALLS=1 (set by the image) counts as sealed
+# too, for hand-built variants at other paths.
 SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
 SEALED=0
-if [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = "1" ] || { [ -n "$SITE" ] && [ ! -w "$SITE" ]; }; then
+if [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = "1" ] || [ "$VENV" = /opt/hermes/.venv ] \
+    || { [ -n "$SITE" ] && [ ! -w "$SITE" ]; }; then
   SEALED=1
 fi
 
+# The image sets HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages; default
+# to that under a stripped environment. The supervised gateway activates the
+# dir from its own (image) environment, so packages installed there are seen.
 LAZY_TARGET="${HERMES_LAZY_INSTALL_TARGET:-}"
+if [ -z "$LAZY_TARGET" ] && [ "$VENV" = /opt/hermes/.venv ] && [ -d /opt/data ]; then
+  LAZY_TARGET=/opt/data/lazy-packages
+fi
 TARGET_ARGS=()
 PYPATH_PREFIX=""
 if [ "$SEALED" = 1 ] && [ -n "$LAZY_TARGET" ]; then
@@ -133,9 +141,16 @@ fi
 
 # Make `hermes` resolvable so the wizard's gateway-restart step works, without
 # shadowing an existing launcher (the Docker shim must stay first on PATH so
-# root `docker exec` sessions keep dropping privileges).
+# root `docker exec` sessions keep dropping privileges). When PATH is stripped
+# enough that even the shim is missing, put the shim dir ahead of $VENV/bin —
+# the raw venv entry point run as root would litter $HERMES_HOME with
+# root-owned files and break the supervised gateway.
 if ! command -v hermes >/dev/null 2>&1; then
-  export PATH="$HERMES_HOME/bin:$VENV/bin:$PATH"
+  HERMES_PATH_PREFIX="$HERMES_HOME/bin:$VENV/bin"
+  if [ "$VENV" = /opt/hermes/.venv ] && [ -x /opt/hermes/bin/hermes ]; then
+    HERMES_PATH_PREFIX="/opt/hermes/bin:$HERMES_PATH_PREFIX"
+  fi
+  export PATH="$HERMES_PATH_PREFIX:$PATH"
 fi
 
 info "Connecting to Filament ..."
