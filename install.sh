@@ -47,12 +47,15 @@ if [ -n "${VIRTUAL_ENV:-}" ]; then
     "VIRTUAL_ENV=$VIRTUAL_ENV doesn't look like a venv (no bin/python)."
   VENV="$VIRTUAL_ENV"
 else
-  for CANDIDATE in \
-    ${HERMES_INSTALL_DIR:+"$HERMES_INSTALL_DIR/venv"} \
-    "$HERMES_HOME/hermes-agent/venv" \
-    /usr/local/lib/hermes-agent/venv \
+  CANDIDATES=(
+    "$HERMES_HOME/hermes-agent/venv"
+    /usr/local/lib/hermes-agent/venv
     /opt/hermes/.venv
-  do
+  )
+  if [ -n "${HERMES_INSTALL_DIR:-}" ]; then
+    CANDIDATES=("$HERMES_INSTALL_DIR/venv" "${CANDIDATES[@]}")
+  fi
+  for CANDIDATE in "${CANDIDATES[@]}"; do
     if is_venv "$CANDIDATE"; then VENV="$CANDIDATE"; break; fi
   done
 fi
