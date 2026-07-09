@@ -119,14 +119,17 @@ def _summarize_media(media: Any) -> str | None:
         size = m.get("size")
         if isinstance(size, int):
             details.append(f"{size} bytes")
+        mxc = _sanitize_meta(str(m.get("mxc_url") or ""), limit=200)
+        if mxc:
+            details.append(mxc)
         items.append(f"{name} ({', '.join(details)})" if details else name)
     if not items:
         return None
     return (
         "[attachment: "
         + "; ".join(items)
-        + " — you can see attachment metadata only; media content is not "
-        "available through your tools yet]"
+        + " — use the download_media tool with the mxc:// url to save the "
+        "file to local disk]"
     )
 
 

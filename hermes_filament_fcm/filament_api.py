@@ -318,6 +318,36 @@ class FilamentAPI:
     # same bearer token but hit dedicated HTTP endpoints that are never
     # exposed in the LLM's tool list.
 
+    async def download_media(
+        self, mxc_url: str, timeout_ms: int | None = None
+    ) -> bytes:
+        """GET /mcp/agents/media — fetch an attachment's raw bytes by mxc URL.
+
+        MCP tool results are JSON, so media bytes never flow through
+        tools/call: the read tools (get_thread, get_recent_messages, ...)
+        surface an ``mxc_url`` reference in their ``media`` blocks and this
+        side-channel serves the content. ``mxc_url`` is the canonical query
+        param on current servers; older deployments only understand ``mxc``,
+        so both are sent.
+
+        Raises on any non-200 response.
+        """
+        url = self._mcp_url.rstrip("/") + "/media"
+        params: dict[str, Any] = {"mxc_url": mxc_url, "mxc": mxc_url}
+        if timeout_ms is not None:
+            params["timeout_ms"] = timeout_ms
+        resp = await self._client_for_loop().get(
+            url,
+            params=params,
+            headers={"Authorization": f"Bearer {self._mcp_token}"},
+            follow_redirects=True,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"media download failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        return resp.content
+
     async def heartbeat(self) -> None:
         """POST /mcp/agents/heartbeat — periodic keep-alive.
 

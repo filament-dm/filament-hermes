@@ -97,7 +97,14 @@ def _load_modules():
     pkg = types.ModuleType("hermes_filament_fcm")
     pkg.__path__ = [str(_PKG_DIR)]
     sys.modules["hermes_filament_fcm"] = pkg
-    for name in ("credentials", "fcm_client", "filament_api", "reactive", "adapter"):
+    for name in (
+        "credentials",
+        "fcm_client",
+        "filament_api",
+        "reactive",
+        "adapter",
+        "media_tool",
+    ):
         spec = importlib.util.spec_from_file_location(
             f"hermes_filament_fcm.{name}", _PKG_DIR / f"{name}.py"
         )
@@ -107,10 +114,11 @@ def _load_modules():
     return (
         sys.modules["hermes_filament_fcm.fcm_client"],
         sys.modules["hermes_filament_fcm.adapter"],
+        sys.modules["hermes_filament_fcm.media_tool"],
     )
 
 
-fcm_client, adapter = _load_modules()
+fcm_client, adapter, media_tool = _load_modules()
 
 
 # ── Payload parsing: has_content ─────────────────────────────────────
@@ -181,8 +189,10 @@ def test_summarize_media_formats_attachment():
             }
         ]
     )
-    assert note.startswith("[attachment: photo.png (m.image, image/png, 8x8, 75 bytes)")
-    assert "metadata only" in note
+    assert note.startswith(
+        "[attachment: photo.png (m.image, image/png, 8x8, 75 bytes, mxc://hs/abc)"
+    )
+    assert "download_media" in note
 
 
 def test_summarize_media_sanitizes_hostile_filename():
@@ -320,3 +330,129 @@ def test_media_note_text_fetch_failure_returns_none():
     api = _FakeAPI(error=True)
     note = asyncio.run(_make_adapter(api)._media_note(_push_msg(body="caption")))
     assert note is None
+
+
+# ── download_media tool ──────────────────────────────────────────────
+
+
+class _FakeDownloadAPI:
+    def __init__(self, data=b"bytes", error=False):
+        self._data = data
+        self._error = error
+        self.calls = []
+
+    async def download_media(self, mxc_url, timeout_ms=None):
+        self.calls.append(mxc_url)
+        if self._error:
+            raise RuntimeError("HTTP 502")
+        return self._data
+
+
+def _run_download(api, args, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    handler = media_tool.make_download_media_handler(api)
+    return json.loads(asyncio.run(handler(args)))
+
+
+def test_download_media_saves_file(tmp_path, monkeypatch):
+    api = _FakeDownloadAPI(data=b"\x89PNGdata")
+    result = _run_download(
+        api,
+        {"mxc_url": "mxc://hs/abc123", "filename": "photo.png"},
+        tmp_path,
+        monkeypatch,
+    )
+    assert result["ok"] is True
+    assert result["bytes"] == 8
+    saved = Path(result["path"])
+    assert saved.read_bytes() == b"\x89PNGdata"
+    assert saved.parent == tmp_path / "filament_media"
+    assert saved.name == "abc123-photo.png"
+    assert api.calls == ["mxc://hs/abc123"]
+
+
+def test_download_media_sanitizes_hostile_filename(tmp_path, monkeypatch):
+    api = _FakeDownloadAPI()
+    result = _run_download(
+        api,
+        {"mxc_url": "mxc://hs/abc", "filename": "../../etc/passwd"},
+        tmp_path,
+        monkeypatch,
+    )
+    saved = Path(result["path"])
+    assert saved.parent == tmp_path / "filament_media"
+    assert ".." not in saved.name
+    assert "/" not in saved.name
+
+
+def test_download_media_rejects_non_mxc_url(tmp_path, monkeypatch):
+    api = _FakeDownloadAPI()
+    result = _run_download(
+        api, {"mxc_url": "https://evil.example/x"}, tmp_path, monkeypatch
+    )
+    assert "error" in result
+    assert api.calls == []
+
+
+def test_download_media_reports_fetch_failure(tmp_path, monkeypatch):
+    api = _FakeDownloadAPI(error=True)
+    result = _run_download(api, {"mxc_url": "mxc://hs/abc"}, tmp_path, monkeypatch)
+    assert "download failed" in result["error"]
+
+
+def test_safe_filename():
+    assert media_tool._safe_filename("../../x.png") == "x.png"
+    assert media_tool._safe_filename(".hidden") == "hidden"
+    assert media_tool._safe_filename("a b\nc.png") == "a_b_c.png"
+    assert media_tool._safe_filename("") == ""
+
+
+# ── FilamentAPI.download_media ───────────────────────────────────────
+
+
+class _FakeResponse:
+    def __init__(self, status_code=200, content=b"img", text=""):
+        self.status_code = status_code
+        self.content = content
+        self.text = text
+
+
+class _FakeHTTPClient:
+    def __init__(self, response):
+        self._response = response
+        self.requests = []
+
+    async def get(self, url, params=None, headers=None, follow_redirects=False):
+        self.requests.append({"url": url, "params": params, "headers": headers})
+        return self._response
+
+
+def _api_with_fake_client(response):
+    fa_mod = sys.modules["hermes_filament_fcm.filament_api"]
+    api = fa_mod.FilamentAPI("https://hs.example/mcp/agents", "fmcp_test")
+    client = _FakeHTTPClient(response)
+    api._client_for_loop = lambda: client
+    return api, client
+
+
+def test_api_download_media_sends_both_params():
+    """Current servers take mxc_url; older ones only understand mxc — both
+    are sent so one request works everywhere."""
+    api, client = _api_with_fake_client(_FakeResponse(content=b"pixels"))
+    data = asyncio.run(api.download_media("mxc://hs/abc"))
+    assert data == b"pixels"
+    req = client.requests[0]
+    assert req["url"] == "https://hs.example/mcp/agents/media"
+    assert req["params"]["mxc_url"] == "mxc://hs/abc"
+    assert req["params"]["mxc"] == "mxc://hs/abc"
+    assert req["headers"]["Authorization"] == "Bearer fmcp_test"
+
+
+def test_api_download_media_raises_on_error():
+    api, _ = _api_with_fake_client(_FakeResponse(status_code=401, text="nope"))
+    try:
+        asyncio.run(api.download_media("mxc://hs/abc"))
+    except RuntimeError as exc:
+        assert "401" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
