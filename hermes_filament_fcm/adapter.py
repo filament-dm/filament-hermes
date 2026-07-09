@@ -264,6 +264,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     # failure) so we reconnect once the principal finishes setup
                     # in the app, then Stage 3 + the greet directive succeed.
                     self._set_fatal_error(
+                        "agent_reserved",
                         "Agent reserved but not finalized yet — waiting for the "
                         "principal to finish setup",
                         retryable=True,
@@ -290,7 +291,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return True
         except Exception:
             logger.exception("filament-fcm: unexpected error during connect")
-            self._set_fatal_error("Connection failed", retryable=True)
+            self._set_fatal_error("connect_failed", "Connection failed", retryable=True)
             return False
 
     async def _maybe_greet(self) -> None:
@@ -532,6 +533,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 on_ping=self._on_ping,
                 on_invite=self._on_invite,
                 on_reaction=self._on_reaction,
+                on_receiver_dead=self._on_fcm_receiver_dead,
             )
             fcm_token = await self._fcm_client.checkin_or_register()
             logger.info(
@@ -541,6 +543,27 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("filament-fcm: [Stage 2] FCM registration failed")
             return False
+
+    def _on_fcm_receiver_dead(self, detail: str) -> None:
+        """The FCM push receiver died and cannot come back on its own.
+
+        The library never recovers a receiver whose internal tasks have
+        ended (e.g. after a network/DNS outage exhausts its retries), so
+        the gateway would stay up — heartbeating, looking Connected — while
+        deaf to every push. Report a retryable fatal error instead: the
+        gateway's reconnect watcher tears this adapter down and rebuilds a
+        fresh one, re-running all connect stages — including push-token
+        registration, so a rotated FCM token is re-registered as a matter
+        of course.
+        """
+        self._set_fatal_error(
+            "fcm_receiver_dead",
+            f"FCM push receiver died ({detail}); reconnecting",
+            retryable=True,
+        )
+        self._schedule_async(
+            self._notify_fatal_error(), "receiver-death notification"
+        )
 
     async def _register_pusher(self) -> bool:
         """Stage 3: Register FCM token with the Filament server via MCP tool."""
@@ -593,38 +616,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         try:
             logger.info("filament-fcm: [Stage 4] starting FCM listener")
             # start() creates internal asyncio tasks and returns immediately.
+            # The client watches its own internal tasks and reports receiver
+            # death via on_receiver_dead (see _on_fcm_receiver_dead).
             await self._fcm_client.start()
-
-            # Monitor the library's internal tasks for crashes.
-            push_client = self._fcm_client._push_client
-            if push_client and hasattr(push_client, "tasks"):
-                for i, task in enumerate(push_client.tasks):
-
-                    def _on_task_done(t: asyncio.Task, idx: int = i) -> None:
-                        try:
-                            exc = t.exception()
-                            if exc:
-                                logger.error(
-                                    "filament-fcm: FCM internal task %d failed: %s",
-                                    idx,
-                                    exc,
-                                    exc_info=exc,
-                                )
-                        except asyncio.CancelledError:
-                            logger.info(
-                                "filament-fcm: FCM internal task %d cancelled", idx
-                            )
-
-                    task.add_done_callback(_on_task_done)
-                logger.info(
-                    "filament-fcm: [Stage 4] monitoring %d internal FCM tasks",
-                    len(push_client.tasks),
-                )
-            else:
-                logger.warning(
-                    "filament-fcm: [Stage 4] could not find "
-                    "internal FCM tasks to monitor"
-                )
 
             logger.info("filament-fcm: [Stage 4] FCM listener started")
 
