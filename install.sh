@@ -24,6 +24,7 @@ HERMES_HOME_DEFAULTED=0
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 
 err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
 [ -n "${CONNECT_TOKEN:-}" ] || err \
@@ -175,4 +176,57 @@ if [ -t 1 ] && [ -r /dev/tty ]; then
   run_setup < /dev/tty
 else
   run_setup
+fi
+
+# --- Force a supervised restart ------------------------------------------
+# On Docker/cloud images the gateway runs under an s6 supervisor
+# (s6-supervise gateway-<profile>). The setup wizard's `hermes gateway
+# restart` can't reliably cycle it there: the wizard runs inside the
+# gateway's own process tree, so it can neither SIGTERM itself cleanly nor
+# reach the supervisor — s6 just keeps (or respawns) the OLD process, which
+# started before the plugin was installed and never loads the Filament
+# adapter. Ask the supervisor directly to bounce the service so the new
+# process picks up the plugin and the saved .env.
+#
+# s6-overlay keeps its binaries in /command, which is rarely on PATH.
+# -t sends SIGTERM and the supervisor respawns the service — the same
+# action as upstream's S6ServiceManager.restart. No-op outside s6 images.
+S6_SVC="$(command -v s6-svc 2>/dev/null || true)"
+if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
+  S6_SVC=/command/s6-svc
+fi
+
+# Restart a live service slot. Returns false only when no live slot exists
+# (a control FIFO is absent) — that's what gates the caller's naming-mismatch
+# fallback. An s6-svc failure still counts as "slot found": falling back to
+# other profiles' slots can't fix it (same s6-svc, same permissions) and
+# would only bounce gateways the wizard never touched — so warn instead.
+restart_slot() {
+  [ -d "$1" ] && [ -p "$1/supervise/control" ] || return 1
+  info "Restarting supervised gateway ($(basename "$1")) so the plugin loads ..."
+  "$S6_SVC" -t "$1" \
+    || warn "could not restart $(basename "$1") — restart it manually: $S6_SVC -t $1"
+}
+
+if [ -n "$S6_SVC" ]; then
+  # Each profile is an independent HERMES_HOME (the default profile at the
+  # root, named ones under <root>/profiles/<name>), and the wizard only
+  # configured this one — leave other profiles' gateways alone.
+  if [ "$(basename "$(dirname "$HERMES_HOME")")" = profiles ]; then
+    HERMES_PROFILE="$(basename "$HERMES_HOME")"
+  else
+    HERMES_PROFILE=default
+  fi
+
+  RESTARTED=0
+  for SVCDIR in "/run/service/gateway-$HERMES_PROFILE" "/run/service/hermes-gateway-$HERMES_PROFILE"; do
+    if restart_slot "$SVCDIR"; then RESTARTED=1; fi
+  done
+  if [ "$RESTARTED" = 0 ]; then
+    # This provider names its slots differently — restart every live
+    # gateway rather than leave the plugin unloaded.
+    for SVCDIR in /run/service/gateway-* /run/service/hermes-gateway-*; do
+      restart_slot "$SVCDIR" || true
+    done
+  fi
 fi
