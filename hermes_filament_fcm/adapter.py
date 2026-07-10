@@ -748,7 +748,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             fcm_token = await self._fcm_client.checkin_or_register()
             logger.info(
-                "filament-fcm: [Stage 2] FCM registered (token: %s...)", fcm_token[:20]
+                "filament-fcm: [Stage 2] FCM registered "
+                "(token fingerprint: %s)",
+                fingerprint(fcm_token),
             )
             slog.info(
                 "filament_fcm.stage.complete",
@@ -983,6 +985,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         try:
             thread_id = (metadata or {}).get("thread_id") if metadata else None
+            slog.info(
+                "filament_fcm.send.start",
+                chat_id=chat_id,
+                thread_id=thread_id,
+                reply_to=reply_to,
+                content_length=len(content or ""),
+                content_snippet=snippet(content),
+            )
 
             if thread_id:
                 result = await self._filament_api.reply_in_thread(
@@ -996,16 +1006,34 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 )
 
             if isinstance(result, dict) and result.get("error"):
+                slog.warning(
+                    "filament_fcm.send.complete",
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    success=False,
+                    error=str(result["error"]),
+                )
                 return SendResult(
                     success=False,
                     error=str(result["error"]),
                     retryable=True,
                 )
 
+            slog.info(
+                "filament_fcm.send.complete",
+                chat_id=chat_id,
+                thread_id=thread_id,
+                success=True,
+            )
             return SendResult(success=True)
 
         except Exception as e:
             logger.exception("Failed to send message")
+            slog.exception(
+                "filament_fcm.send.failed",
+                chat_id=chat_id,
+                reply_to=reply_to,
+            )
             return SendResult(success=False, error=str(e), retryable=True)
 
     async def get_chat_info(self, chat_id: str) -> dict:

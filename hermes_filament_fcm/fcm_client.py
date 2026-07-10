@@ -464,8 +464,8 @@ class FilamentFCMClient:
                 self._push_client = client
                 self._fcm_token = token
                 logger.info(
-                    "FCM token: %s... (registered on attempt %s/%s)",
-                    token[:20],
+                    "FCM token fingerprint: %s (registered on attempt %s/%s)",
+                    fingerprint(token),
                     i,
                     attempts,
                 )
