@@ -30,7 +30,7 @@ from typing import Any, Callable, ClassVar
 from firebase_messaging import FcmPushClient, FcmRegisterConfig
 
 from .credentials import CredentialStore, ReceivedPersistentIds
-from .observability import fingerprint, get_logger, new_id, snippet
+from .observability import fingerprint, get_logger, new_id
 
 logger = logging.getLogger("gateway.filament_fcm")
 slog = get_logger()
@@ -797,10 +797,11 @@ class FilamentFCMClient:
         msg.push_receive_id = env.push_receive_id
         msg.fcm_client_id = env.fcm_client_id
         logger.info(
-            "Push from %s in %s: %s",
+            "Push from %s in %s (event=%s, branch_type=%s)",
             msg.sender_display_name or msg.sender,
             msg.room_name,
-            msg.body[:80] if msg.body else "(empty)",
+            msg.event_id,
+            msg.branch_type,
         )
         slog.info(
             "filament_fcm.message.dispatch",
@@ -814,6 +815,5 @@ class FilamentFCMClient:
             is_direct=msg.is_direct,
             is_mention=msg.is_mention,
             is_everyone_mention=msg.is_everyone_mention,
-            body_snippet=snippet(msg.body),
         )
         self._on_message(msg)

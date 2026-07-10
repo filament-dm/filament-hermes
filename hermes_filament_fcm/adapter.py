@@ -45,7 +45,7 @@ from .fcm_client import (
     VouchMessage,
 )
 from .filament_api import FilamentAPI
-from .observability import bound_context, fingerprint, get_logger, new_id, snippet
+from .observability import bound_context, fingerprint, get_logger, new_id
 from .reactive import (
     InstructionsStore,
     WakePolicyStore,
@@ -981,18 +981,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not self._filament_api:
             return SendResult(success=False, error="Not connected")
 
-        try:
-            thread_id = (metadata or {}).get("thread_id") if metadata else None
-            slog.info(
-                "filament_fcm.send.start",
-                chat_id=chat_id,
-                thread_id=thread_id,
-                reply_to=reply_to,
-                content_length=len(content or ""),
-                content_snippet=snippet(content),
-            )
+        with bound_context(call_origin="adapter_send"):
+            try:
+                thread_id = (metadata or {}).get("thread_id") if metadata else None
+                slog.info(
+                    "filament_fcm.send.start",
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    reply_to=reply_to,
+                    content_length=len(content or ""),
+                )
 
-            with bound_context(call_origin="adapter_send"):
                 if thread_id:
                     result = await self._filament_api.reply_in_thread(
                         message_id=thread_id,
@@ -1004,36 +1003,36 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         markdown_body=content,
                     )
 
-            if isinstance(result, dict) and result.get("error"):
-                slog.warning(
+                if isinstance(result, dict) and result.get("error"):
+                    slog.warning(
+                        "filament_fcm.send.complete",
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        success=False,
+                        error=str(result["error"]),
+                    )
+                    return SendResult(
+                        success=False,
+                        error=str(result["error"]),
+                        retryable=True,
+                    )
+
+                slog.info(
                     "filament_fcm.send.complete",
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    success=False,
-                    error=str(result["error"]),
+                    success=True,
                 )
-                return SendResult(
-                    success=False,
-                    error=str(result["error"]),
-                    retryable=True,
+                return SendResult(success=True)
+
+            except Exception as e:
+                logger.exception("Failed to send message")
+                slog.exception(
+                    "filament_fcm.send.failed",
+                    chat_id=chat_id,
+                    reply_to=reply_to,
                 )
-
-            slog.info(
-                "filament_fcm.send.complete",
-                chat_id=chat_id,
-                thread_id=thread_id,
-                success=True,
-            )
-            return SendResult(success=True)
-
-        except Exception as e:
-            logger.exception("Failed to send message")
-            slog.exception(
-                "filament_fcm.send.failed",
-                chat_id=chat_id,
-                reply_to=reply_to,
-            )
-            return SendResult(success=False, error=str(e), retryable=True)
+                return SendResult(success=False, error=str(e), retryable=True)
 
     async def get_chat_info(self, chat_id: str) -> dict:
         """Return metadata about a chat/room."""
@@ -1184,7 +1183,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=msg.thread_id,
             is_mention=msg.is_mention,
             is_everyone_mention=msg.is_everyone_mention,
-            body_snippet=snippet(msg.body),
         )
 
         if not self._is_new_event(msg.event_id):
@@ -1201,7 +1199,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             logger.info("filament-fcm: → CONTROL plane (backchannel %s)", msg.room_id)
             slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
             await self._handle_control_message(msg)
-            slog.info("filament_fcm.turn.complete", turn_id=turn_id, plane="control")
+            slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="control")
             return
 
         logger.info(
@@ -1261,7 +1259,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=msg.thread_id or msg.event_id,
             raw=msg.raw,
         )
-        slog.info("filament_fcm.turn.complete", turn_id=turn_id, plane="reactive")
+        slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     async def _handle_control_message(self, msg: PushMessage) -> None:
         """Backchannel (control plane): the principal commands the agent
@@ -1296,16 +1294,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             raw_message=msg.raw,
         )
         logger.info(
-            "Dispatching control message from %s: %s",
+            "Dispatching control message from %s (event=%s, room=%s)",
             msg.sender_display_name or msg.sender,
-            (msg.body or "(empty)")[:80] if msg.body else "(empty)",
+            msg.event_id,
+            msg.room_id,
         )
         slog.info(
             "filament_fcm.control.dispatch",
             event_id=msg.event_id,
             room_id=msg.room_id,
             thread_id=thread_id,
-            body_snippet=snippet(body),
         )
         # Mark this turn control-plane so set_instructions / set_wake_policy are
         # permitted (they refuse from reactive turns). ContextVar is task-local.
@@ -1422,7 +1420,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=reaction.thread_id or reaction.target_event_id,
             raw=reaction.raw,
         )
-        slog.info("filament_fcm.turn.complete", turn_id=turn_id, plane="reactive")
+        slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     async def _wake(
         self,

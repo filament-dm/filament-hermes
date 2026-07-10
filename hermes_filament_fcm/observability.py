@@ -69,16 +69,6 @@ def fingerprint(value: str | None, *, size: int = 12) -> str | None:
     return sha256(value.encode("utf-8")).hexdigest()[:size]
 
 
-def snippet(value: str | None, *, limit: int = 80) -> str | None:
-    """Bounded single-line text for debug logs."""
-    if value is None:
-        return None
-    flat = " ".join(str(value).split())
-    if len(flat) <= limit:
-        return flat
-    return flat[: limit - 1] + "…"
-
-
 _gateway_instance_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "filament_gateway_instance_id", default=None
 )
@@ -126,12 +116,12 @@ def current_context() -> dict[str, str]:
 def bound_context(**values: str | None) -> Iterator[None]:
     """Temporarily bind correlation fields to the current context/task."""
     tokens: list[tuple[contextvars.ContextVar[str | None], contextvars.Token]] = []
-    bind_values = {key: value for key, value in values.items() if value}
+    bind_values = {
+        key: value for key, value in values.items() if value and key in _CONTEXT_VARS
+    }
     try:
         for key, value in bind_values.items():
-            var = _CONTEXT_VARS.get(key)
-            if var is None:
-                continue
+            var = _CONTEXT_VARS[key]
             tokens.append((var, var.set(value)))
         structlog.contextvars.bind_contextvars(**bind_values)
         yield
