@@ -37,6 +37,7 @@ def _configure_structlog() -> None:
                     "fcm_client_id",
                     "push_receive_id",
                     "turn_id",
+                    "call_origin",
                     "trigger_event_id",
                     "persistent_id",
                 ],
@@ -93,6 +94,9 @@ _push_receive_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _turn_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "filament_turn_id", default=None
 )
+_call_origin: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "filament_call_origin", default=None
+)
 _trigger_event_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "filament_trigger_event_id", default=None
 )
@@ -107,6 +111,7 @@ _CONTEXT_VARS: dict[str, contextvars.ContextVar[str | None]] = {
     "fcm_client_id": _fcm_client_id,
     "push_receive_id": _push_receive_id,
     "turn_id": _turn_id,
+    "call_origin": _call_origin,
     "trigger_event_id": _trigger_event_id,
     "persistent_id": _persistent_id,
 }

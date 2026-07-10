@@ -32,6 +32,7 @@ from typing import Any
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
 from .filament_api import FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
+from .observability import bound_context
 from .reactive import InstructionsStore, WakePolicyStore, current_zone
 from .setup_cli import _enable_plugin, _run_interactive_setup
 
@@ -64,9 +65,7 @@ def _resolve_tools(mcp_url: str, mcp_token: str) -> list[dict]:
     if mcp_token:
         try:
             tools = FilamentAPI.fetch_tools(mcp_url, mcp_token)
-            logger.info(
-                "filament-fcm: fetched %d tools from MCP server", len(tools)
-            )
+            logger.info("filament-fcm: fetched %d tools from MCP server", len(tools))
             return tools
         except Exception as exc:
             logger.warning(
@@ -75,6 +74,7 @@ def _resolve_tools(mcp_url: str, mcp_token: str) -> list[dict]:
                 exc,
             )
     return _STATIC_TOOLS
+
 
 # Tools NOT exposed to the LLM.  Each entry documents why the tool is
 # blocked so the decision is auditable and reviewable.
@@ -101,7 +101,8 @@ def _make_tool_handler(tool_name: str, api: FilamentAPI):
 
     async def handler(args: dict, **kwargs: Any) -> str:
         try:
-            result = await api.call_tool(tool_name, args)
+            with bound_context(call_origin="tool_proxy"):
+                result = await api.call_tool(tool_name, args)
             parsed = api.parse_tool_result(result)
             return json.dumps(parsed, indent=2, default=str)
         except Exception as exc:
@@ -406,8 +407,10 @@ def _register_reactive_tools(ctx: Any) -> None:
         policy = args.get("policy")
         if not isinstance(policy, dict):
             return json.dumps(
-                {"error": "policy must be an object (trigger_emojis / "
-                          "reactive_wake / per_channel)."}
+                {
+                    "error": "policy must be an object (trigger_emojis / "
+                    "reactive_wake / per_channel)."
+                }
             )
         err = _wake_policy_error(policy)
         if err:

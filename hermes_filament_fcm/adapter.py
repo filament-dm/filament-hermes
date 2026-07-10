@@ -114,9 +114,7 @@ def _summarize_media(media: Any) -> str | None:
             continue
         name = _sanitize_meta(str(m.get("filename") or "unnamed"))
         details = [
-            _sanitize_meta(str(v))
-            for v in (m.get("msgtype"), m.get("mimetype"))
-            if v
+            _sanitize_meta(str(v)) for v in (m.get("msgtype"), m.get("mimetype")) if v
         ]
         width, height = m.get("width"), m.get("height")
         if width and height:
@@ -292,7 +290,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
         note = None
         try:
-            result = await self._filament_api.get_thread(msg.event_id)
+            with bound_context(call_origin="media_lookup"):
+                result = await self._filament_api.get_thread(msg.event_id)
             data = self._filament_api.parse_tool_result(result)
             target = None
             if isinstance(data, dict):
@@ -409,9 +408,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 return False
             if not await self._register_pusher():
                 logger.error("filament-fcm: Stage 3 (push token registration) failed")
-                slog.error(
-                    "filament_fcm.connect.stage_failed", stage="register_pusher"
-                )
+                slog.error("filament_fcm.connect.stage_failed", stage="register_pusher")
                 return False
             if not await self._start_listener():
                 logger.error("filament-fcm: Stage 4 (FCM listener) failed")
@@ -524,7 +521,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 self._filament_api._mcp_url,
             )
             slog.info("filament_fcm.stage.start", stage="initialize_api")
-            init = await self._filament_api.initialize()
+            with bound_context(call_origin="startup"):
+                init = await self._filament_api.initialize()
             logger.info("filament-fcm: [Stage 1] MCP session established")
             slog.info("filament_fcm.stage.complete", stage="initialize_api")
 
@@ -540,7 +538,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # principal's user ID (for the sender allowlist), and the
             # backchannel + owner so a first-contact hello has somewhere to go.
             try:
-                self_info = await self._filament_api.get_self()
+                with bound_context(call_origin="startup"):
+                    self_info = await self._filament_api.get_self()
                 if _is_not_finalized(self_info):
                     # ENG-429: reserved, not finalized yet — nothing exists to
                     # connect to. Tell the user once; connect() turns this into
@@ -572,9 +571,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                             "filament-fcm: get_self response missing "
                             "owner.user_id — cannot determine principal"
                         )
-                    logger.info(
-                        "filament-fcm: [Stage 1] principal is %s", principal_id
-                    )
+                    logger.info("filament-fcm: [Stage 1] principal is %s", principal_id)
                     slog.info(
                         "filament_fcm.identity.loaded",
                         agent_id=self._user_id,
@@ -663,7 +660,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not self._filament_api:
             return
         try:
-            result = await self._filament_api.list_pending_invites()
+            with bound_context(call_origin="startup"):
+                result = await self._filament_api.list_pending_invites()
             invites = self._filament_api.parse_tool_result(result)
             if not isinstance(invites, dict):
                 return
@@ -676,7 +674,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 if not loop_id:
                     continue
                 try:
-                    await self._filament_api.accept_invite(loop_id)
+                    with bound_context(call_origin="startup"):
+                        await self._filament_api.accept_invite(loop_id)
                     logger.info("filament-fcm: accepted invite to %s", loop_id)
                 except Exception:
                     logger.warning(
@@ -748,8 +747,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             fcm_token = await self._fcm_client.checkin_or_register()
             logger.info(
-                "filament-fcm: [Stage 2] FCM registered "
-                "(token fingerprint: %s)",
+                "filament-fcm: [Stage 2] FCM registered (token fingerprint: %s)",
                 fingerprint(fcm_token),
             )
             slog.info(
@@ -780,9 +778,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             f"FCM push receiver died ({detail}); reconnecting",
             retryable=True,
         )
-        self._schedule_async(
-            self._notify_fatal_error(), "receiver-death notification"
-        )
+        self._schedule_async(self._notify_fatal_error(), "receiver-death notification")
 
     async def _register_pusher(self) -> bool:
         """Stage 3: Register FCM token with the Filament server via MCP tool."""
@@ -803,10 +799,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 stage="register_pusher",
                 fcm_token_fingerprint=fingerprint(fcm_token),
             )
-            result = await self._filament_api.register_push_token(
-                token=fcm_token,
-                platform="android",
-            )
+            with bound_context(call_origin="startup"):
+                result = await self._filament_api.register_push_token(
+                    token=fcm_token,
+                    platform="android",
+                )
 
             # Check if the tool exists on the server.
             if isinstance(result, dict):
@@ -887,7 +884,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             if not self._filament_api:
                 continue
             try:
-                await self._filament_api.heartbeat()
+                with bound_context(call_origin="heartbeat"):
+                    await self._filament_api.heartbeat()
                 logger.debug("filament-fcm: presence heartbeat sent")
             except Exception:
                 logger.warning("filament-fcm: presence heartbeat failed", exc_info=True)
@@ -994,16 +992,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 content_snippet=snippet(content),
             )
 
-            if thread_id:
-                result = await self._filament_api.reply_in_thread(
-                    message_id=thread_id,
-                    markdown_body=content,
-                )
-            else:
-                result = await self._filament_api.post_message(
-                    channel=chat_id,
-                    markdown_body=content,
-                )
+            with bound_context(call_origin="adapter_send"):
+                if thread_id:
+                    result = await self._filament_api.reply_in_thread(
+                        message_id=thread_id,
+                        markdown_body=content,
+                    )
+                else:
+                    result = await self._filament_api.post_message(
+                        channel=chat_id,
+                        markdown_body=content,
+                    )
 
             if isinstance(result, dict) and result.get("error"):
                 slog.warning(
@@ -1056,7 +1055,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 logger.warning("filament-fcm: ping received but API not ready")
                 return
             try:
-                await self._filament_api.pong(nonce)
+                with bound_context(call_origin="ping_pong"):
+                    await self._filament_api.pong(nonce)
                 logger.info("filament-fcm: pong sent (nonce=%s)", nonce)
             except Exception:
                 logger.exception("filament-fcm: pong failed")
@@ -1075,7 +1075,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 logger.warning("filament-fcm: invite received but API not ready")
                 return
             try:
-                await self._filament_api.accept_invite(invite.room_id)
+                with bound_context(call_origin="invite_accept"):
+                    await self._filament_api.accept_invite(invite.room_id)
                 logger.info(
                     "filament-fcm: accepted invite to %s (%s) from %s",
                     invite.room_name or invite.room_id,
@@ -1149,9 +1150,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         ):
             await self._handle_push_message_turn(msg, turn_id)
 
-    async def _handle_push_message_turn(
-        self, msg: PushMessage, turn_id: str
-    ) -> None:
+    async def _handle_push_message_turn(self, msg: PushMessage, turn_id: str) -> None:
         """Route an incoming message: backchannel = control, else = reactive.
 
         Admission (who reaches the agent at all) is the gateway's job. Here we
@@ -1199,9 +1198,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return
 
         if self._is_control_channel(msg.room_id):
-            logger.info(
-                "filament-fcm: → CONTROL plane (backchannel %s)", msg.room_id
-            )
+            logger.info("filament-fcm: → CONTROL plane (backchannel %s)", msg.room_id)
             slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
             await self._handle_control_message(msg)
             slog.info("filament_fcm.turn.complete", turn_id=turn_id, plane="control")
@@ -1377,9 +1374,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             return
         if reaction.key in _PROCESSING_REACTIONS:
-            logger.info(
-                "filament-fcm: ignoring processing reaction %s", reaction.key
-            )
+            logger.info("filament-fcm: ignoring processing reaction %s", reaction.key)
             slog.info(
                 "filament_fcm.turn.skipped",
                 turn_id=turn_id,
@@ -1552,7 +1547,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 "filament_fcm.processing.start",
                 target_event_id=target,
             )
-            await self._filament_api.react(message_id=target, key="👀")
+            with bound_context(call_origin="processing_reaction"):
+                await self._filament_api.react(message_id=target, key="👀")
         except Exception:
             logger.debug("filament-fcm: failed to add 👀 reaction", exc_info=True)
             slog.debug(
@@ -1573,7 +1569,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 target_event_id=target,
                 outcome=str(outcome),
             )
-            await self._filament_api.unreact(message_id=target, key="👀")
+            with bound_context(call_origin="processing_reaction"):
+                await self._filament_api.unreact(message_id=target, key="👀")
         except Exception:
             logger.debug("filament-fcm: failed to remove 👀 reaction", exc_info=True)
             slog.debug(
