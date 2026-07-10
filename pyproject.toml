@@ -8,6 +8,13 @@ license-files = ["LICENSE"]
 dependencies = [
     "firebase-messaging>=0.4.5,<1",
     "httpx>=0.24",
+    "structlog==25.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
 ]
 
 [project.scripts]

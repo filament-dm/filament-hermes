@@ -15,8 +15,10 @@ from typing import Any
 import httpx
 
 from ._version import DIST_NAME, PLUGIN_VERSION, version_headers
+from .observability import Stopwatch, current_context, get_logger
 
 logger = logging.getLogger("gateway.filament_fcm")
+slog = get_logger()
 
 # Standard MCP initialize params. clientInfo tells the server exactly what
 # plugin version this agent runs (the same version also rides on every
@@ -383,6 +385,14 @@ class FilamentAPI:
             params["timeout_ms"] = timeout_ms
         tmp = f"{dest}.part"
         written = 0
+        timer = Stopwatch.start()
+        slog.debug(
+            "filament_fcm.http.side_channel.start",
+            **current_context(),
+            path="/media",
+            method="GET",
+            timeout_ms=timeout_ms,
+        )
         try:
             async with self._client_for_loop().stream(
                 "GET",
@@ -393,6 +403,15 @@ class FilamentAPI:
             ) as resp:
                 if resp.status_code != 200:
                     detail = (await resp.aread())[:200]
+                    slog.warning(
+                        "filament_fcm.http.side_channel.complete",
+                        **current_context(),
+                        path="/media",
+                        method="GET",
+                        http_status=resp.status_code,
+                        duration_ms=timer.elapsed_ms(),
+                        bytes_written=written,
+                    )
                     raise RuntimeError(
                         f"media download failed: HTTP {resp.status_code} "
                         f"{detail.decode(errors='replace')}"
@@ -402,6 +421,15 @@ class FilamentAPI:
                         f.write(chunk)
                         written += len(chunk)
             os.replace(tmp, dest)
+            slog.debug(
+                "filament_fcm.http.side_channel.complete",
+                **current_context(),
+                path="/media",
+                method="GET",
+                http_status=200,
+                duration_ms=timer.elapsed_ms(),
+                bytes_written=written,
+            )
         finally:
             with contextlib.suppress(OSError):
                 os.remove(tmp)
@@ -434,10 +462,26 @@ class FilamentAPI:
         if body is not None:
             headers["Content-Type"] = "application/json"
             content = json.dumps(body)
+        timer = Stopwatch.start()
+        slog.debug(
+            "filament_fcm.http.side_channel.start",
+            **current_context(),
+            path=path,
+            method="POST",
+            has_body=body is not None,
+        )
         resp = await self._client_for_loop().post(
             url,
             content=content,
             headers=headers,
+        )
+        slog.debug(
+            "filament_fcm.http.side_channel.complete",
+            **current_context(),
+            path=path,
+            method="POST",
+            http_status=resp.status_code,
+            duration_ms=timer.elapsed_ms(),
         )
         if resp.status_code in (200, 204):
             if resp.status_code == 204 or not resp.text:
@@ -472,6 +516,10 @@ class FilamentAPI:
 
     async def _post(self, body: dict) -> dict[str, Any] | None:
         """Send a JSON-RPC POST to the MCP endpoint."""
+        method = body.get("method")
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        tool_name = params.get("name") if method == "tools/call" else None
+        rpc_id = body.get("id")
         headers = {
             "Authorization": f"Bearer {self._mcp_token}",
             "Content-Type": "application/json",
@@ -480,11 +528,21 @@ class FilamentAPI:
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
 
+        timer = Stopwatch.start()
+        slog.debug(
+            "filament_fcm.mcp.request.start",
+            **current_context(),
+            rpc_id=rpc_id,
+            method=method,
+            tool_name=tool_name,
+            has_session_id=bool(self._session_id),
+        )
         resp = await self._client_for_loop().post(
             self._mcp_url,
             content=json.dumps(body),
             headers=headers,
         )
+        duration_ms = timer.elapsed_ms()
 
         # Capture session ID from response header.
         sid = resp.headers.get("mcp-session-id")
@@ -494,14 +552,63 @@ class FilamentAPI:
         # 202 (MCP 2025-03-26) and 204 (MCP 2024-11-05) both indicate
         # a notification was accepted — no response body expected.
         if resp.status_code in (202, 204):
+            slog.debug(
+                "filament_fcm.mcp.request.complete",
+                **current_context(),
+                rpc_id=rpc_id,
+                method=method,
+                tool_name=tool_name,
+                http_status=resp.status_code,
+                duration_ms=duration_ms,
+                notification=True,
+            )
             return None
 
         if resp.status_code != 200:
             logger.error("MCP request failed: %d %s", resp.status_code, resp.text[:200])
+            slog.warning(
+                "filament_fcm.mcp.request.complete",
+                **current_context(),
+                rpc_id=rpc_id,
+                method=method,
+                tool_name=tool_name,
+                http_status=resp.status_code,
+                duration_ms=duration_ms,
+                error="http_error",
+            )
             return {"error": f"HTTP {resp.status_code}"}
 
         try:
-            return resp.json()
+            parsed = resp.json()
         except Exception:
             logger.error("Failed to parse MCP response: %s", resp.text[:200])
+            slog.warning(
+                "filament_fcm.mcp.request.complete",
+                **current_context(),
+                rpc_id=rpc_id,
+                method=method,
+                tool_name=tool_name,
+                http_status=resp.status_code,
+                duration_ms=duration_ms,
+                error="invalid_json",
+            )
             return {"error": "invalid response"}
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        error_code = error.get("code") if isinstance(error, dict) else None
+        event = (
+            "filament_fcm.mcp.request.error"
+            if error_code is not None
+            else "filament_fcm.mcp.request.complete"
+        )
+        log = slog.warning if error_code is not None else slog.debug
+        log(
+            event,
+            **current_context(),
+            rpc_id=rpc_id,
+            method=method,
+            tool_name=tool_name,
+            http_status=resp.status_code,
+            jsonrpc_error_code=error_code,
+            duration_ms=duration_ms,
+        )
+        return parsed
