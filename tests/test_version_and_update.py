@@ -143,6 +143,22 @@ def test_notified_state_survives_restart(tmp_path, monkeypatch):
     assert asyncio.run(checker2.check()) is None
 
 
+def test_corrupted_notice_file_still_reminds(tmp_path, monkeypatch):
+    # A valid-JSON-but-non-dict update_notice.json must not kill the check
+    # with AttributeError — it reads as "never notified" and gets rewritten
+    # by the next mark_notified.
+    (tmp_path / "update_notice.json").write_text('["not", "a", "dict"]')
+    checker, _ = _checker(tmp_path)
+
+    async def fake_fetch(timeout=10.0):
+        return "0.2.0"
+
+    monkeypatch.setattr(update_check, "fetch_latest_version", fake_fetch)
+    assert asyncio.run(checker.check()) == "0.2.0"
+    checker.mark_notified("0.2.0")
+    assert asyncio.run(checker.check()) is None
+
+
 def test_update_check_disabled_env(monkeypatch):
     monkeypatch.delenv("FILAMENT_DISABLE_UPDATE_CHECK", raising=False)
     assert not update_check.update_check_disabled()

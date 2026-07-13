@@ -111,8 +111,13 @@ class UpdateChecker:
             self._current,
             REPO_URL,
         )
-        state = self._store.load_update_notice() or {}
-        if state.get("notified_version") == latest:
+        # isinstance, not truthiness: a corrupted update_notice.json can hold
+        # any JSON value (list, string, ...) — calling .get on it would raise
+        # and silently kill the reminder until the file is removed. A non-dict
+        # is treated as "never notified", so the reminder self-heals the file
+        # on the next successful delivery.
+        state = self._store.load_update_notice()
+        if isinstance(state, dict) and state.get("notified_version") == latest:
             return None
         return latest
 
