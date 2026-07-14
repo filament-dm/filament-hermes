@@ -41,6 +41,7 @@ from .fcm_client import (
     InviteMessage,
     PushMessage,
     ReactionMessage,
+    VouchMessage,
 )
 from .filament_api import FilamentAPI
 from .reactive import (
@@ -578,6 +579,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # it's been invited to while it was offline.
             await self._accept_pending_invites()
 
+            # Accept any pending vouches so a loop admin can approve the agent
+            # into loops it was vouched for while offline.
+            await self._accept_pending_vouches()
+
             return True
         except Exception:
             logger.exception("filament-fcm: [Stage 1] MCP initialization failed")
@@ -618,6 +623,47 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 "filament-fcm: failed to list pending invites", exc_info=True
             )
 
+    async def _accept_pending_vouches(self) -> None:
+        """Accept all pending vouches via MCP tools.
+
+        A member vouching the agent into a loop lands a pending vouch in the
+        agent's knock-invite mailbox — not an ``m.room.member`` invite, so
+        ``_accept_pending_invites`` never sees it. Accepting it (``accept_vouch``)
+        knocks on the loop, turning the vouch into a member proposal a loop admin
+        then approves; without this the vouch is invisible to the admin and can
+        never be approved. Failures are logged but do not block startup.
+        """
+        if not self._filament_api:
+            return
+        try:
+            result = await self._filament_api.list_vouches()
+            parsed = self._filament_api.parse_tool_result(result)
+            if not isinstance(parsed, dict):
+                return
+            vouches = parsed.get("vouches") or []
+            if not vouches:
+                logger.info("filament-fcm: no pending vouches")
+                return
+            for vouch in vouches:
+                loop_id = vouch.get("loop_id") if isinstance(vouch, dict) else vouch
+                if not loop_id:
+                    continue
+                try:
+                    await self._filament_api.accept_vouch(loop_id)
+                    logger.info(
+                        "filament-fcm: accepted vouch into %s "
+                        "(pending loop-admin approval)",
+                        loop_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "filament-fcm: failed to accept vouch into %s",
+                        loop_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.warning("filament-fcm: failed to list vouches", exc_info=True)
+
     async def _register_fcm(self) -> bool:
         """Stage 2: FCM checkin + registration → FCM token."""
         try:
@@ -629,6 +675,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 credentials=self._credentials,
                 on_ping=self._on_ping,
                 on_invite=self._on_invite,
+                on_vouch=self._on_vouch,
                 on_reaction=self._on_reaction,
                 on_receiver_dead=self._on_fcm_receiver_dead,
             )
@@ -867,6 +914,36 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 )
 
         self._schedule_async(_accept(), "invite accept")
+
+    def _on_vouch(self, vouch: VouchMessage) -> None:
+        """A vouch arrived via FCM: accept it so a loop admin can approve.
+
+        Accepting a vouch knocks on the loop and records the voucher, turning
+        it into a member proposal the loop admin then approves — the agent is
+        not joined until that approval, so this crosses no membership boundary.
+        Runs in the firebase-messaging callback context (synchronous);
+        schedules async accept on the event loop.
+        """
+
+        async def _accept() -> None:
+            if not self._filament_api:
+                logger.warning("filament-fcm: vouch received but API not ready")
+                return
+            try:
+                await self._filament_api.accept_vouch(vouch.loop_id)
+                logger.info(
+                    "filament-fcm: accepted vouch into %s from %s "
+                    "(pending loop-admin approval)",
+                    vouch.loop_name or vouch.loop_id,
+                    vouch.inviter,
+                )
+            except Exception:
+                logger.exception(
+                    "filament-fcm: failed to accept vouch into %s",
+                    vouch.loop_id,
+                )
+
+        self._schedule_async(_accept(), "vouch accept")
 
     def _on_push_message(self, msg: PushMessage) -> None:
         """Called by the FCM client when a push notification arrives.
