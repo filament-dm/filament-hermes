@@ -121,6 +121,41 @@ def test_wake_policy_off():
         wp = reactive.WakePolicyStore(Path(d) / "wake.json")
         wp.write({"reactive_wake": "off"})
         assert wp.should_wake_message("!room", is_mention=True) is False
+        # Mute wins over thread engagement too.
+        assert not wp.should_wake_message("!room", is_mention=False, in_thread=True)
+
+
+def test_thread_wake_engaged_by_default():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        # Default (mention-gated): an un-mentioned message OUTSIDE a thread
+        # stays silent, but an un-mentioned message INSIDE an engaged thread
+        # wakes — its delivery is the engagement signal (ENG-724).
+        assert not wp.should_wake_message("!room", is_mention=False, in_thread=False)
+        assert wp.should_wake_message("!room", is_mention=False, in_thread=True)
+
+
+def test_thread_wake_off_suppresses_engaged_follow_ups():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        wp.write({"reactive_wake": "mention", "thread_wake": "off"})
+        # thread_wake off → back to mention-only, even inside a thread.
+        assert not wp.should_wake_message("!room", is_mention=False, in_thread=True)
+        assert wp.should_wake_message("!room", is_mention=True, in_thread=True)
+
+
+def test_thread_wake_per_channel_override():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        wp.write(
+            {
+                "thread_wake": "engaged",
+                "per_channel": {"!noisy": {"thread_wake": "off"}},
+            }
+        )
+        # Global default engages threads; the noisy channel opts out.
+        assert wp.should_wake_message("!other", is_mention=False, in_thread=True)
+        assert not wp.should_wake_message("!noisy", is_mention=False, in_thread=True)
 
 
 def test_current_zone_default_is_data():
