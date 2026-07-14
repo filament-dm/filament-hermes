@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -53,6 +52,18 @@ def _configure_structlog() -> None:
 _configure_structlog()
 
 
+_CONTEXT_KEYS = {
+    "gateway_instance_id",
+    "connect_attempt_id",
+    "fcm_client_id",
+    "push_receive_id",
+    "turn_id",
+    "call_origin",
+    "trigger_event_id",
+    "persistent_id",
+}
+
+
 def get_logger(name: str = "gateway.filament_fcm") -> Any:
     return structlog.get_logger(name)
 
@@ -69,66 +80,23 @@ def fingerprint(value: str | None, *, size: int = 12) -> str | None:
     return sha256(value.encode("utf-8")).hexdigest()[:size]
 
 
-_gateway_instance_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_gateway_instance_id", default=None
-)
-_connect_attempt_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_connect_attempt_id", default=None
-)
-_fcm_client_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_fcm_client_id", default=None
-)
-_push_receive_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_push_receive_id", default=None
-)
-_turn_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_turn_id", default=None
-)
-_call_origin: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_call_origin", default=None
-)
-_trigger_event_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_trigger_event_id", default=None
-)
-_persistent_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "filament_persistent_id", default=None
-)
-
-
-_CONTEXT_VARS: dict[str, contextvars.ContextVar[str | None]] = {
-    "gateway_instance_id": _gateway_instance_id,
-    "connect_attempt_id": _connect_attempt_id,
-    "fcm_client_id": _fcm_client_id,
-    "push_receive_id": _push_receive_id,
-    "turn_id": _turn_id,
-    "call_origin": _call_origin,
-    "trigger_event_id": _trigger_event_id,
-    "persistent_id": _persistent_id,
-}
-
-
 def current_context() -> dict[str, str]:
     """Return non-empty correlation fields for the current task."""
-    return {key: value for key, var in _CONTEXT_VARS.items() if (value := var.get())}
+    return {
+        key: value
+        for key, value in structlog.contextvars.get_contextvars().items()
+        if key in _CONTEXT_KEYS and isinstance(value, str) and value
+    }
 
 
 @contextlib.contextmanager
 def bound_context(**values: str | None) -> Iterator[None]:
     """Temporarily bind correlation fields to the current context/task."""
-    tokens: list[tuple[contextvars.ContextVar[str | None], contextvars.Token]] = []
     bind_values = {
-        key: value for key, value in values.items() if value and key in _CONTEXT_VARS
+        key: value for key, value in values.items() if value and key in _CONTEXT_KEYS
     }
-    try:
-        for key, value in bind_values.items():
-            var = _CONTEXT_VARS[key]
-            tokens.append((var, var.set(value)))
-        structlog.contextvars.bind_contextvars(**bind_values)
+    with structlog.contextvars.bound_contextvars(**bind_values):
         yield
-    finally:
-        structlog.contextvars.unbind_contextvars(*bind_values.keys())
-        for var, token in reversed(tokens):
-            var.reset(token)
 
 
 @dataclass
