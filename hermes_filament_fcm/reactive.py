@@ -52,6 +52,62 @@ current_zone: contextvars.ContextVar[str] = contextvars.ContextVar(
     "filament_zone", default="data"
 )
 
+# How many recent messages the adapter reads to build the context breadcrumb.
+# A bounded window: enough to notice the agent is walking into a conversation
+# with history it can't see, cheap enough to read on every wake.
+BREADCRUMB_LIMIT = 15
+
+
+def context_breadcrumb(
+    messages: list[dict],
+    *,
+    trigger_event_id: str | None,
+) -> str | None:
+    """Build a counted "you may be missing context" cue, or None if there's
+    nothing worth flagging.
+
+    A push-model agent is handed only the single triggering event, so a turn
+    dispatched into a fresh session — a cold start, or a shared-channel turn
+    that escalated into the backchannel from a *different* session — carries no
+    in-context history at all. The agent then answers "I don't see that" from
+    an empty memory even though the channel timeline holds what it needs. This
+    counts the recent messages the agent didn't author and nudges it to read
+    them with get_recent_messages *before* concluding it lacks context.
+
+    Design (from the eval): inject a COUNT, never the message bodies. A counted
+    cue is what reliably triggers the fetch, where a static standing
+    instruction does not; and keeping bodies out means no untrusted message
+    text is ever prepended to the prompt (the count is the only thing derived
+    from the timeline, and an integer can't carry an injection). The count is
+    an upper bound — some of these may already be in the session — so it is
+    phrased "up to N"; an over-count costs at most one redundant read.
+
+    `messages` is the get_recent_messages payload (a list of message dicts).
+    """
+    n = 0
+    for m in messages:
+        # Count real messages only — skip reactions, membership, other state.
+        if m.get("type") not in (None, "m.room.message"):
+            continue
+        # The agent's own posts aren't context it's missing.
+        if m.get("is_from_self"):
+            continue
+        # The event we're already replying to isn't missing context either.
+        if trigger_event_id and m.get("event_id") == trigger_event_id:
+            continue
+        n += 1
+    if n == 0:
+        return None
+    plural = "s" if n != 1 else ""
+    return (
+        f"[CONTEXT: up to {n} recent message{plural} in this channel may not be "
+        "in this conversation. If anything below refers to something you can't "
+        'see here — a name, a topic, "that", "earlier", "catch me up", or a '
+        "question you don't have in front of you — call get_recent_messages to "
+        "read them BEFORE replying or saying you lack context. Don't answer "
+        "from memory alone.]"
+    )
+
 
 def is_system_sender(sender: str | None, self_user_id: str | None) -> bool:
     """True if ``sender`` is the local Filament system account

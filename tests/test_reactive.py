@@ -128,6 +128,53 @@ def test_current_zone_default_is_data():
     assert reactive.current_zone.get() == "data"
 
 
+# ── context_breadcrumb ────────────────────────────────────────────────
+def _msg(event_id, sender="@x:s", is_from_self=False, type="m.room.message"):
+    return {"event_id": event_id, "sender": sender, "is_from_self": is_from_self,
+            "type": type}
+
+
+def test_breadcrumb_none_when_empty():
+    assert reactive.context_breadcrumb([], trigger_event_id="$t") is None
+
+
+def test_breadcrumb_none_when_only_trigger():
+    msgs = [_msg("$t")]
+    assert reactive.context_breadcrumb(msgs, trigger_event_id="$t") is None
+
+
+def test_breadcrumb_none_when_only_self():
+    msgs = [_msg("$a", is_from_self=True), _msg("$b", is_from_self=True)]
+    assert reactive.context_breadcrumb(msgs, trigger_event_id="$t") is None
+
+
+def test_breadcrumb_counts_others_excluding_self_and_trigger():
+    msgs = [
+        _msg("$t"),                       # the trigger — excluded
+        _msg("$self", is_from_self=True), # our own post — excluded
+        _msg("$a"),                       # counts
+        _msg("$b"),                       # counts
+        _msg("$r", type="m.reaction"),    # not a message — excluded
+    ]
+    out = reactive.context_breadcrumb(msgs, trigger_event_id="$t")
+    assert out is not None
+    assert "up to 2 recent messages" in out
+    assert "get_recent_messages" in out
+
+
+def test_breadcrumb_singular_grammar():
+    out = reactive.context_breadcrumb([_msg("$a")], trigger_event_id="$t")
+    assert "up to 1 recent message " in out  # trailing space -> no 's'
+
+
+def test_breadcrumb_missing_type_treated_as_message():
+    # A payload without an explicit type still counts (defensive default).
+    out = reactive.context_breadcrumb(
+        [{"event_id": "$a", "is_from_self": False}], trigger_event_id="$t"
+    )
+    assert "up to 1 recent message " in out
+
+
 def _run() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

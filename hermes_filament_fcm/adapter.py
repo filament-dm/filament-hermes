@@ -44,8 +44,10 @@ from .fcm_client import (
 )
 from .filament_api import FilamentAPI
 from .reactive import (
+    BREADCRUMB_LIMIT,
     InstructionsStore,
     WakePolicyStore,
+    context_breadcrumb,
     current_zone,
     is_system_sender,
 )
@@ -954,6 +956,31 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             raw=msg.raw,
         )
 
+    async def _context_breadcrumb(
+        self, channel: str, trigger_event_id: str | None
+    ) -> str | None:
+        """Read a bounded recent-message window and build the counted context
+        cue (see reactive.context_breadcrumb). Best-effort: any failure — no
+        MCP session yet, a server hiccup — returns None so a turn is never
+        blocked on this enrichment."""
+        if not self._filament_api:
+            return None
+        try:
+            raw = await self._filament_api.call_tool(
+                "get_recent_messages",
+                {"channel": channel, "limit": BREADCRUMB_LIMIT},
+            )
+            parsed = FilamentAPI.parse_tool_result(raw)
+            messages = parsed.get("messages", []) if isinstance(parsed, dict) else []
+        except Exception:  # enrichment only, never fatal to a turn
+            logger.debug(
+                "filament-fcm: context breadcrumb read failed for %s",
+                channel,
+                exc_info=True,
+            )
+            return None
+        return context_breadcrumb(messages, trigger_event_id=trigger_event_id)
+
     async def _handle_control_message(self, msg: PushMessage) -> None:
         """Backchannel (control plane): the principal commands the agent
         directly — no wake policy, no standing-instructions framing, full
@@ -979,12 +1006,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             message_id=msg.event_id,
         )
+        # A control turn is often dispatched into a fresh session (cold start,
+        # or a turn escalated here from a different session): the backchannel
+        # timeline may hold context this session never saw. Flag the count so
+        # the agent reads it instead of answering "I don't see that" from an
+        # empty memory. The framework prepends channel_context to the body.
+        breadcrumb = await self._context_breadcrumb(msg.room_id, msg.event_id)
         event = MessageEvent(
             text=body,
             message_type=MessageType.TEXT,
             source=source,
             message_id=msg.event_id,
             raw_message=msg.raw,
+            channel_context=breadcrumb,
         )
         logger.info(
             "Dispatching control message from %s: %s",
@@ -1127,12 +1161,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id or message_id,
             message_id=message_id,
         )
+        # Reinforce the envelope's get_recent_messages hint with a concrete
+        # count of channel history this reactive turn can't see — the counted
+        # cue is what reliably drives the fetch (the static hint alone doesn't).
+        breadcrumb = await self._context_breadcrumb(channel, target_event_id)
         event = MessageEvent(
             text=envelope,
             message_type=MessageType.TEXT,
             source=source,
             message_id=message_id,
             raw_message=raw,
+            channel_context=breadcrumb,
         )
         logger.info(
             "filament-fcm: WAKE → reactive turn: trigger=%s channel=%s sender=%s "
