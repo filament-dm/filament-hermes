@@ -31,6 +31,7 @@ def _configure_structlog() -> None:
                     "event",
                     "level",
                     "logger",
+                    "installation_id",
                     "gateway_instance_id",
                     "connect_attempt_id",
                     "fcm_client_id",
@@ -53,6 +54,7 @@ _configure_structlog()
 
 
 _CONTEXT_KEYS = {
+    "installation_id",
     "gateway_instance_id",
     "connect_attempt_id",
     "fcm_client_id",

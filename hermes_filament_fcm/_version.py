@@ -17,8 +17,7 @@ REPO_URL = "https://github.com/filament-dm/filament-hermes"
 # install.sh installs from git main, so the version on main IS the latest
 # available version — no PyPI release to consult.
 LATEST_PYPROJECT_URL = (
-    "https://raw.githubusercontent.com/filament-dm/filament-hermes/"
-    "main/pyproject.toml"
+    "https://raw.githubusercontent.com/filament-dm/filament-hermes/main/pyproject.toml"
 )
 
 

@@ -58,6 +58,15 @@ def test_store_save_bounds_to_cap():
         assert loaded[-1] == f"0:{cap + 49}"
 
 
+def test_installation_id_persists_across_store_instances():
+    with tempfile.TemporaryDirectory() as d:
+        first = credentials.CredentialStore(d).load_or_create_installation_id()
+        second = credentials.CredentialStore(d).load_or_create_installation_id()
+
+        assert first.startswith("inst_")
+        assert second == first
+
+
 def test_record_new_then_duplicate():
     with tempfile.TemporaryDirectory() as d:
         store = credentials.CredentialStore(d)

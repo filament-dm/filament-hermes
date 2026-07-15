@@ -67,9 +67,7 @@ async def fetch_latest_version(timeout: float = 10.0) -> str | None:
         ) as client:
             resp = await client.get(LATEST_PYPROJECT_URL)
             if resp.status_code != 200:
-                logger.debug(
-                    "filament-fcm: update check got HTTP %d", resp.status_code
-                )
+                logger.debug("filament-fcm: update check got HTTP %d", resp.status_code)
                 return None
             return version_from_pyproject(resp.text)
     except Exception:

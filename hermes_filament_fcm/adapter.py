@@ -58,7 +58,7 @@ from .reactive import (
     current_zone,
     is_system_sender,
 )
-from .update_check import UpdateChecker, build_reminder, update_check_disabled
+from .update_check import UpdateChecker, update_check_disabled
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
 logger = logging.getLogger("gateway.filament_fcm")
@@ -230,9 +230,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Event deduplication — bounded deque + set so memory stays flat.
         self._seen_events: deque[str] = deque(maxlen=2000)
         self._seen_set: set[str] = set()
+        self._installation_id = self._credentials.load_or_create_installation_id()
         self._gateway_instance_id = new_id("gw")
         slog.info(
             "filament_fcm.adapter.created",
+            installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             mcp_url=self._filament_api._mcp_url,
         )
@@ -387,6 +389,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
         connect_attempt_id = new_id("conn")
         with bound_context(
+            installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             connect_attempt_id=connect_attempt_id,
         ):
@@ -408,6 +411,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             slog.info(
                 "filament_fcm.connect.start",
+                installation_id=self._installation_id,
                 gateway_instance_id=self._gateway_instance_id,
                 connect_attempt_id=connect_attempt_id,
                 mcp_url=self._filament_api._mcp_url,
@@ -521,6 +525,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
             )
             with bound_context(
+                installation_id=self._installation_id,
                 gateway_instance_id=self._gateway_instance_id,
                 turn_id=greet_id,
                 call_origin="first_contact_greet",
@@ -1040,11 +1045,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         content_hash = fingerprint(content or "")
         metadata_keys = _metadata_keys(metadata)
 
-        with bound_context(call_origin="adapter_send"):
+        with bound_context(
+            installation_id=self._installation_id,
+            call_origin="adapter_send",
+        ):
             try:
                 thread_id = (metadata or {}).get("thread_id") if metadata else None
                 slog.info(
                     "filament_fcm.send.start",
+                    installation_id=self._installation_id,
                     send_id=send_id,
                     send_kind=send_kind,
                     chat_id=chat_id,
@@ -1072,6 +1081,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 if isinstance(result, dict) and result.get("error"):
                     slog.warning(
                         "filament_fcm.send.complete",
+                        installation_id=self._installation_id,
                         send_id=send_id,
                         send_kind=send_kind,
                         chat_id=chat_id,
@@ -1089,6 +1099,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
                 slog.info(
                     "filament_fcm.send.complete",
+                    installation_id=self._installation_id,
                     send_id=send_id,
                     send_kind=send_kind,
                     chat_id=chat_id,
@@ -1102,6 +1113,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 logger.exception("Failed to send message")
                 slog.exception(
                     "filament_fcm.send.failed",
+                    installation_id=self._installation_id,
                     send_id=send_id,
                     send_kind=send_kind,
                     chat_id=chat_id,
@@ -1203,6 +1215,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
         slog.info(
             "filament_fcm.message.scheduled",
+            installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             fcm_client_id=msg.fcm_client_id,
             push_receive_id=msg.push_receive_id,
@@ -1215,6 +1228,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def _handle_push_message(self, msg: PushMessage) -> None:
         turn_id = new_id("turn")
         with bound_context(
+            installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             fcm_client_id=msg.fcm_client_id,
             push_receive_id=msg.push_receive_id,
@@ -1389,6 +1403,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """An emoji reaction arrived via FCM (a potential wake-up signal)."""
         slog.info(
             "filament_fcm.reaction.scheduled",
+            installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             fcm_client_id=reaction.fcm_client_id,
             push_receive_id=reaction.push_receive_id,
@@ -1403,6 +1418,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def _handle_reaction(self, reaction: ReactionMessage) -> None:
         turn_id = new_id("turn")
         with bound_context(
+            installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             fcm_client_id=reaction.fcm_client_id,
             push_receive_id=reaction.push_receive_id,

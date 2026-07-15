@@ -451,7 +451,7 @@ class FilamentFCMClient:
             )
             try:
                 token = await client.checkin_or_register()
-            except Exception as e:  # noqa: BLE001 — library raises bare RuntimeError
+            except Exception as e:
                 last_exc = e
                 logger.warning(
                     "filament-fcm: FCM registration attempt %s/%s failed: %s",

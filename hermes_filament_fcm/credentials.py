@@ -18,6 +18,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from secrets import token_hex
 from typing import Any
 
 logger = logging.getLogger("gateway.filament_fcm")
@@ -78,6 +79,17 @@ class CredentialStore:
     def save_update_notice(self, data: dict[str, Any]) -> None:
         """Persist the update-reminder state."""
         self._write_json("update_notice.json", data)
+
+    def load_or_create_installation_id(self) -> str:
+        """Return a stable, report-safe id for this Hermes plugin install."""
+        data = self._read_json("installation.json")
+        if isinstance(data, dict):
+            installation_id = data.get("installation_id")
+            if isinstance(installation_id, str) and installation_id:
+                return installation_id
+        installation_id = f"inst_{token_hex(5)}"
+        self._write_json("installation.json", {"installation_id": installation_id})
+        return installation_id
 
     def load_received_persistent_ids(self) -> list[str]:
         """Load the persistent ids of pushes we've already received."""
