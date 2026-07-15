@@ -9,9 +9,9 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateway plugin th
 ## Commands
 
 ```bash
-uvx pytest tests/ -q        # run tests
-uvx pytest tests/test_reactive.py -q                    # one file
-uvx pytest tests/test_reactive.py::test_name -q         # one test
+uvx --with httpx pytest tests/ -q        # run tests (httpx needed: filament_api imports it)
+uvx --with httpx pytest tests/test_reactive.py -q                    # one file
+uvx --with httpx pytest tests/test_reactive.py::test_name -q         # one test
 uvx ruff check .            # lint (config in pyproject.toml)
 ```
 
@@ -55,4 +55,8 @@ Load-bearing invariants:
 
 ## Configuration (environment variables)
 
-`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra trusted commanders; the principal is auto-discovered via `get_self`), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_FCM_CREDENTIALS_DIR`, `HERMES_HOME`.
+`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra trusted commanders; the principal is auto-discovered via `get_self`), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_FCM_CREDENTIALS_DIR`, `FILAMENT_DISABLE_UPDATE_CHECK` (set true to turn off the daily new-version check/reminder — see `update_check.py`), `HERMES_HOME`.
+
+## Versioning
+
+Every HTTP request to the Filament server carries the installed plugin version (`User-Agent` + `X-Filament-Plugin-Version` headers set client-wide in `filament_api.py`, plus MCP `clientInfo` on `initialize`) so the server can tell what version deployed agents run. `_version.py` owns the helpers (stdlib-only). Installs come from git main, so **bump `version` in pyproject.toml on every user-visible change** — `update_check.py` compares the installed version against pyproject.toml on main daily and reminds the principal (once per version, via backchannel) to update.

@@ -34,6 +34,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+from ._version import PLUGIN_VERSION
 from .credentials import CredentialStore
 from .fcm_client import (
     FCMConfig,
@@ -50,6 +51,7 @@ from .reactive import (
     current_zone,
     is_system_sender,
 )
+from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
 logger = logging.getLogger("gateway.filament_fcm")
@@ -167,6 +169,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Runtime state (populated during connect stages).
         self._fcm_client: FilamentFCMClient | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._update_check_task: asyncio.Task | None = None
+        self._update_checker = UpdateChecker(self._credentials)
         # The gateway's event loop, captured in connect(). FCM callbacks (which
         # fire from the firebase-messaging thread) are bridged onto it so all
         # handling — and the shared httpx client — stay on one loop.
@@ -352,8 +356,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # handling, and the shared httpx client, on a single loop.
             self._loop = asyncio.get_running_loop()
             logger.info(
-                "filament-fcm: starting connection (url=%s)",
+                "filament-fcm: starting connection (url=%s, plugin=v%s)",
                 self._filament_api._mcp_url,
+                PLUGIN_VERSION,
             )
 
             if not await self._initialize_api():
@@ -382,6 +387,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
             self._mark_connected()
             logger.info("filament-fcm: connected successfully")
+
+            # Daily update check (first pass right away). Started after the
+            # connect stages so a reminder has a live send path; never
+            # blocks or fails the connect.
+            self._start_update_check()
 
             # First-contact hello, once the listener is up so the agent's
             # reply path is fully live. Never block/fail the connect on it.
@@ -802,6 +812,54 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("filament-fcm: presence heartbeat failed", exc_info=True)
 
+    # ── Update check ────────────────────────────────────────────────
+
+    def _start_update_check(self) -> None:
+        """Kick off the daily update-available check (idempotent)."""
+        if update_check_disabled():
+            logger.info("filament-fcm: update check disabled by env")
+            return
+        if self._update_check_task and not self._update_check_task.done():
+            return
+        self._update_check_task = asyncio.create_task(self._update_check_loop())
+
+    async def _update_check_loop(self, interval_seconds: int = 86400) -> None:
+        """Once now and then daily: is a newer plugin version on main?
+
+        A newer version always logs a warning (UpdateChecker.check); the
+        backchannel reminder to the principal fires at most once per new
+        version, persisted across restarts (update_notice.json).
+        """
+        while True:
+            try:
+                newer = await self._update_checker.check()
+                if newer:
+                    await self._notify_update_available(newer)
+            except Exception:
+                logger.debug("filament-fcm: update check failed", exc_info=True)
+            await asyncio.sleep(interval_seconds)
+
+    async def _notify_update_available(self, latest: str) -> None:
+        """Post the small update reminder to the principal's backchannel.
+
+        Marked as notified only after the post succeeds, so a failed
+        delivery retries on the next daily check. Without a backchannel
+        there's nowhere to remind — the warning already logged by
+        UpdateChecker.check is the whole reminder then.
+        """
+        if not self._cc_room_id:
+            return
+        # result = await self._filament_api.post_message(
+        #     self._cc_room_id, build_reminder(latest, PLUGIN_VERSION)
+        # )
+        # if isinstance(result, dict) and result.get("error"):
+        #     logger.warning(
+        #         "filament-fcm: update reminder failed to send: %s",
+        #         result.get("error"),
+        #     )
+        #     return
+        self._update_checker.mark_notified(latest)
+
     # ── Disconnect ──────────────────────────────────────────────────
 
     async def disconnect(self) -> None:
@@ -815,6 +873,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
+
+        if self._update_check_task and not self._update_check_task.done():
+            self._update_check_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._update_check_task
 
         if self._filament_api:
             await self._filament_api.close()

@@ -70,6 +70,15 @@ class CredentialStore:
         """Persist FCM registration credentials."""
         self._write_json("fcm_credentials.json", creds)
 
+    def load_update_notice(self) -> dict[str, Any] | None:
+        """Load the update-reminder state (last version the principal was
+        told about) — see update_check.py."""
+        return self._read_json("update_notice.json")
+
+    def save_update_notice(self, data: dict[str, Any]) -> None:
+        """Persist the update-reminder state."""
+        self._write_json("update_notice.json", data)
+
     def load_received_persistent_ids(self) -> list[str]:
         """Load the persistent ids of pushes we've already received."""
         data = self._read_json("received_persistent_ids.json")

@@ -14,7 +14,18 @@ from typing import Any
 
 import httpx
 
+from ._version import DIST_NAME, PLUGIN_VERSION, version_headers
+
 logger = logging.getLogger("gateway.filament_fcm")
+
+# Standard MCP initialize params. clientInfo tells the server exactly what
+# plugin version this agent runs (the same version also rides on every
+# request as User-Agent / X-Filament-Plugin-Version — see version_headers).
+_INITIALIZE_PARAMS: dict[str, Any] = {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {},
+    "clientInfo": {"name": DIST_NAME, "version": PLUGIN_VERSION},
+}
 
 
 class FilamentAPI:
@@ -48,9 +59,23 @@ class FilamentAPI:
         its sockets/fds aren't leaked.
         """
         loop = asyncio.get_running_loop()
-        if self._client is None or self._client_loop is not loop:
+        # is_closed guards the reconnect path: close() (adapter disconnect)
+        # closes the client, and the reconnect watcher then reuses this same
+        # FilamentAPI on the same loop — without the check, every request
+        # after a disconnect would die on "client has been closed" forever.
+        if (
+            self._client is None
+            or self._client.is_closed
+            or self._client_loop is not loop
+        ):
             old, old_loop = self._client, self._client_loop
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=70.0))
+            # Client-level default headers ride on every request (MCP,
+            # media, side-channels) so the server always sees the plugin
+            # version; per-request headers merge on top per-key.
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, read=70.0),
+                headers=version_headers(),
+            )
             self._client_loop = loop
             if old is not None and old_loop is not None and old_loop.is_running():
                 # Fire-and-forget aclose on the old loop's thread (suppress the
@@ -66,7 +91,7 @@ class FilamentAPI:
                 "jsonrpc": "2.0",
                 "id": self._next_rpc_id(),
                 "method": "initialize",
-                "params": {},
+                "params": _INITIALIZE_PARAMS,
             }
         )
 
@@ -172,13 +197,19 @@ class FilamentAPI:
             "Authorization": f"Bearer {mcp_token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            **version_headers(),
         }
         with httpx.Client(timeout=timeout) as client:
             init_resp = client.post(
                 mcp_url,
                 headers=headers,
                 content=json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": _INITIALIZE_PARAMS,
+                    }
                 ),
             )
             init_resp.raise_for_status()
@@ -421,10 +452,16 @@ class FilamentAPI:
         return {"error": f"HTTP {resp.status_code}"}
 
     async def close(self) -> None:
-        """Close the HTTP client (best-effort — it may be bound to another loop)."""
-        if self._client is not None:
+        """Close the HTTP client (best-effort — it may be bound to another loop).
+
+        The cached client is dropped *before* aclose so a later call (the
+        gateway reconnecting with this same instance) builds a fresh client
+        instead of reusing a closed one.
+        """
+        client, self._client, self._client_loop = self._client, None, None
+        if client is not None:
             try:
-                await self._client.aclose()
+                await client.aclose()
             except Exception:
                 logger.debug("filament-fcm: error closing http client", exc_info=True)
 
