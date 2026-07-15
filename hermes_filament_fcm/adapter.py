@@ -45,7 +45,13 @@ from .fcm_client import (
     VouchMessage,
 )
 from .filament_api import FilamentAPI
-from .observability import bound_context, fingerprint, get_logger, new_id
+from .observability import (
+    bound_context,
+    current_context,
+    fingerprint,
+    get_logger,
+    new_id,
+)
 from .reactive import (
     InstructionsStore,
     WakePolicyStore,
@@ -94,6 +100,29 @@ def _sanitize_meta(value: str, limit: int = 80) -> str:
     flat = re.sub(r"\s+", " ", value).strip()
     flat = "".join(ch for ch in flat if ch.isprintable())
     return flat[:limit]
+
+
+def _result_event_id(result: Any) -> str | None:
+    """Best-effort event id extraction from an MCP tool response."""
+    parsed = FilamentAPI.parse_tool_result(result if isinstance(result, dict) else None)
+    if isinstance(parsed, dict):
+        event_id = parsed.get("event_id") or parsed.get("message_id")
+        if isinstance(event_id, str) and event_id:
+            return event_id
+    return None
+
+
+def _metadata_keys(metadata: Any) -> list[str]:
+    if not isinstance(metadata, dict):
+        return []
+    return sorted(str(key) for key in metadata)
+
+
+def _metadata_value(metadata: Any, key: str) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    return value if isinstance(value, str) and value else None
 
 
 def _summarize_media(media: Any) -> str | None:
@@ -465,13 +494,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._greet_pending = False
 
         try:
+            greet_id = new_id("greet")
+            trigger_id = f"greet:{self._cc_room_id}"
             source = self.build_source(
                 chat_id=self._cc_room_id,
                 chat_name="backchannel",
                 chat_type="dm",
                 user_id=self._owner_id,
                 user_name=self._owner_name or self._owner_id,
-                message_id=f"greet:{self._cc_room_id}",
+                message_id=trigger_id,
             )
             event = MessageEvent(
                 text=(
@@ -483,18 +514,31 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 ),
                 message_type=MessageType.TEXT,
                 source=source,
-                message_id=f"greet:{self._cc_room_id}",
+                message_id=trigger_id,
                 raw_message=None,
             )
             logger.info(
                 "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
             )
-            slog.info(
-                "filament_fcm.greet.dispatch",
-                channel_id=self._cc_room_id,
-                principal_id=self._owner_id,
-            )
-            await self.handle_message(event)
+            with bound_context(
+                gateway_instance_id=self._gateway_instance_id,
+                turn_id=greet_id,
+                call_origin="first_contact_greet",
+                trigger_event_id=trigger_id,
+            ):
+                slog.info(
+                    "filament_fcm.greet.dispatch",
+                    channel_id=self._cc_room_id,
+                    principal_id=self._owner_id,
+                    synthetic_event_id=trigger_id,
+                )
+                await self.handle_message(event)
+                slog.info(
+                    "filament_fcm.greet.dispatched",
+                    channel_id=self._cc_room_id,
+                    principal_id=self._owner_id,
+                    synthetic_event_id=trigger_id,
+                )
         except Exception:
             logger.exception("filament-fcm: greet turn failed")
             slog.exception("filament_fcm.greet.failed")
@@ -981,15 +1025,36 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not self._filament_api:
             return SendResult(success=False, error="Not connected")
 
+        parent_context = current_context()
+        send_id = new_id("send")
+        send_kind = _metadata_value(metadata, "send_kind") or _metadata_value(
+            metadata, "delivery_phase"
+        )
+        if send_kind is None:
+            if parent_context.get("call_origin") == "first_contact_greet":
+                send_kind = "first_contact_greet"
+            elif parent_context.get("turn_id"):
+                send_kind = "turn_response"
+            else:
+                send_kind = "out_of_turn"
+        content_hash = fingerprint(content or "")
+        metadata_keys = _metadata_keys(metadata)
+
         with bound_context(call_origin="adapter_send"):
             try:
                 thread_id = (metadata or {}).get("thread_id") if metadata else None
                 slog.info(
                     "filament_fcm.send.start",
+                    send_id=send_id,
+                    send_kind=send_kind,
                     chat_id=chat_id,
                     thread_id=thread_id,
                     reply_to=reply_to,
                     content_length=len(content or ""),
+                    content_fingerprint=content_hash,
+                    metadata_keys=metadata_keys,
+                    in_turn=bool(parent_context.get("turn_id")),
+                    parent_call_origin=parent_context.get("call_origin"),
                 )
 
                 if thread_id:
@@ -1003,32 +1068,42 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         markdown_body=content,
                     )
 
+                event_id = _result_event_id(result)
                 if isinstance(result, dict) and result.get("error"):
                     slog.warning(
                         "filament_fcm.send.complete",
+                        send_id=send_id,
+                        send_kind=send_kind,
                         chat_id=chat_id,
                         thread_id=thread_id,
+                        event_id=event_id,
                         success=False,
                         error=str(result["error"]),
                     )
                     return SendResult(
                         success=False,
+                        raw_response=result,
                         error=str(result["error"]),
                         retryable=True,
                     )
 
                 slog.info(
                     "filament_fcm.send.complete",
+                    send_id=send_id,
+                    send_kind=send_kind,
                     chat_id=chat_id,
                     thread_id=thread_id,
+                    event_id=event_id,
                     success=True,
                 )
-                return SendResult(success=True)
+                return SendResult(success=True, raw_response=result)
 
             except Exception as e:
                 logger.exception("Failed to send message")
                 slog.exception(
                     "filament_fcm.send.failed",
+                    send_id=send_id,
+                    send_kind=send_kind,
                     chat_id=chat_id,
                     reply_to=reply_to,
                 )
