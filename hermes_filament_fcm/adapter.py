@@ -802,15 +802,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
         if not self._cc_room_id:
             return
-        result = await self._filament_api.post_message(
-            self._cc_room_id, build_reminder(latest, PLUGIN_VERSION)
-        )
-        if isinstance(result, dict) and result.get("error"):
-            logger.warning(
-                "filament-fcm: update reminder failed to send: %s",
-                result.get("error"),
-            )
-            return
+        # result = await self._filament_api.post_message(
+        #     self._cc_room_id, build_reminder(latest, PLUGIN_VERSION)
+        # )
+        # if isinstance(result, dict) and result.get("error"):
+        #     logger.warning(
+        #         "filament-fcm: update reminder failed to send: %s",
+        #         result.get("error"),
+        #     )
+        #     return
         self._update_checker.mark_notified(latest)
 
     # ── Disconnect ──────────────────────────────────────────────────
