@@ -98,14 +98,20 @@ def context_breadcrumb(
         n += 1
     if n == 0:
         return None
-    plural = "s" if n != 1 else ""
+    # Imperative, not conditional. An earlier version said "IF the message
+    # refers to something you can't see, fetch" — but the failure mode is
+    # exactly that the agent DOESN'T realize the answer lives in history: asked
+    # a plain question ("what's the wifi password?") it reads no reference to
+    # prior context, decides the condition isn't met, and answers "I don't have
+    # that" from an empty memory. So the cue orders the fetch outright whenever
+    # unseen messages exist, and forbids the "I lack the info" reply until the
+    # agent has actually read them.
     return (
-        f"[CONTEXT: up to {n} recent message{plural} in this channel may not be "
-        "in this conversation. If anything below refers to something you can't "
-        'see here — a name, a topic, "that", "earlier", "catch me up", or a '
-        "question you don't have in front of you — call get_recent_messages to "
-        "read them BEFORE replying or saying you lack context. Don't answer "
-        "from memory alone.]"
+        f"[CONTEXT: {n} recent message(s) in this channel are NOT in this "
+        "conversation — you have not seen them. Before you reply, call "
+        "get_recent_messages to read the recent channel history. Do NOT answer "
+        "from memory, and do NOT say you lack the information, until you have "
+        "read those messages — the answer may be in them.]"
     )
 
 

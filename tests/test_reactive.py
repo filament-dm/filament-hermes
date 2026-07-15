@@ -158,13 +158,16 @@ def test_breadcrumb_counts_others_excluding_self_and_trigger():
     ]
     out = reactive.context_breadcrumb(msgs, trigger_event_id="$t")
     assert out is not None
-    assert "up to 2 recent messages" in out
+    assert "2 recent message(s)" in out
     assert "get_recent_messages" in out
+    # Imperative, not conditional — no "if it refers to..." escape hatch.
+    assert "Before you reply" in out
+    assert "if" not in out.lower()
 
 
-def test_breadcrumb_singular_grammar():
+def test_breadcrumb_count_reflects_qualifying_messages():
     out = reactive.context_breadcrumb([_msg("$a")], trigger_event_id="$t")
-    assert "up to 1 recent message " in out  # trailing space -> no 's'
+    assert "1 recent message(s)" in out
 
 
 def test_breadcrumb_missing_type_treated_as_message():
@@ -172,7 +175,7 @@ def test_breadcrumb_missing_type_treated_as_message():
     out = reactive.context_breadcrumb(
         [{"event_id": "$a", "is_from_self": False}], trigger_event_id="$t"
     )
-    assert "up to 1 recent message " in out
+    assert "1 recent message(s)" in out
 
 
 def _run() -> None:
