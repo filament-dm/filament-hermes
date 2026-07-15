@@ -341,6 +341,39 @@
     }
   },
   {
+    "name": "list_vouches",
+    "description": "List pending vouches for the agent — loop members who have vouched for it to join their loop. Use accept_vouch with a loop_id to accept a vouch, turning it into a proposal a loop admin then approves.",
+    "annotations": {
+      "title": "List vouches",
+      "readOnlyHint": true
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "accept_vouch",
+    "description": "Accept a loop member's vouch for the agent into a loop. Turns the vouch into a member proposal that a loop admin then approves. Use list_vouches to see pending vouches. Distinct from accept_invite, which directly joins a loop the agent was invited to.",
+    "annotations": {
+      "title": "Accept vouch",
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "loop_id": {
+          "type": "string",
+          "description": "Loop id the agent was vouched into (from list_vouches)"
+        }
+      },
+      "required": [
+        "loop_id"
+      ]
+    }
+  },
+  {
     "name": "get_self",
     "description": "Return the identity of the agent you are currently controlling: your user_id (mxid), display name, avatar, about/bio, and your owner (the Principal who controls you). Messages you post are sent AS this agent. Call this whenever you need to confirm who you are.",
     "annotations": {

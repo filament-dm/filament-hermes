@@ -310,6 +310,14 @@ class FilamentAPI:
         """List loops the agent has been invited to but hasn't joined yet."""
         return await self.call_tool("list_pending_invites", {})
 
+    async def list_vouches(self) -> dict[str, Any]:
+        """List pending vouches (loop members who vouched the agent into a loop)."""
+        return await self.call_tool("list_vouches", {})
+
+    async def accept_vouch(self, loop_id: str) -> dict[str, Any]:
+        """Accept a vouch: knock on the loop so a loop admin can approve the agent."""
+        return await self.call_tool("accept_vouch", {"loop_id": loop_id})
+
     async def accept_invite(self, loop_id: str) -> dict[str, Any]:
         """Accept a pending invite (join a loop)."""
         return await self.call_tool("accept_invite", {"loop_id": loop_id})

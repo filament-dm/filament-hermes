@@ -145,6 +145,23 @@ class InviteMessage:
 
 
 @dataclass
+class VouchMessage:
+    """A parsed vouch (knock-invite) notification from Filament's DirectPusher.
+
+    A loop member vouched the agent into a loop. Unlike an invite this is not
+    an ``m.room.member`` invite — it lands in the agent's knock-invite mailbox,
+    so it never surfaces via the invite path. Accepting it knocks on the loop,
+    turning the vouch into a member proposal a loop admin then approves.
+    """
+
+    loop_id: str
+    inviter: str  # display name of the voucher
+    inviter_id: str  # mxid of the voucher
+    loop_name: str | None  # loop (space) name, when known
+    raw: dict
+
+
+@dataclass
 class ReactionMessage:
     """A parsed emoji-reaction notification from Filament's DirectPusher.
 
@@ -282,6 +299,25 @@ def _build_invite_message(env: Envelope) -> InviteMessage | None:
     )
 
 
+def _build_vouch_message(env: Envelope) -> "VouchMessage | None":
+    """Build a ``VouchMessage`` from a ``knock_invite_received`` envelope.
+
+    The loop id lives on the branch (``loop_id``), not the payload top level."""
+    branch = env.branch
+    if branch is None:
+        return None
+    loop_id = branch.get("loop_id") or env.payload.get("room_id", "")
+    if not loop_id:
+        return None
+    return VouchMessage(
+        loop_id=loop_id,
+        inviter=branch.get("inviter", ""),
+        inviter_id=branch.get("inviter_id", ""),
+        loop_name=branch.get("loop"),
+        raw=env.payload,
+    )
+
+
 def _build_reaction(env: Envelope) -> "ReactionMessage | None":
     """Build a ``ReactionMessage`` from a ``reaction`` envelope."""
     branch = env.branch
@@ -312,6 +348,7 @@ class FilamentFCMClient:
         credentials: CredentialStore,
         on_ping: Callable[[dict], Any] | None = None,
         on_invite: Callable[["InviteMessage"], Any] | None = None,
+        on_vouch: Callable[["VouchMessage"], Any] | None = None,
         on_reaction: Callable[["ReactionMessage"], Any] | None = None,
         on_receiver_dead: Callable[[str], Any] | None = None,
     ) -> None:
@@ -319,6 +356,7 @@ class FilamentFCMClient:
         self._on_message = on_message
         self._on_ping = on_ping
         self._on_invite = on_invite
+        self._on_vouch = on_vouch
         self._on_reaction = on_reaction
         self._on_receiver_dead = on_receiver_dead
         self._credential_store = credentials
@@ -488,6 +526,7 @@ class FilamentFCMClient:
         "channel_message": "_dispatch_message",
         "add_to_channel": "_dispatch_invite",
         "add_to_space": "_dispatch_invite",
+        "knock_invite_received": "_dispatch_vouch",
         "reaction": "_dispatch_reaction",
         "io.filament.ping": "_dispatch_ping",
     }
@@ -576,6 +615,19 @@ class FilamentFCMClient:
         )
         if self._on_invite is not None:
             self._on_invite(invite)
+
+    def _dispatch_vouch(self, env: Envelope) -> None:
+        """Handle ``knock_invite_received`` — a member vouched the agent into a loop."""
+        vouch = _build_vouch_message(env)
+        if vouch is None:
+            return
+        logger.info(
+            "filament-fcm: vouch received (into %s from %s)",
+            vouch.loop_name or vouch.loop_id,
+            vouch.inviter,
+        )
+        if self._on_vouch is not None:
+            self._on_vouch(vouch)
 
     def _dispatch_reaction(self, env: Envelope) -> None:
         """Handle ``reaction`` — an emoji reaction, a wake-up signal."""
