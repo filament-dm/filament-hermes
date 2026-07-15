@@ -1057,18 +1057,24 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # Reactive plane: wake only if the policy admits this message. A mention
         # is the server's flag (is_mention_of_recipient / @everyone) first, with
-        # a body text-match as a fallback.
+        # a body text-match as a fallback. A message inside a thread (thread_id
+        # set) counts as an engaged-thread signal: the server only pushes these
+        # to us because we replied there and got auto-subscribed (ENG-724).
         mentioned = (
             msg.is_mention
             or msg.is_everyone_mention
             or self._mentions_me(msg.body or "")
         )
-        if not self._wake_policy.should_wake_message(msg.room_id, mentioned):
+        in_thread = bool(msg.thread_id)
+        if not self._wake_policy.should_wake_message(
+            msg.room_id, mentioned, in_thread=in_thread
+        ):
             logger.info(
                 "filament-fcm: skipping message in %s (wake policy: not woken; "
-                "mention=%s)",
+                "mention=%s, in_thread=%s)",
                 msg.room_name,
                 mentioned,
+                in_thread,
             )
             return
 
