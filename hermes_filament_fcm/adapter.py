@@ -973,13 +973,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             parsed = FilamentAPI.parse_tool_result(raw)
             messages = parsed.get("messages", []) if isinstance(parsed, dict) else []
         except Exception:  # enrichment only, never fatal to a turn
-            logger.debug(
+            logger.warning(
                 "filament-fcm: context breadcrumb read failed for %s",
                 channel,
                 exc_info=True,
             )
             return None
-        return context_breadcrumb(messages, trigger_event_id=trigger_event_id)
+        crumb = context_breadcrumb(messages, trigger_event_id=trigger_event_id)
+        logger.info(
+            "filament-fcm: context breadcrumb for %s: %d messages read, cue=%s",
+            channel,
+            len(messages),
+            "set" if crumb else "none",
+        )
+        return crumb
 
     async def _handle_control_message(self, msg: PushMessage) -> None:
         """Backchannel (control plane): the principal commands the agent
