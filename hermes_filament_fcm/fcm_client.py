@@ -54,6 +54,35 @@ _DEFAULT_FIREBASE_API_KEY = "AIzaSyBtYzzP3IRpmIZ57dp1PMS4Y8RPjTB0snk"
 _DEFAULT_FIREBASE_APP_ID = "1:143821144946:web:90e517a7f36aa42a6093eb"
 _DEFAULT_FIREBASE_SENDER_ID = "143821144946"
 
+# Fresh FCM registration is flaky: Google's GCM registration intermittently
+# returns PHONE_REGISTRATION_ERROR, and firebase-messaging only retries twice
+# internally, so a no-saved-creds registration fails outright a large fraction
+# of the time. That makes a first-boot gateway connect unreliable. Retry the
+# whole registration here so the very first connect is dependable; saved-cred
+# checkins normally succeed on the first attempt and pay no penalty. Tunable
+# via env for constrained/offline environments.
+_DEFAULT_REGISTER_ATTEMPTS = 12
+# Gentle backoff: PHONE_REGISTRATION_ERROR failures cluster (Google rate-limits
+# bursts of fresh registrations), so spreading attempts out clears a burst
+# better than hammering. Capped so all attempts still fit the gateway's connect
+# window.
+_REGISTER_RETRY_BASE_S = 1.5
+_REGISTER_RETRY_CAP_S = 5.0
+
+
+def _register_retry_sleep(attempt: int) -> float:
+    return min(_REGISTER_RETRY_BASE_S * attempt, _REGISTER_RETRY_CAP_S)
+
+
+def _register_attempts() -> int:
+    raw = os.environ.get("FILAMENT_FCM_REGISTER_ATTEMPTS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return _DEFAULT_REGISTER_ATTEMPTS
+
 
 @dataclass
 class FCMConfig:
@@ -330,19 +359,48 @@ class FilamentFCMClient:
         # a push whose ack never flushed (e.g. the /restart that killed the
         # previous gateway) is redelivered on every connect — and a
         # redelivered /restart restarts the gateway in an infinite loop.
-        self._push_client = FcmPushClient(
-            callback=on_notification,
-            fcm_config=fcm_config,
-            credentials=saved_creds,
-            credentials_updated_callback=on_credentials_updated,
-            received_persistent_ids=self._received_ids.ids,
-        )
-
-        self._fcm_token = await self._push_client.checkin_or_register()
-        logger.info(
-            "FCM token: %s...", self._fcm_token[:20] if self._fcm_token else "None"
-        )
-        return self._fcm_token
+        #
+        # Retry the registration: fresh (no-saved-creds) registrations hit
+        # Google's flaky PHONE_REGISTRATION_ERROR and firebase-messaging only
+        # retries twice internally, so a single call fails often. A fresh
+        # client is built per attempt because the library's register() is not
+        # safely re-runnable on an already-failed client.
+        attempts = _register_attempts()
+        last_exc: Exception | None = None
+        for i in range(1, attempts + 1):
+            client = FcmPushClient(
+                callback=on_notification,
+                fcm_config=fcm_config,
+                credentials=saved_creds,
+                credentials_updated_callback=on_credentials_updated,
+                received_persistent_ids=self._received_ids.ids,
+            )
+            try:
+                token = await client.checkin_or_register()
+            except Exception as e:  # noqa: BLE001 — library raises bare RuntimeError
+                last_exc = e
+                logger.warning(
+                    "filament-fcm: FCM registration attempt %s/%s failed: %s",
+                    i,
+                    attempts,
+                    e,
+                )
+                token = None
+            if token:
+                self._push_client = client
+                self._fcm_token = token
+                logger.info(
+                    "FCM token: %s... (registered on attempt %s/%s)",
+                    token[:20],
+                    i,
+                    attempts,
+                )
+                return token
+            if i < attempts:
+                await asyncio.sleep(_register_retry_sleep(i))
+        raise RuntimeError(
+            f"FCM registration failed after {attempts} attempts"
+        ) from last_exc
 
     async def start(self) -> None:
         """Start listening for push notifications and arm death detection.
