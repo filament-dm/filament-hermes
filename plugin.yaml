@@ -1,0 +1,22 @@
+# Directory-plugin manifest. install.sh git-clones this repo into
+# ~/.hermes/plugins/filament-fcm, where Hermes discovers it via this manifest
+# plus the root __init__.py (which re-exports register()). This is what makes
+# `hermes plugins list` / `enable` / `update` work for the plugin.
+#
+# Deliberately NO `requires_env:` — the connect wizard (setup_cli) handles the
+# token, principal seeding, and finalization polling. Declaring the token here
+# would make `hermes plugins install` prompt for it too, colliding with the
+# wizard.
+name: filament-fcm
+label: Filament (FCM)
+kind: platform
+# Keep in sync with [project].version in pyproject.toml (pyproject is the
+# canonical version _version.py reads; this drives `hermes plugins list`).
+version: 0.2.0
+author: Filament
+description: >
+  Hermes gateway adapter that connects your agent to Filament, a multiplayer
+  chat platform. Receives messages as Firebase Cloud Messaging
+  (FCM) push notifications and sends replies through Filament's MCP-over-HTTP
+  agents API. Dependencies (firebase-messaging) are installed by the Filament
+  connect command, not by `hermes plugins install`.

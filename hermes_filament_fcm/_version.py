@@ -1,15 +1,28 @@
 """Plugin version helpers (stdlib-only, unit-testable).
 
-The installed distribution version is attached to every HTTP request the
-plugin makes to the Filament server — as a ``User-Agent`` /
-``X-Filament-Plugin-Version`` header pair plus the MCP ``clientInfo`` on
-``initialize`` — so the server can tell what version deployed agents are
-running. ``update_check.py`` builds the update-available reminder on the
-same helpers.
+The installed version is attached to every HTTP request the plugin makes to
+the Filament server — as a ``User-Agent`` / ``X-Filament-Plugin-Version``
+header pair plus the MCP ``clientInfo`` on ``initialize`` — so the server can
+tell what version deployed agents are running. ``update_check.py`` builds the
+update-available reminder on the same helpers.
+
+Version resolution order (``plugin_version``):
+
+1. The ``pyproject.toml`` shipped alongside this code (the plugin's own
+   directory). This is the source of truth for a **directory install**
+   (git-cloned into ~/.hermes/plugins/filament-fcm): ``hermes plugins update``
+   git-pulls that tree, so reading the version from it means the reported
+   version tracks the code that is actually running — unlike
+   ``importlib.metadata``, which would report a stale/absent pip dist-info.
+2. ``importlib.metadata`` — for a legacy pip install of the package.
+3. ``"unknown"`` — a source checkout that was never installed; version
+   comparison treats it as unparseable, so the update reminder stays quiet
+   rather than nagging developers.
 """
 
 import re
 from importlib.metadata import version as _dist_version
+from pathlib import Path
 
 DIST_NAME = "hermes-filament-fcm"
 REPO_URL = "https://github.com/filament-dm/filament-hermes"
@@ -21,14 +34,42 @@ LATEST_PYPROJECT_URL = (
     "main/pyproject.toml"
 )
 
+# First `version = "..."` line wins — in this repo's pyproject.toml that is
+# the [project] version (ruff/hatch sections carry no version key).
+_PYPROJECT_VERSION_RE = re.compile(
+    r"^\s*version\s*=\s*[\"']([^\"']+)[\"']", re.MULTILINE
+)
+
+
+def version_from_pyproject(text: str) -> str | None:
+    """Extract the [project] version from pyproject.toml text.
+
+    A regex instead of a real TOML parse: tomllib is 3.11+ and this must
+    stay stdlib-only for older interpreters.
+    """
+    match = _PYPROJECT_VERSION_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _version_from_local_pyproject() -> str | None:
+    """Read the version from the pyproject.toml next to this package.
+
+    This file lives at ``<plugin_root>/hermes_filament_fcm/_version.py``, so the
+    plugin's pyproject.toml is two levels up. Present in a git checkout and in a
+    directory install; absent when only the package (no repo) was pip-installed.
+    """
+    try:
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        return version_from_pyproject(pyproject.read_text())
+    except Exception:
+        return None
+
 
 def plugin_version() -> str:
-    """The installed distribution's version, or "unknown".
-
-    "unknown" covers running from a source checkout that was never
-    pip-installed — version comparison treats it as unparseable, so the
-    update reminder stays quiet rather than nagging developers.
-    """
+    """The running plugin's version, or "unknown" (see module docstring)."""
+    local = _version_from_local_pyproject()
+    if local:
+        return local
     try:
         return _dist_version(DIST_NAME)
     except Exception:
@@ -50,23 +91,6 @@ def version_headers() -> dict:
         "User-Agent": USER_AGENT,
         "X-Filament-Plugin-Version": PLUGIN_VERSION,
     }
-
-
-# First `version = "..."` line wins — in this repo's pyproject.toml that is
-# the [project] version (ruff/hatch sections carry no version key).
-_PYPROJECT_VERSION_RE = re.compile(
-    r"^\s*version\s*=\s*[\"']([^\"']+)[\"']", re.MULTILINE
-)
-
-
-def version_from_pyproject(text: str) -> str | None:
-    """Extract the [project] version from pyproject.toml text.
-
-    A regex instead of a real TOML parse: tomllib is 3.11+ and this must
-    stay stdlib-only for older interpreters.
-    """
-    match = _PYPROJECT_VERSION_RE.search(text)
-    return match.group(1) if match else None
 
 
 def _version_tuple(version: str) -> tuple | None:

@@ -12,6 +12,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
 
 
@@ -53,11 +55,27 @@ class _StubPushClient:
                 task.cancel()
 
 
+# The plugin imports firebase_messaging lazily (inside checkin_or_register), so
+# the stub must be the active sys.modules entry when a test RUNS, not just when
+# this module is imported. Other standalone test modules overwrite
+# sys.modules["firebase_messaging"] during collection, so keep a reference and
+# reinstall it per test via the autouse fixture below.
+_FIREBASE_STUB = types.ModuleType("firebase_messaging")
+_FIREBASE_STUB.FcmPushClient = _StubPushClient
+_FIREBASE_STUB.FcmRegisterConfig = _StubRegisterConfig
+
+
+@pytest.fixture(autouse=True)
+def _use_firebase_stub():
+    prev = sys.modules.get("firebase_messaging")
+    sys.modules["firebase_messaging"] = _FIREBASE_STUB
+    yield
+    if prev is not None:
+        sys.modules["firebase_messaging"] = prev
+
+
 def _load_fcm_client_module():
-    stub = types.ModuleType("firebase_messaging")
-    stub.FcmPushClient = _StubPushClient
-    stub.FcmRegisterConfig = _StubRegisterConfig
-    sys.modules["firebase_messaging"] = stub
+    sys.modules["firebase_messaging"] = _FIREBASE_STUB
 
     pkg = types.ModuleType("hermes_filament_fcm")
     pkg.__path__ = [str(_PKG_DIR)]

@@ -27,8 +27,13 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar
 
-from firebase_messaging import FcmPushClient, FcmRegisterConfig
-
+# NOTE: firebase-messaging is imported lazily (inside checkin_or_register),
+# not at module top level. This plugin is installed as a directory plugin
+# whose Python dependencies are installed separately (see install.sh); the
+# runtime dep-check in ``__init__._dep_problem`` turns a missing/outdated
+# firebase-messaging into an actionable message BEFORE we reach this import,
+# instead of a raw ImportError at plugin load. Keep firebase out of the
+# import path that ``register()`` triggers.
 from .credentials import CredentialStore, ReceivedPersistentIds
 
 logger = logging.getLogger("gateway.filament_fcm")
@@ -377,6 +382,15 @@ class FilamentFCMClient:
         Loads saved credentials if available, otherwise performs a fresh
         registration with Google's Checkin and FCM APIs.
         """
+        # Lazy import: keeps firebase-messaging out of the plugin-load path so
+        # a missing/outdated dep is reported by the dep-check, not a raw
+        # ImportError. By the time connect() calls this, check_requirements()
+        # has already verified the dep is present and in range.
+        from firebase_messaging import (  # noqa: PLC0415
+            FcmPushClient,
+            FcmRegisterConfig,
+        )
+
         fcm_config = FcmRegisterConfig(
             self._config.project_id,
             self._config.app_id,
