@@ -150,30 +150,17 @@ class WakePolicyStore:
         {
           "trigger_emojis": ["🐞", "🐛", "🤖"],   # reactions that wake
           "reactive_wake": "mention",               # "mention" | "all" | "off"
-          "thread_wake": "engaged",                 # "engaged" | "off"
           "per_channel": {"<room_id>": {"reactive_wake": "all",
                                          "trigger_emojis": [...]}}
         }
 
     Defaults are conservative: respond only when @-mentioned, no reaction
     triggers, until the principal configures it from the backchannel.
-
-    `thread_wake` is the one exception, and it defaults on ("engaged"): once
-    the agent has replied in a thread, the server auto-subscribes it and pushes
-    that thread's later messages even without a re-mention (synapse#796). In a
-    mention-gated channel — the reactive default — an un-mentioned message can
-    only reach us via that subscription, so a delivered in-thread message is
-    itself the engagement signal and we wake on it. This is what keeps the
-    agent in a back-and-forth without being re-tagged every turn (ENG-724).
-    (Limitation: in a notify-all room the server pushes every thread, so
-    thread_wake there can wake on threads the agent isn't part of; set
-    thread_wake="off" per_channel if that's unwanted.)
     """
 
     _DEFAULTS: ClassVar[dict] = {
         "trigger_emojis": [],
         "reactive_wake": "mention",
-        "thread_wake": "engaged",
         "per_channel": {},
     }
 
@@ -207,33 +194,16 @@ class WakePolicyStore:
         per = policy.get("per_channel") or {}
         return per.get(room_id, {}) if isinstance(per, dict) else {}
 
-    def should_wake_message(
-        self, room_id: str, is_mention: bool, in_thread: bool = False
-    ) -> bool:
-        """Decide whether an inbound shared-channel message wakes a turn.
-
-        Wakes when the channel is set to "all", when the message @-mentions
-        the agent (unless muted), or when it lands in a thread the agent is
-        engaged in — the delivery of an un-mentioned in-thread message being
-        the engagement signal (see the class docstring; ENG-724). A muted
-        channel (reactive_wake="off") suppresses all three.
-        """
+    def should_wake_message(self, room_id: str, is_mention: bool) -> bool:
         policy = self.read()
         ch = self._channel(policy, room_id)
         mode = ch.get("reactive_wake", policy.get("reactive_wake", "mention"))
-        thread_mode = ch.get("thread_wake", policy.get("thread_wake", "engaged"))
-        woke = mode == "all" or (
-            mode != "off"
-            and (bool(is_mention) or (in_thread and thread_mode == "engaged"))
-        )
+        woke = mode == "all" or (mode != "off" and bool(is_mention))
         logger.info(
-            "filament-fcm: wake(message) room=%s mode=%s thread_mode=%s "
-            "mention=%s in_thread=%s → %s",
+            "filament-fcm: wake(message) room=%s mode=%s mention=%s → %s",
             room_id,
             mode,
-            thread_mode,
             is_mention,
-            in_thread,
             woke,
         )
         return woke

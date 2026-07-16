@@ -335,9 +335,6 @@ def _wake_policy_error(policy: dict) -> str | None:
         rw = scope.get("reactive_wake")
         if rw is not None and rw not in ("mention", "all", "off"):
             return f"reactive_wake{where} must be 'mention', 'all', or 'off'."
-        tw = scope.get("thread_wake")
-        if tw is not None and tw not in ("engaged", "off"):
-            return f"thread_wake{where} must be 'engaged' or 'off'."
         te = scope.get("trigger_emojis")
         if te is not None and not (
             isinstance(te, list) and all(isinstance(e, str) for e in te)
@@ -456,10 +453,8 @@ def _register_reactive_tools(ctx: Any) -> None:
         "set_wake_policy",
         "Set the wake policy that decides whether a shared-channel event wakes "
         "the agent. Object with: trigger_emojis (list of emoji that wake on "
-        "reaction), reactive_wake ('mention' | 'all' | 'off'), thread_wake "
-        "('engaged' | 'off'; default 'engaged' keeps replying to follow-ups in "
-        "threads you're already in), and optional per_channel overrides keyed "
-        "by room id. Backchannel/owner only.",
+        "reaction), reactive_wake ('mention' | 'all' | 'off'), and optional "
+        "per_channel overrides keyed by room id. Backchannel/owner only.",
         {
             "type": "object",
             "properties": {"policy": {"type": "object"}},
