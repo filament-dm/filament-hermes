@@ -26,11 +26,9 @@
 # means re-running this command, which the plugin's dep-check will prompt for.
 set -euo pipefail
 
-# Runtime Python dependencies. Keep in sync with [project.dependencies] in
-# pyproject.toml and REQUIRED in hermes_filament_fcm/deps.py. httpx is already a
-# Hermes core dependency (installing it here is a harmless no-op); firebase-
-# messaging (with its aiohttp/cryptography/protobuf stack) is the real payload.
-FCM_DEPS=("firebase-messaging>=0.4.5,<1" "httpx>=0.24")
+# Runtime Python dependencies are read from the cloned pyproject.toml below
+# ([project.dependencies]) — the single source of truth — so a dependency added
+# there is never silently missed by this installer.
 
 # Where to clone the plugin from. FILAMENT_FCM_REPO accepts either a plain git
 # URL or a pip-style "git+<url>[@<ref>]" requirement — the Filament app and some
@@ -175,8 +173,6 @@ else
   info "Installing dependencies into $VENV ..."
 fi
 
-"$UV" pip install ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}"
-
 # --- Install the plugin (as a Hermes directory plugin) -----------------------
 # Clone the plugin into $HERMES_HOME/plugins/filament-fcm, where Hermes
 # discovers it via its plugin.yaml + __init__.py. A real clone (not a copy)
@@ -211,6 +207,52 @@ else
     || err "could not fetch ref '$PLUGIN_REF' from $PLUGIN_REPO_URL (branch, tag, or commit)."
   "$GIT" -C "$CLONE_TMP" checkout -q --detach FETCH_HEAD || err "git checkout of '$PLUGIN_REF' failed."
 fi
+
+# Install the plugin's declared runtime dependencies, read straight from the
+# cloned pyproject.toml ([project.dependencies]) so this installer never drifts
+# from what the code needs. Done before the swap below, so a failed dep install
+# leaves any previously-working plugin in place.
+#
+# --upgrade so re-running the install command is the way to pull dependency
+# updates: each dep is brought to the newest version satisfying its pyproject
+# constraint (a fresh install just installs; a re-run upgrades). `hermes plugins
+# update` only pulls code, so this installer is the dependency-refresh path.
+info "Installing/upgrading plugin dependencies ..."
+FCM_DEPS=()
+while IFS= read -r _dep; do
+  [ -n "$_dep" ] && FCM_DEPS+=("$_dep")
+done < <("$PY" - "$CLONE_TMP/pyproject.toml" <<'PYEOF'
+import sys
+
+# Parse pyproject.toml properly so requirement extras (e.g. "httpx[socks]") and
+# other bracket content inside requirement strings don't confuse extraction.
+# tomllib is stdlib on 3.11+; fall back to tomli, then to nothing (the bash
+# caller substitutes a safe built-in dependency set when this prints empty).
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+
+deps = []
+if tomllib is not None:
+    try:
+        with open(sys.argv[1], "rb") as f:
+            deps = tomllib.load(f).get("project", {}).get("dependencies", []) or []
+    except Exception:
+        deps = []
+print("\n".join(d for d in deps if isinstance(d, str)))
+PYEOF
+)
+if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
+  # A pyproject parse hiccup must never leave the plugin without its hard
+  # dependency — fall back to the essential set.
+  warn "could not read dependencies from pyproject.toml; using built-in defaults."
+  FCM_DEPS=("firebase-messaging>=0.4.5,<1" "httpx>=0.24" "structlog>=25.5.0,<26")
+fi
+"$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}"
 
 # Write the directory-plugin entry point. Hermes loads $PLUGIN_DIR/__init__.py
 # and calls register(); the real code lives in the nested hermes_filament_fcm

@@ -1,8 +1,19 @@
-"""Structured logging helpers for the Filament Hermes plugin."""
+"""Structured logging helpers for the Filament Hermes plugin.
+
+``structlog`` is a real dependency (see pyproject / install.sh), but it is
+imported **defensively** here: this module is pulled in at plugin-load time (the
+adapter and fcm_client create a module-level logger), so a hard ``import
+structlog`` would make the whole plugin fail to load if the dependency is ever
+missing — e.g. after a code-only ``hermes plugins update`` that pulled new code
+before the deps were refreshed. Instead we fall back to a small stdlib-logging
+shim so the gateway keeps running with (plainer) logs; ``deps.py`` nudges the
+principal to refresh dependencies to restore full structured logging.
+"""
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -10,12 +21,53 @@ from hashlib import sha256
 from secrets import token_hex
 from typing import Any
 
-import structlog
+try:
+    import structlog
+except ImportError:  # pragma: no cover - exercised only when the dep is absent
+    structlog = None
+
+
+class _FallbackLogger:
+    """Minimal structlog-style logger over stdlib logging.
+
+    Used only when ``structlog`` is not installed. Supports the surface the
+    plugin uses: ``bind(**)`` plus ``debug/info/warning/error/exception(event,
+    **fields)``, rendering ``event key=value`` so logs stay readable.
+    """
+
+    def __init__(self, name: str = "gateway.filament_fcm", **bound: Any) -> None:
+        self._logger = logging.getLogger(name)
+        self._bound = bound
+
+    def bind(self, **kw: Any) -> _FallbackLogger:
+        return _FallbackLogger(self._logger.name, **{**self._bound, **kw})
+
+    def _emit(self, level: int, event: str, exc_info: bool = False, **kw: Any) -> None:
+        fields = {**self._bound, **kw}
+        suffix = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+        tail = f" {suffix}" if suffix else ""
+        self._logger.log(level, "%s%s", event, tail, exc_info=exc_info)
+
+    def debug(self, event: str = "", **kw: Any) -> None:
+        self._emit(logging.DEBUG, event, **kw)
+
+    def info(self, event: str = "", **kw: Any) -> None:
+        self._emit(logging.INFO, event, **kw)
+
+    def warning(self, event: str = "", **kw: Any) -> None:
+        self._emit(logging.WARNING, event, **kw)
+
+    def error(self, event: str = "", **kw: Any) -> None:
+        self._emit(logging.ERROR, event, **kw)
+
+    def exception(self, event: str = "", **kw: Any) -> None:
+        kw.pop("exc_info", None)
+        self._emit(logging.ERROR, event, exc_info=True, **kw)
 
 
 def _configure_structlog() -> None:
     """Configure structlog to render key=value messages into gateway.log."""
-    if structlog.is_configured():
+    if structlog is None or structlog.is_configured():
         return
     structlog.configure(
         processors=[
@@ -67,6 +119,8 @@ _CONTEXT_KEYS = {
 
 
 def get_logger(name: str = "gateway.filament_fcm") -> Any:
+    if structlog is None:
+        return _FallbackLogger(name)
     return structlog.get_logger(name)
 
 
@@ -84,6 +138,8 @@ def fingerprint(value: str | None, *, size: int = 12) -> str | None:
 
 def current_context() -> dict[str, str]:
     """Return non-empty correlation fields for the current task."""
+    if structlog is None:
+        return {}
     return {
         key: value
         for key, value in structlog.contextvars.get_contextvars().items()
@@ -94,6 +150,9 @@ def current_context() -> dict[str, str]:
 @contextlib.contextmanager
 def bound_context(**values: str | None) -> Iterator[None]:
     """Temporarily bind correlation fields to the current context/task."""
+    if structlog is None:
+        yield
+        return
     bind_values = {
         key: value for key, value in values.items() if value and key in _CONTEXT_KEYS
     }
