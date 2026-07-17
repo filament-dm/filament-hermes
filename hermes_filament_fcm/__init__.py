@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
-from .deps import dep_problem
+from .deps import dep_problem, optional_dep_warnings
 from .filament_api import FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .observability import bound_context
@@ -137,6 +137,10 @@ def check_requirements() -> bool:
     if problem:
         logger.warning("filament-fcm: dependency check failed — %s", problem)
         return False
+    # Soft deps (e.g. structlog): the plugin still runs, just degraded, so nudge
+    # rather than refuse to start.
+    for warning in optional_dep_warnings():
+        logger.warning("filament-fcm: %s", warning)
     return True
 
 

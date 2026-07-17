@@ -27,11 +27,18 @@ import re
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
-# Single source of truth for the runtime dependency contract. Keep in sync with
-# [project.dependencies] in pyproject.toml and the deps install.sh installs.
-# httpx is a Hermes core dependency, so it is always present; only the
-# FCM-specific dep is worth checking at runtime.
+# HARD dependencies — the plugin cannot function without these, so a missing
+# one makes check_requirements() fail (the platform stays down with an
+# actionable message). Keep in sync with [project.dependencies] in
+# pyproject.toml. httpx is a Hermes core dependency, so it is always present;
+# only the FCM-specific dep is worth checking at runtime.
 REQUIRED = {"firebase-messaging": ">=0.4.5,<1"}
+
+# SOFT dependencies — the plugin runs without these but in a degraded mode, so a
+# missing one produces a warning nudge rather than taking the platform down.
+# structlog powers structured logging (see observability.py, which falls back to
+# plain stdlib logging when it's absent).
+OPTIONAL = {"structlog": ">=25.5.0,<26"}
 
 # How the operator refreshes deps when a release bumps them (rare). install.sh
 # is idempotent and re-installs the current deps.
@@ -126,3 +133,34 @@ def dep_problem() -> str | None:
                 f"To fix: {REFRESH_HINT}."
             )
     return None
+
+
+def optional_dep_warnings() -> list[str]:
+    """Return nudges for missing/out-of-range SOFT dependencies.
+
+    Unlike :func:`dep_problem`, these never take the platform down — the plugin
+    runs in a degraded mode without them (e.g. plain instead of structured
+    logging). Typically triggered after a code-only ``hermes plugins update``
+    that pulled code needing a newly-added optional dep.
+    """
+    warnings: list[str] = []
+    for name, spec in OPTIONAL.items():
+        module = name.replace("-", "_")
+        try:
+            __import__(module)
+        except Exception:
+            warnings.append(
+                f"{name} is not installed — running in a degraded mode "
+                f"(observability logs will be plain text). To restore: {REFRESH_HINT}."
+            )
+            continue
+        try:
+            installed = _dist_version(name)
+        except PackageNotFoundError:
+            continue
+        if not satisfies(installed, spec):
+            warnings.append(
+                f"{name} {installed} does not satisfy {spec} — some features may "
+                f"be degraded. To fix: {REFRESH_HINT}."
+            )
+    return warnings

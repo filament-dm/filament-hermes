@@ -86,3 +86,35 @@ def test_dep_problem_ok(monkeypatch):
     monkeypatch.setitem(sys.modules, "firebase_messaging", stub)
     monkeypatch.setattr(deps, "_dist_version", lambda name: "0.4.5")
     assert deps.dep_problem() is None
+
+
+# ── optional_dep_warnings() — soft deps (e.g. structlog) ─────────────
+
+
+def test_optional_warning_when_soft_dep_missing(monkeypatch):
+    # A soft dep that isn't importable → a nudge, but never a hard failure.
+    monkeypatch.setattr(deps, "OPTIONAL", {"nonexistent-soft-dep": ">=1,<2"})
+    monkeypatch.delitem(sys.modules, "nonexistent_soft_dep", raising=False)
+    warnings = deps.optional_dep_warnings()
+    assert len(warnings) == 1
+    assert "nonexistent-soft-dep" in warnings[0]
+    assert deps.REFRESH_HINT in warnings[0]
+
+
+def test_optional_no_warning_when_soft_dep_present(monkeypatch):
+    # Importable and in range → no nudge.
+    stub = types.ModuleType("structlog")
+    monkeypatch.setattr(deps, "OPTIONAL", {"structlog": ">=25.5.0,<26"})
+    monkeypatch.setitem(sys.modules, "structlog", stub)
+    monkeypatch.setattr(deps, "_dist_version", lambda name: "25.5.0")
+    assert deps.optional_dep_warnings() == []
+
+
+def test_optional_warning_when_soft_dep_out_of_range(monkeypatch):
+    stub = types.ModuleType("structlog")
+    monkeypatch.setattr(deps, "OPTIONAL", {"structlog": ">=25.5.0,<26"})
+    monkeypatch.setitem(sys.modules, "structlog", stub)
+    monkeypatch.setattr(deps, "_dist_version", lambda name: "24.1.0")
+    warnings = deps.optional_dep_warnings()
+    assert len(warnings) == 1
+    assert "structlog" in warnings[0]
