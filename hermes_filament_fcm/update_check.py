@@ -50,10 +50,10 @@ def build_reminder(latest: str, current: str) -> str:
         f"📦 A new version of the Filament↔Hermes plugin is available: "
         f"v{latest} (this agent runs v{current}). To update, run on the "
         f"machine hosting this agent:\n"
-        f"```\nuv pip install --upgrade 'git+{REPO_URL}.git' "
-        f"&& hermes gateway restart\n```\n"
-        f"(use the Hermes venv's uv/pip — the same environment the plugin "
-        f"was installed into)"
+        f"```\nhermes plugins update filament-fcm && hermes gateway restart\n```\n"
+        f"If the plugin reports a dependency problem after updating (rare — only "
+        f"when a release bumps a dependency), re-run the connect command from "
+        f"the Filament app instead, which also refreshes dependencies."
     )
 
 

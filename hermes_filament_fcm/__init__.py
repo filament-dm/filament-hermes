@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
+from .deps import dep_problem
 from .filament_api import FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .reactive import InstructionsStore, WakePolicyStore, current_zone
@@ -116,12 +117,24 @@ def _make_tool_handler(tool_name: str, api: FilamentAPI):
 def check_requirements() -> bool:
     """Called by Hermes to check if this platform can be enabled.
 
-    Only ``FILAMENT_MCP_TOKEN`` is required.  The principal (owner) is
-    auto-discovered from the MCP ``get_self`` tool during startup, so
-    ``FILAMENT_CONTROL_USERS`` is optional (for additional senders).
+    Requires ``FILAMENT_MCP_TOKEN`` and the firebase-messaging dependency
+    stack. The principal (owner) is auto-discovered from the MCP ``get_self``
+    tool during startup, so ``FILAMENT_CONTROL_USERS`` is optional (for
+    additional senders).
+
+    The dependency check matters because this plugin ships as a *directory
+    plugin* whose deps are installed out of band (see install.sh) and are not
+    refreshed by ``hermes plugins update``. A release that bumps a dep, pulled
+    via ``plugins update`` without a dep refresh, would otherwise crash with a
+    raw ImportError deep in ``connect()``; here it surfaces as an actionable
+    warning and the platform simply stays down until the dep is refreshed.
     """
     if not os.environ.get("FILAMENT_MCP_TOKEN"):
         logger.debug("filament-fcm: missing env var: FILAMENT_MCP_TOKEN")
+        return False
+    problem = dep_problem()
+    if problem:
+        logger.warning("filament-fcm: dependency check failed — %s", problem)
         return False
     return True
 
@@ -193,7 +206,10 @@ def register(ctx: Any) -> None:
             "FILAMENT_MCP_TOKEN",
         ],
         install_hint=(
-            "pip install hermes-filament-fcm\nThen run: hermes gateway setup"
+            "Install with the one-line connect command from the Filament app "
+            "(it installs the plugin and its dependencies, then connects). "
+            "If this platform is down after a `hermes plugins update`, a "
+            "dependency likely needs refreshing — re-run that connect command."
         ),
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="FILAMENT_HOME_ROOM",

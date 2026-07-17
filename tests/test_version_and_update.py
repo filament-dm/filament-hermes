@@ -172,7 +172,9 @@ def test_update_check_disabled_env(monkeypatch):
 def test_build_reminder_mentions_versions():
     note = update_check.build_reminder("0.2.0", "0.1.0")
     assert "0.2.0" in note and "0.1.0" in note
-    assert "filament-hermes" in note  # repo url → how to update
+    # The plugin is a directory plugin now, so the update instruction is the
+    # `hermes plugins update` command (not a pip/repo URL).
+    assert "hermes plugins update" in note
 
 
 # ── filament_api: client survives a disconnect/reconnect cycle ───────

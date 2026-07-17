@@ -12,13 +12,48 @@
 #
 # Optional environment overrides:
 #   FILAMENT_MCP_URL     point at staging/local instead of production
-#   FILAMENT_FCM_REPO    install from a different repo/branch (default: https main)
+#   FILAMENT_FCM_REPO    clone the plugin from a different repo URL
+#                        (default: https github main)
+#   FILAMENT_FCM_REF     clone a specific branch/tag/commit (default: repo's
+#                        default branch — used to test unreleased plugin changes)
 #   VIRTUAL_ENV          Hermes venv (default: auto-detected, see below)
 #   HERMES_HOME          Hermes home (default: ~/.hermes)
 #
+# This plugin installs as a Hermes *directory plugin*: its Python dependencies
+# go into the Hermes venv, and the plugin code is git-cloned into
+# $HERMES_HOME/plugins/filament-fcm so `hermes plugins list/update/enable` work.
+# `hermes plugins update` refreshes the code only; a dependency bump (rare)
+# means re-running this command, which the plugin's dep-check will prompt for.
 set -euo pipefail
 
-REPO="${FILAMENT_FCM_REPO:-git+https://github.com/filament-dm/filament-hermes.git}"
+# Runtime Python dependencies. Keep in sync with [project.dependencies] in
+# pyproject.toml and REQUIRED in hermes_filament_fcm/deps.py. httpx is already a
+# Hermes core dependency (installing it here is a harmless no-op); firebase-
+# messaging (with its aiohttp/cryptography/protobuf stack) is the real payload.
+FCM_DEPS=("firebase-messaging>=0.4.5,<1" "httpx>=0.24")
+
+# Where to clone the plugin from. FILAMENT_FCM_REPO accepts either a plain git
+# URL or a pip-style "git+<url>[@<ref>]" requirement — the Filament app and some
+# tooling set it in the pip form. Strip a leading git+, and (unless
+# FILAMENT_FCM_REF is set) treat a trailing "@<ref>" as the branch/tag/commit —
+# whether or not the URL carries the optional ".git" suffix.
+_repo_spec="${FILAMENT_FCM_REPO:-https://github.com/filament-dm/filament-hermes.git}"
+_repo_spec="${_repo_spec#git+}"
+PLUGIN_REF="${FILAMENT_FCM_REF:-}"
+# Only URLs with a scheme (https://, ssh://, ...) can carry a "@<ref>" suffix we
+# split on; the "@" then reliably sits after "://host/path", not in a
+# scp-style "git@host:owner/repo" address (which has no scheme and is left
+# whole). The ref may itself contain "/" (e.g. a "user/branch" name), so split
+# on the LAST "@".
+case "$_repo_spec" in
+  *://*@*)
+    [ -n "$PLUGIN_REF" ] || PLUGIN_REF="${_repo_spec##*@}"
+    PLUGIN_REPO_URL="${_repo_spec%@*}"
+    ;;
+  *)
+    PLUGIN_REPO_URL="$_repo_spec"
+    ;;
+esac
 HERMES_HOME_DEFAULTED=0
 [ -n "${HERMES_HOME:-}" ] || HERMES_HOME_DEFAULTED=1
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -101,11 +136,12 @@ UV="$HERMES_HOME/bin/uv"
 [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
 [ -n "$UV" ] || err "uv not found — install Hermes Agent first (expected $HERMES_HOME/bin/uv)."
 
-# --- Install -----------------------------------------------------------------
-# Sealed images (Docker / cloud) mount the venv read-only; Hermes redirects
-# runtime installs to a writable dir it puts on sys.path at startup
-# (HERMES_LAZY_INSTALL_TARGET, e.g. /opt/data/lazy-packages). Install there
-# so the gateway can import the plugin after restart.
+# --- Install dependencies ----------------------------------------------------
+# Only the Python dependencies go into the venv here — NOT the plugin package
+# (which is cloned as a directory plugin below). Sealed images (Docker / cloud)
+# mount the venv read-only; Hermes redirects runtime installs to a writable dir
+# it puts on sys.path at startup (HERMES_LAZY_INSTALL_TARGET, e.g.
+# /opt/data/lazy-packages). Install deps there so the gateway can import them.
 #
 # The writability test alone can't be trusted here: as root it passes even
 # on the sealed image venv, and writes there land in the container's image
@@ -130,15 +166,87 @@ TARGET_ARGS=()
 PYPATH_PREFIX=""
 if [ "$SEALED" = 1 ] && [ -n "$LAZY_TARGET" ]; then
   mkdir -p "$LAZY_TARGET"
-  info "Hermes venv at $VENV is sealed — installing hermes-filament-fcm into $LAZY_TARGET ..."
+  info "Hermes venv at $VENV is sealed — installing dependencies into $LAZY_TARGET ..."
   TARGET_ARGS=(--target "$LAZY_TARGET")
   PYPATH_PREFIX="$LAZY_TARGET"
 elif [ "$SEALED" = 1 ]; then
   err "Hermes venv at $VENV is sealed (read-only or lazy installs disabled) and HERMES_LAZY_INSTALL_TARGET is not set — nowhere to install."
 else
-  info "Installing hermes-filament-fcm into $VENV ..."
+  info "Installing dependencies into $VENV ..."
 fi
-"$UV" pip install ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "$REPO"
+
+"$UV" pip install ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}"
+
+# --- Install the plugin (as a Hermes directory plugin) -----------------------
+# Clone the plugin into $HERMES_HOME/plugins/filament-fcm, where Hermes
+# discovers it via its plugin.yaml + __init__.py. A real clone (not a copy)
+# leaves a git remote, so `hermes plugins update filament-fcm` can `git pull`
+# later — the whole point of installing this way.
+#
+# Clone into a temp dir first and only swap it into place once complete, so a
+# failed clone/checkout never leaves the machine with the old plugin removed and
+# nothing to replace it.
+GIT="$(command -v git 2>/dev/null || true)"
+[ -n "$GIT" ] || err "git not found — needed to install the plugin."
+PLUGIN_DIR="$HERMES_HOME/plugins/filament-fcm"
+mkdir -p "$HERMES_HOME/plugins"
+CLONE_TMP="$(mktemp -d "$HERMES_HOME/plugins/.filament-fcm.XXXXXX")" \
+  || err "could not create a temp dir under $HERMES_HOME/plugins."
+cleanup_clone_tmp() { rm -rf "$CLONE_TMP" 2>/dev/null || true; }
+trap cleanup_clone_tmp EXIT
+
+info "Cloning plugin from $PLUGIN_REPO_URL${PLUGIN_REF:+ (ref: $PLUGIN_REF)} ..."
+if [ -z "$PLUGIN_REF" ]; then
+  "$GIT" clone --depth 1 "$PLUGIN_REPO_URL" "$CLONE_TMP" || err "git clone failed."
+elif "$GIT" clone --depth 1 --branch "$PLUGIN_REF" "$PLUGIN_REPO_URL" "$CLONE_TMP" 2>/dev/null; then
+  : # ref was a branch or tag
+else
+  # `git clone --branch` only accepts branch/tag names, so a commit SHA lands
+  # here. Fetch the ref explicitly and check it out — GitHub serves reachable
+  # commit SHAs, so this one path covers branch, tag, and commit uniformly.
+  rm -rf "$CLONE_TMP" && mkdir -p "$CLONE_TMP"
+  "$GIT" -C "$CLONE_TMP" init -q || err "git init failed."
+  "$GIT" -C "$CLONE_TMP" remote add origin "$PLUGIN_REPO_URL" || err "git remote add failed."
+  "$GIT" -C "$CLONE_TMP" fetch --depth 1 origin "$PLUGIN_REF" \
+    || err "could not fetch ref '$PLUGIN_REF' from $PLUGIN_REPO_URL (branch, tag, or commit)."
+  "$GIT" -C "$CLONE_TMP" checkout -q --detach FETCH_HEAD || err "git checkout of '$PLUGIN_REF' failed."
+fi
+
+# Write the directory-plugin entry point. Hermes loads $PLUGIN_DIR/__init__.py
+# and calls register(); the real code lives in the nested hermes_filament_fcm
+# package, so this shim just re-exports it. It is generated here (not committed
+# to the repo) so the repo root stays a normal project tree — a committed root
+# __init__.py would make the repo a package and break pytest collection. It is
+# untracked in the clone, so `hermes plugins update` (git pull) leaves it in
+# place.
+cat > "$CLONE_TMP/__init__.py" <<'PYSHIM'
+"""Directory-plugin entry point (generated by install.sh).
+
+Re-exports register() from the nested hermes_filament_fcm package so Hermes'
+directory-plugin loader can find it.
+"""
+
+from .hermes_filament_fcm import register
+
+__all__ = ["register"]
+PYSHIM
+
+# The new plugin is complete — swap it into place (replacing any prior install),
+# then migrate off an earlier pip/entry-point install so it can't shadow this
+# directory plugin (entry points win the loader's dedup, so leaving one would
+# make `hermes plugins update` refresh code that never runs). Both steps happen
+# only after a successful clone, so a failure above leaves the old plugin intact.
+if [ -d "$PLUGIN_DIR" ]; then
+  info "Replacing existing plugin at $PLUGIN_DIR ..."
+  rm -rf "$PLUGIN_DIR"
+fi
+mv "$CLONE_TMP" "$PLUGIN_DIR" || err "could not move the plugin into $PLUGIN_DIR."
+trap - EXIT
+
+"$UV" pip uninstall hermes-filament-fcm >/dev/null 2>&1 || true
+if [ -n "$LAZY_TARGET" ] && [ -d "$LAZY_TARGET" ]; then
+  rm -rf "$LAZY_TARGET"/hermes_filament_fcm "$LAZY_TARGET"/hermes_filament_fcm-*.dist-info 2>/dev/null || true
+fi
 
 # Make `hermes` resolvable so the wizard's gateway-restart step works, without
 # shadowing an existing launcher (the Docker shim must stay first on PATH so
@@ -155,19 +263,12 @@ if ! command -v hermes >/dev/null 2>&1; then
 fi
 
 info "Connecting to Filament ..."
+# Run the setup wizard with the venv Python and the plugin dir (plus any durable
+# dep target) on PYTHONPATH, so `hermes_filament_fcm` imports from the clone.
+# The package is not pip-installed, so there is no console script to run.
 run_setup() {
-  if [ -n "$PYPATH_PREFIX" ]; then
-    # Durable-target install: the sealed venv can't see the package, and the
-    # console script's shebang points at the wrong interpreter. Run the module
-    # with the venv Python and the target dir on PYTHONPATH.
-    PYTHONPATH="$PYPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}" \
-      "$PY" -m hermes_filament_fcm.setup_cli "$@"
-  else
-    # --active makes `uv run` use the activated $VIRTUAL_ENV (the Hermes venv
-    # where we just installed the package) instead of discovering/creating
-    # its own.
-    "$UV" run --active filament-fcm-setup "$@"
-  fi
+  PYTHONPATH="$PLUGIN_DIR${PYPATH_PREFIX:+:$PYPATH_PREFIX}${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PY" -m hermes_filament_fcm.setup_cli "$@"
 }
 
 # Re-attach the terminal so the setup wizard's prompts work even under

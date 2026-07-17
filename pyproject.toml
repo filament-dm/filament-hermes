@@ -1,6 +1,6 @@
 [project]
 name = "hermes-filament-fcm"
-version = "0.1.2"
+version = "0.2.0"
 description = "Hermes gateway adapter for Filament"
 requires-python = ">=3.9"
 license = "MIT"
@@ -13,8 +13,14 @@ dependencies = [
 [project.scripts]
 filament-fcm-setup = "hermes_filament_fcm.setup_cli:main"
 
-[project.entry-points."hermes_agent.plugins"]
-filament-fcm = "hermes_filament_fcm"
+# NOTE: no ``[project.entry-points."hermes_agent.plugins"]`` here.
+# This plugin installs as a *directory plugin* (git-cloned into
+# ~/.hermes/plugins/filament-fcm by install.sh), discovered via its root
+# plugin.yaml + __init__.py — NOT as a pip entry-point plugin. Registering an
+# entry point too would shadow the directory copy (entry points win the
+# loader's dedup), so `hermes plugins update` would git-pull code that never
+# runs. Keep this out. The package's own dependencies are still declared above
+# so install.sh can install them; the package itself is not installed.
 
 [build-system]
 requires = ["hatchling"]
