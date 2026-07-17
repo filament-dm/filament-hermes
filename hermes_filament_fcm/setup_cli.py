@@ -133,9 +133,7 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
                 # (e.g. "HTTP 401", "HTTP 500"). 401/403 are definitive
                 # token rejections; everything else is transient.
                 if not isinstance(err, dict):
-                    if isinstance(err, str) and (
-                        "401" in err or "403" in err
-                    ):
+                    if isinstance(err, str) and ("401" in err or "403" in err):
                         print_warning(
                             "The server rejected this token. Reconnect in "
                             "the Filament app to get a fresh one, then "
@@ -222,8 +220,10 @@ def _run_interactive_setup() -> bool:
     # connect command exports it; local-dev users can export it or edit
     # ~/.hermes/.env), otherwise default to production.
     url = (
-        get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents"
-    ).strip().rstrip("/")
+        (get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents")
+        .strip()
+        .rstrip("/")
+    )
 
     # Validate the token before persisting any configuration. If the token
     # is rejected or the user aborts, the previous working config in
@@ -344,7 +344,7 @@ def _restart_gateway() -> None:
     # `hermes gateway status` exits 0 whether up or down, so parse its output:
     # "✓ ... running" vs "✗ ... not running" / "... stopped". Check the
     # negative markers first ("not running" contains "running").
-    out = (result.stdout or "")
+    out = result.stdout or ""
     low = out.lower()
     if "not running" in low or "stopped" in low or "✗" in out:
         print_info("Gateway is still starting; verify with: hermes gateway status")

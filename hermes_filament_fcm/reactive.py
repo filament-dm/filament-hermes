@@ -123,9 +123,7 @@ class InstructionsStore:
             except FileNotFoundError:
                 continue
             except Exception:
-                logger.warning(
-                    "filament-fcm: failed to read %s", path, exc_info=True
-                )
+                logger.warning("filament-fcm: failed to read %s", path, exc_info=True)
         logger.info("filament-fcm: no standing instructions found — using fallback")
         return self._FALLBACK
 

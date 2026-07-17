@@ -9,10 +9,10 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateway plugin th
 ## Commands
 
 ```bash
-uvx --with httpx pytest tests/ -q        # run tests (httpx needed: filament_api imports it)
-uvx --with httpx pytest tests/test_reactive.py -q                    # one file
-uvx --with httpx pytest tests/test_reactive.py::test_name -q         # one test
-uvx ruff check .            # lint (config in pyproject.toml)
+uv run --group dev pytest tests/ -q        # run tests
+uv run --group dev pytest tests/test_reactive.py -q                    # one file
+uv run --group dev pytest tests/test_reactive.py::test_name -q         # one test
+uv run --group dev ruff check .            # lint (config in pyproject.toml)
 ```
 
 There is no build step. End users never install this by hand — the Filament app hands them a one-liner that runs `install.sh` with a `CONNECT_TOKEN`, which pip-installs the package into the Hermes venv and runs the `filament-fcm-setup` wizard (`setup_cli.py`).
