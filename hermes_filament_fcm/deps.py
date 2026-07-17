@@ -6,16 +6,19 @@ This plugin is installed as a *directory plugin* (git-cloned into
 git-pulls the plugin code). Most releases are code-only, so that's fine — but a
 release that bumps a dependency needs the dep refreshed out of band.
 
-``dep_problem()`` makes that legible: it verifies ``firebase-messaging`` is
-importable and within the required version range, and returns a human-readable
-remediation string when it isn't (or ``None`` when all is well). The plugin
-wires this into ``check_requirements`` so a stale/missing dep surfaces as an
-actionable message instead of a raw ``ImportError`` at gateway start.
+``dep_problem()`` makes that legible: it verifies each ``REQUIRED`` dependency is
+present and within its version range, and returns a human-readable remediation
+string when it isn't (or ``None`` when all is well). The plugin wires this into
+``check_requirements`` so a stale/missing dep surfaces as an actionable message
+instead of a raw ``ImportError`` at gateway start.
 
-Importing ``firebase_messaging`` here also pulls its compiled stack
-(aiohttp / cryptography / protobuf), so a single guarded import covers the
-whole dependency set — if any piece is missing, the import fails and we report
-it, rather than crashing later.
+The guarded ``firebase_messaging`` import also exercises its compiled stack
+(aiohttp / cryptography / protobuf). It does NOT cover ``structlog``, which is a
+separate top-level dependency (imported by ``observability.py``); that one is
+verified through its distribution metadata in the ``REQUIRED`` loop below. Keep
+``REQUIRED`` in step with ``[project.dependencies]`` and install.sh's
+``FCM_DEPS`` — a dep present in the code but missing from those two installs
+fails at import before this check can run.
 
 Keep this stdlib-only (no ``packaging``) so it works on the same interpreters
 as ``_version`` and never adds a dependency of its own.
@@ -29,9 +32,12 @@ from importlib.metadata import version as _dist_version
 
 # Single source of truth for the runtime dependency contract. Keep in sync with
 # [project.dependencies] in pyproject.toml and the deps install.sh installs.
-# httpx is a Hermes core dependency, so it is always present; only the
-# FCM-specific dep is worth checking at runtime.
-REQUIRED = {"firebase-messaging": ">=0.4.5,<1"}
+# httpx is a Hermes core dependency, so it is always present; the FCM-specific
+# deps (firebase-messaging and structlog) are the ones worth checking at runtime.
+REQUIRED = {
+    "firebase-messaging": ">=0.4.5,<1",
+    "structlog": ">=25.5.0,<26",
+}
 
 # How the operator refreshes deps when a release bumps them (rare). install.sh
 # is idempotent and re-installs the current deps.

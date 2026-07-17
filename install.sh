@@ -29,8 +29,10 @@ set -euo pipefail
 # Runtime Python dependencies. Keep in sync with [project.dependencies] in
 # pyproject.toml and REQUIRED in hermes_filament_fcm/deps.py. httpx is already a
 # Hermes core dependency (installing it here is a harmless no-op); firebase-
-# messaging (with its aiohttp/cryptography/protobuf stack) is the real payload.
-FCM_DEPS=("firebase-messaging>=0.4.5,<1" "httpx>=0.24")
+# messaging (with its aiohttp/cryptography/protobuf stack) and structlog (used by
+# hermes_filament_fcm/observability.py) are the real payload — omitting either
+# makes the plugin fail to import at gateway start.
+FCM_DEPS=("firebase-messaging>=0.4.5,<1" "httpx>=0.24" "structlog>=25.5.0,<26")
 
 # Where to clone the plugin from. FILAMENT_FCM_REPO accepts either a plain git
 # URL or a pip-style "git+<url>[@<ref>]" requirement — the Filament app and some

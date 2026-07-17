@@ -58,12 +58,17 @@ def test_satisfies_equality():
 # ── dep_problem() — the actionable message ───────────────────────────
 
 
+# Satisfying versions for every REQUIRED dep, so a test that isn't probing a
+# specific failure gets a clean pass regardless of what's installed.
+_OK_VERSIONS = {"firebase-messaging": "0.4.5", "structlog": "25.5.0"}
+
+
 def test_dep_problem_missing_import(monkeypatch):
     # No firebase_messaging importable → a message pointing at the refresh path.
-    monkeypatch.delitem(sys.modules, "firebase_messaging", raising=False)
-    monkeypatch.setattr(
-        deps, "REQUIRED", {"firebase-messaging": ">=0.4.5,<1"}, raising=False
-    )
+    # Setting sys.modules[name] = None forces `import firebase_messaging` to
+    # raise ImportError even when the package is really installed in the test
+    # env (a bare delitem would just let it re-import).
+    monkeypatch.setitem(sys.modules, "firebase_messaging", None)
     problem = deps.dep_problem()
     assert problem is not None
     assert "firebase-messaging" in problem
@@ -75,14 +80,34 @@ def test_dep_problem_present_but_no_metadata(monkeypatch):
     # can't confirm the version satisfies the requirement.
     stub = types.ModuleType("firebase_messaging")
     monkeypatch.setitem(sys.modules, "firebase_messaging", stub)
+
+    def _no_metadata(name: str) -> str:
+        raise deps.PackageNotFoundError(name)
+
+    monkeypatch.setattr(deps, "_dist_version", _no_metadata)
     problem = deps.dep_problem()
     assert problem is not None
     assert deps.REFRESH_HINT in problem
 
 
 def test_dep_problem_ok(monkeypatch):
-    # firebase importable AND a satisfying version reported → no problem.
+    # firebase importable AND a satisfying version for every REQUIRED dep → clean.
     stub = types.ModuleType("firebase_messaging")
     monkeypatch.setitem(sys.modules, "firebase_messaging", stub)
-    monkeypatch.setattr(deps, "_dist_version", lambda name: "0.4.5")
+    monkeypatch.setattr(deps, "_dist_version", lambda name: _OK_VERSIONS[name])
     assert deps.dep_problem() is None
+
+
+def test_dep_problem_flags_structlog_out_of_range(monkeypatch):
+    # Regression guard for the install.sh dependency drift: structlog is a
+    # REQUIRED dep in its own right (observability.py imports it), NOT covered by
+    # the guarded firebase_messaging import. An out-of-range structlog must be
+    # reported so a stale install surfaces legibly instead of ImportError-ing.
+    stub = types.ModuleType("firebase_messaging")
+    monkeypatch.setitem(sys.modules, "firebase_messaging", stub)
+    versions = {"firebase-messaging": "0.4.5", "structlog": "24.0.0"}
+    monkeypatch.setattr(deps, "_dist_version", lambda name: versions[name])
+    problem = deps.dep_problem()
+    assert problem is not None
+    assert "structlog" in problem
+    assert deps.REFRESH_HINT in problem
