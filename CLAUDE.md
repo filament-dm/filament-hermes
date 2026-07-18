@@ -27,7 +27,7 @@ The package imports `gateway.*`, `agent.*`, and `hermes_cli.*` from hermes-agent
 
 ## Architecture
 
-`__init__.py` — Hermes plugin entry point (`register()` via the `hermes_agent.plugins` entry point). Registers the platform adapter plus every Filament MCP tool as a Hermes tool. The tool list is fetched live from the MCP server, falling back to the bundled `tool_manifest.json` (regenerate with `filament mcp dump-tools`). `BLOCKED_TOOLS` documents tools deliberately hidden from the LLM — keep the "why" comments. Also registers the control-plane-only reactive tools (`set_instructions`/`get_instructions`/`set_wake_policy`/`get_wake_policy`).
+`__init__.py` — Hermes plugin entry point (`register()` via the `hermes_agent.plugins` entry point). Registers the platform adapter plus every Filament MCP tool as a Hermes tool. The tool list is fetched live from the MCP server, falling back to the bundled `tool_manifest.json` (regenerate with `filament mcp dump-tools`). `BLOCKED_TOOLS` documents tools deliberately hidden from the LLM — keep the "why" comments. Also registers the control-plane-only reactive tools (`set_instructions`/`get_instructions`/`set_wake_policy`/`get_wake_policy`, plus `set_capabilities`/`get_capabilities`), and installs the data-plane capability gate as a `pre_tool_call` hook (`_register_capability_gate`).
 
 `adapter.py` — `FCMFilamentAdapter`, the platform adapter. Startup is staged in `connect()`: initialize MCP session → FCM checkin/registration → register the FCM token as a pusher with Filament → open the persistent MCS listener. Handles pushes, invites (auto-accepted — membership is not a security boundary), and emoji reactions. Adds 👀 while processing a turn and removes it on completion; `_PROCESSING_REACTIONS` must never be wake triggers or the agent re-wakes itself forever.
 
@@ -37,7 +37,7 @@ The package imports `gateway.*`, `agent.*`, and `hermes_cli.*` from hermes-agent
 
 `credentials.py` — persists FCM credentials and received persistent ids under `~/.hermes/filament-fcm/` (`FILAMENT_FCM_CREDENTIALS_DIR` to override). The persistent ids seed the next MCS login so Google doesn't redeliver already-handled pushes after a restart.
 
-`reactive.py` + `setup_cli.py` — reactive-plane stores and the setup wizard.
+`reactive.py` + `setup_cli.py` — reactive-plane stores and the setup wizard. `reactive.py` also holds the `current_capabilities` ContextVar, the `capability_denies` gate decision, and `CapabilityPolicyStore` (per-channel / per-user grants of named tool *bundles*, fail-closed, read fresh per event, server-migratable).
 
 ## The trust-zone model (read `docs/agent-boundaries.md` before touching message handling)
 
@@ -51,11 +51,11 @@ Load-bearing invariants:
 - `current_zone` (a ContextVar in `reactive.py`, default `"data"` = fail-closed) is set per turn by the adapter and gates the `set_instructions`/`set_wake_policy` tools so shared-channel participants can never reconfigure the agent.
 - Standing instructions and the wake policy are **file-backed data read fresh on every event**, not startup config — the principal retunes them conversationally from the backchannel with no restart. `CORE_RULES` in `reactive.py` are safety invariants prepended to whatever instructions the principal saved; edits there affect every deployed agent's behavior in shared channels.
 - Untrusted metadata (display names, room names) interpolated into framing text must be sanitized (`_sanitize_meta`) — it's an injection surface.
-- The boundary is prompt-level only (no per-zone tool gating yet), so the framing text and zone classification are the entire defense. Treat changes to them as security-sensitive.
+- The boundary has two layers: soft (framing text + zone classification) and hard (the `pre_tool_call` capability gate). The adapter pins `current_capabilities` per data turn from `CapabilityPolicyStore.resolve(channel, sender)`; the hook denies any tool outside that set. `current_capabilities` is `None` = ungated for control turns (full capability) — data turns always set an explicit (fail-closed minimal-or-larger) set. Treat the framing, the zone classification, AND the capability policy/gate as security-sensitive.
 
 ## Configuration (environment variables)
 
-`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra trusted commanders; the principal is auto-discovered via `get_self`), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_FCM_CREDENTIALS_DIR`, `FILAMENT_DISABLE_UPDATE_CHECK` (set true to turn off the daily new-version check/reminder — see `update_check.py`), `HERMES_HOME`.
+`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra trusted commanders; the principal is auto-discovered via `get_self`), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_FCM_CREDENTIALS_DIR`, `FILAMENT_CAPABILITY_POLICY_FILE` (override the data-plane capability policy path; default `<creds dir>/capability_policy.json`), `FILAMENT_DISABLE_UPDATE_CHECK` (set true to turn off the daily new-version check/reminder — see `update_check.py`), `HERMES_HOME`.
 
 ## Versioning
 

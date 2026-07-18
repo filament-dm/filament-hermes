@@ -52,6 +52,60 @@ current_zone: contextvars.ContextVar[str] = contextvars.ContextVar(
     "filament_zone", default="data"
 )
 
+# Per-turn tool capability grant — the *hard* half of the trust boundary that
+# ``current_zone`` frames softly. The adapter sets this in the same place it
+# sets ``current_zone``: ``None`` for a control turn (ungated — the principal's
+# backchannel keeps full capability), and a concrete frozenset of allowed tool
+# names for a data turn. The ``pre_tool_call`` hook registered in ``__init__``
+# reads it and denies any tool not in the set, so a shared-channel turn can only
+# call what its (channel, sender) policy grants — enforcement in non-LLM code
+# the framing can't be talked out of.
+#
+# ``None`` = ungated. This is deliberately the default so that turns which never
+# touch this ContextVar (a plain CLI session in the same Hermes process, a
+# control turn) are never gated. Fail-closed for the DATA plane is achieved by
+# the adapter ALWAYS resolving and setting an explicit (minimal-or-larger) set
+# for data turns — an unlisted channel/user resolves to the minimal default
+# profile, never to ``None``.
+current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
+    contextvars.ContextVar("filament_capabilities", default=None)
+)
+
+
+def capability_denies(allowed: "frozenset[str] | None", tool_name: str) -> bool:
+    """Return True if a turn restricted to ``allowed`` may NOT call ``tool_name``.
+
+    ``allowed is None`` means ungated (control / non-data / non-Filament turns)
+    and never denies. A frozenset gates: only its members are permitted. Pure
+    and stdlib-only so it is unit-testable without importing Hermes; the
+    ``pre_tool_call`` hook in ``__init__`` is a thin wrapper over this.
+    """
+    if allowed is None:
+        return False
+    return tool_name not in allowed
+
+
+def capability_hint(allowed: "frozenset[str] | None") -> str:
+    """Framing line telling the agent which tools it may use this turn, so it
+    doesn't waste a call attempting a tool the gate will refuse.
+
+    Advisory (soft) — it complements, never replaces, the hard ``pre_tool_call``
+    gate. ``None`` (ungated control/other turns) → empty string (no hint, full
+    access). A frozenset → a bracketed, trusted framing block listing exactly
+    the permitted tools; an empty set says "none" (a pure-observe turn). The
+    text is derived from the principal's policy (trusted), not from event data,
+    so it carries no injection risk. Stdlib-only for unit testing.
+    """
+    if allowed is None:
+        return ""
+    names = ", ".join(sorted(allowed)) if allowed else "(none)"
+    return (
+        "[TOOLS AVAILABLE TO YOU IN THIS CHANNEL — you may use ONLY these tools "
+        "here. Every other tool is disabled by your principal's policy for this "
+        "channel and will be refused, so do not attempt it (and don't claim you "
+        f"used it): {names}]"
+    )
+
 # How many recent messages the adapter reads to build the context breadcrumb.
 # A bounded window: enough to notice the agent is walking into a conversation
 # with history it can't see, cheap enough to read on every wake.
@@ -281,3 +335,208 @@ class WakePolicyStore:
             woke,
         )
         return woke
+
+
+# ── Capability policy ────────────────────────────────────────────────
+#
+# Built-in capability bundles: friendly names → the Filament tool names each
+# grants. The principal grants *bundles* (not raw tool names) per channel/user
+# from the backchannel; a data turn's allowed tool set is the union of the
+# bundles granted to it, expanded to tool names. Rings referenced below are the
+# capability rings from docs/agent-boundaries.md §3.
+#
+# Only Filament's own tools are named here — the plugin can't know the tool
+# names a *separate* plugin (a calendar/web MCP server) registers. Those are
+# granted via CUSTOM bundles the principal defines in the policy JSON, composed
+# with the help of get_capabilities (which lists every registered tool name).
+BUILTIN_BUNDLES: dict[str, list[str]] = {
+    # Read channel context and reply in-channel. The safe default for a data
+    # turn: enough to be a useful participant, nothing privileged. Excludes
+    # set_profile (Ring 0), accept_invite/accept_vouch (Ring 1 membership), and
+    # message_principal (see "escalate").
+    "messaging": [
+        "get_self",
+        "get_recent_messages",
+        "get_thread",
+        "get_user_profile",
+        "search_messages",
+        "search_user_profiles",
+        "list_mentions",
+        "react",
+        "unreact",
+        "mark_read",
+        "post_message",
+        "reply_in_thread",
+    ],
+    # Reach the principal — the one channel-independent escalation path. Kept
+    # separate so the principal can grant "read + reply" without also letting a
+    # channel ping them, or vice-versa.
+    "escalate": ["message_principal"],
+    # Observe and summarize, never write. For channels where the agent should
+    # answer questions from context but not post autonomously.
+    "readonly": [
+        "get_self",
+        "get_recent_messages",
+        "get_thread",
+        "get_user_profile",
+        "search_messages",
+        "list_mentions",
+    ],
+}
+
+# Fail-closed default profile for a data channel/user with no explicit policy
+# entry: read the channel, reply in it, and escalate to the principal — but no
+# membership actions, no profile edits, and no non-Filament tools.
+DEFAULT_CAPABILITIES: list[str] = ["messaging", "escalate"]
+
+# Guard against a self-referential or mutually-recursive custom bundle
+# ("@a" includes "@b" includes "@a") blowing the stack during expansion.
+_MAX_BUNDLE_DEPTH = 16
+
+
+class CapabilityPolicyStore:
+    """Per-(channel, user) tool-capability policy for data-plane turns.
+
+    Declarative JSON on disk, read fresh per event (like ``WakePolicyStore``),
+    so the principal retunes it from the backchannel with ``set_capabilities``
+    and the next turn uses the new value — no restart. Shape::
+
+        {
+          "default_capabilities": ["messaging", "escalate"],
+          "bundles": {                          # custom / override definitions
+            "calendar": ["list_events", "get_event"],
+            "messaging_plus": ["@messaging", "search_user_profiles"]
+          },
+          "per_channel": {"<room_id>":  ["messaging", "calendar"]},
+          "per_user":    {"<sender_id>": ["messaging", "calendar"]}
+        }
+
+    A bundle value is a list of entries; each entry is a tool name or
+    ``"@other_bundle"`` to include another bundle (built-in or custom). Custom
+    bundles override built-ins of the same name, which is how the principal
+    tweaks a starter bundle ("modified bundles").
+
+    Resolution is fail-closed and additive: a data turn's allowed tools are the
+    UNION of ``default_capabilities``, the channel's entry, and the sender's
+    entry, each expanded to tool names. An unlisted channel/user therefore gets
+    only ``default_capabilities`` (a minimal profile), never full access.
+    Union means an entry can only *grant*; restricting one user below a channel
+    grant would need a deny-list (a future addition — see
+    docs/agent-boundaries.md).
+
+    Designed to migrate to a server-hosted policy later: replace ``read`` with
+    an HTTP fetch returning the same shape and nothing else changes.
+    """
+
+    _DEFAULTS: ClassVar[dict] = {
+        "default_capabilities": list(DEFAULT_CAPABILITIES),
+        "bundles": {},
+        "per_channel": {},
+        "per_user": {},
+    }
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(
+            path
+            or os.environ.get("FILAMENT_CAPABILITY_POLICY_FILE")
+            or _default_dir() / "capability_policy.json"
+        )
+
+    def read(self) -> dict:
+        policy = {
+            k: (list(v) if isinstance(v, list) else dict(v))
+            for k, v in self._DEFAULTS.items()
+        }
+        try:
+            loaded = json.loads(self._path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                policy.update(loaded)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning(
+                "filament-fcm: failed to read capability policy", exc_info=True
+            )
+        return policy
+
+    def write(self, policy: dict) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
+        logger.info("filament-fcm: capability policy updated")
+
+    # ── Bundle expansion ────────────────────────────────────────────
+
+    def bundles(self, policy: dict | None = None) -> dict[str, list[str]]:
+        """Merged bundle definitions: built-ins overlaid with the policy's
+        custom ``bundles`` (custom wins on name collision)."""
+        merged: dict[str, list[str]] = {k: list(v) for k, v in BUILTIN_BUNDLES.items()}
+        custom = (policy or {}).get("bundles") or {}
+        if isinstance(custom, dict):
+            for name, entries in custom.items():
+                if isinstance(entries, list):
+                    merged[str(name)] = [str(e) for e in entries]
+        return merged
+
+    def expand_bundle(
+        self,
+        name: str,
+        policy: dict | None = None,
+        _defs: dict[str, list[str]] | None = None,
+        _depth: int = 0,
+    ) -> frozenset[str]:
+        """Expand one bundle name to its concrete set of tool names, resolving
+        ``@include`` references recursively. Unknown bundle names and over-deep
+        recursion expand to nothing (logged), never raise — a typo in the policy
+        must fail closed, not crash the turn."""
+        defs = _defs if _defs is not None else self.bundles(policy)
+        if _depth > _MAX_BUNDLE_DEPTH:
+            logger.warning(
+                "filament-fcm: capability bundle recursion too deep at %r", name
+            )
+            return frozenset()
+        entries = defs.get(name)
+        if entries is None:
+            logger.warning(
+                "filament-fcm: unknown capability bundle %r (granting nothing)", name
+            )
+            return frozenset()
+        tools: set[str] = set()
+        for entry in entries:
+            if isinstance(entry, str) and entry.startswith("@"):
+                tools |= self.expand_bundle(entry[1:], policy, defs, _depth + 1)
+            elif entry:
+                tools.add(str(entry))
+        return frozenset(tools)
+
+    def expand_capabilities(
+        self, names: list[str], policy: dict | None = None
+    ) -> frozenset[str]:
+        """Union-expand a list of capability/bundle names to tool names."""
+        defs = self.bundles(policy)
+        tools: set[str] = set()
+        for name in names or []:
+            tools |= self.expand_bundle(str(name), policy, defs)
+        return frozenset(tools)
+
+    def resolve(self, room_id: str | None, sender: str | None) -> frozenset[str]:
+        """The allowed tool set for a data turn from (channel, sender): the
+        union of the default, per-channel, and per-user grants, expanded.
+        Fail-closed — unlisted scopes contribute nothing and the minimal default
+        always applies."""
+        policy = self.read()
+        granted: list[str] = list(policy.get("default_capabilities") or [])
+        per_channel = policy.get("per_channel") or {}
+        if isinstance(per_channel, dict) and room_id in per_channel:
+            granted += list(per_channel.get(room_id) or [])
+        per_user = policy.get("per_user") or {}
+        if isinstance(per_user, dict) and sender in per_user:
+            granted += list(per_user.get(sender) or [])
+        allowed = self.expand_capabilities(granted, policy)
+        logger.info(
+            "filament-fcm: capabilities room=%s sender=%s grants=%s → %d tool(s)",
+            room_id,
+            sender,
+            granted,
+            len(allowed),
+        )
+        return allowed

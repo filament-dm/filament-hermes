@@ -178,6 +178,124 @@ def test_breadcrumb_missing_type_treated_as_message():
     assert "1 recent message(s)" in out
 
 
+# ── Capability policy ────────────────────────────────────────────────
+
+
+def test_capability_denies_ungated_and_gated():
+    # None = ungated (control / non-data / non-Filament turns): never denies.
+    assert reactive.capability_denies(None, "anything") is False
+    # A frozenset gates: only members are permitted.
+    allowed = frozenset({"get_thread", "post_message"})
+    assert reactive.capability_denies(allowed, "post_message") is False
+    assert reactive.capability_denies(allowed, "set_profile") is True
+    # Empty set denies everything (a pure silent-observe turn).
+    assert reactive.capability_denies(frozenset(), "get_thread") is True
+
+
+def test_capability_hint():
+    # Ungated (control/other) → no hint at all.
+    assert reactive.capability_hint(None) == ""
+    # Gated → lists exactly the allowed tools, sorted, with a "only these" framing.
+    h = reactive.capability_hint(frozenset({"post_message", "get_thread"}))
+    assert "get_thread, post_message" in h  # sorted
+    assert "ONLY these" in h and "will be refused" in h
+    # Empty set (pure observer) → says "(none)".
+    assert "(none)" in reactive.capability_hint(frozenset())
+
+
+def test_expand_bundle_builtin_and_unknown():
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    messaging = store.expand_bundle("messaging")
+    assert "post_message" in messaging and "get_thread" in messaging
+    # set_profile (Ring 0) is never in the messaging baseline.
+    assert "set_profile" not in messaging
+    # Unknown bundle → nothing (fail closed), never raises.
+    assert store.expand_bundle("does_not_exist") == frozenset()
+
+
+def test_expand_bundle_include_and_cycle_guard():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "capability_policy.json"
+        store = reactive.CapabilityPolicyStore(path)
+        store.write(
+            {
+                "bundles": {
+                    # @include composes another bundle ("modified bundle").
+                    "reader_plus": ["@readonly", "search_user_profiles"],
+                    # Mutually-recursive pair must not blow the stack.
+                    "a": ["@b", "tool_a"],
+                    "b": ["@a", "tool_b"],
+                }
+            }
+        )
+        policy = store.read()
+        plus = store.expand_bundle("reader_plus", policy)
+        assert "get_thread" in plus  # from @readonly
+        assert "search_user_profiles" in plus  # added directly
+        # Cycle terminates and still collects the concrete tools on the path.
+        cyclic = store.expand_bundle("a", policy)
+        assert "tool_a" in cyclic and "tool_b" in cyclic
+
+
+def test_custom_bundle_overrides_builtin():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "capability_policy.json"
+        store = reactive.CapabilityPolicyStore(path)
+        store.write({"bundles": {"messaging": ["get_self"]}})
+        policy = store.read()
+        # Custom definition wins over the built-in of the same name.
+        assert store.expand_bundle("messaging", policy) == frozenset({"get_self"})
+
+
+def test_resolve_fail_closed_default_for_unlisted():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        # No file at all → the built-in fail-closed default (messaging+escalate),
+        # never full access.
+        allowed = store.resolve("!room:x", "@stranger:x")
+        assert "post_message" in allowed  # can reply
+        assert "message_principal" in allowed  # can escalate
+        assert "set_profile" not in allowed  # cannot reconfigure
+        assert "accept_invite" not in allowed  # cannot join loops
+
+
+def test_resolve_unions_default_channel_and_user_grants():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write(
+            {
+                "default_capabilities": ["readonly"],
+                "bundles": {
+                    "calendar": ["list_events", "get_event"],
+                    "notes": ["write_note"],
+                },
+                "per_channel": {"!room:x": ["calendar"]},
+                "per_user": {"@vip:x": ["notes"]},
+            }
+        )
+        # Unlisted channel/user → only the default (readonly), no calendar.
+        base = store.resolve("!other:x", "@nobody:x")
+        assert "get_thread" in base and "list_events" not in base
+        # Channel grant adds calendar (union with default).
+        in_room = store.resolve("!room:x", "@nobody:x")
+        assert "list_events" in in_room and "get_thread" in in_room
+        assert "write_note" not in in_room
+        # A VIP user in that same room gets default + channel + user (union).
+        vip = store.resolve("!room:x", "@vip:x")
+        assert {"get_thread", "list_events", "write_note"}.issubset(vip)
+
+
+def test_resolve_empty_default_is_silent_observer():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write({"default_capabilities": []})
+        # Principal chose a pure observer posture: no tools at all for unlisted
+        # turns. capability_denies then blocks every call.
+        allowed = store.resolve("!room:x", "@x:x")
+        assert allowed == frozenset()
+        assert reactive.capability_denies(allowed, "get_thread") is True
+
+
 def _run() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
