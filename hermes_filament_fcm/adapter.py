@@ -1314,6 +1314,32 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="reactive")
 
+        # Never reply to a Filament system notice. filament_god authors exactly
+        # one kind of timeline message today — the "X vouched for Y to join
+        # <loop>" Welcome announcement; its other actions are state events,
+        # redactions, kicks, and power-level edits, none of which arrive as a
+        # reactive message wake — and the product requirement is that agents
+        # don't respond to it at all. Skip before wake-policy, media-note, and
+        # breadcrumb work so no turn or API call is spent. If filament_god ever
+        # gains a second timeline message the principal WOULD want the agent to
+        # see, gate this on the notice shape too so the new one isn't suppressed.
+        # is_system_sender fails closed: it only matches @filament_god:<the
+        # agent's own homeserver>, so a federated or impersonating sender is not
+        # treated as system.
+        if is_system_sender(msg.sender, self._user_id):
+            logger.info(
+                "filament-fcm: skipping system notice from %s in %s",
+                msg.sender,
+                msg.room_name,
+            )
+            slog.info(
+                "filament_fcm.turn.skipped",
+                turn_id=turn_id,
+                event_id=msg.event_id,
+                reason="system_notice",
+            )
+            return
+
         # Reactive plane: wake only if the policy admits this message. A mention
         # is the server's flag (is_mention_of_recipient / @everyone) first, with
         # a body text-match as a fallback.
@@ -1585,30 +1611,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # trigger is partly attacker-controlled (reaction.key), so sanitize it
         # before it goes into the trusted framing.
         safe_trigger = _sanitize_meta(trigger)
-        # A message wake authored by the local filament_god is a genuine system
-        # notice (membership/administrative). Mark it in the trusted framing so
-        # the standing instructions can suppress it without trusting the body —
-        # anything that merely *looks* like a membership notice but isn't marked
-        # carries the typist's own id and is handled by its content instead.
-        #
-        # filament_god authors exactly one kind of timeline message: the
-        # "X vouched for Y to join <loop>" announcement. Its other actions are
-        # state events, redactions, kicks, and power-level edits, none of which
-        # arrive as a reactive message wake. So marking every god-authored
-        # message wake as a system notice is safe today. If it ever gains a
-        # second timeline message that the principal WOULD want to see, gate
-        # this on the notice shape too, so the new one isn't suppressed.
-        is_system = data is not None and is_system_sender(sender, self._user_id)
         signal = (
             "[WAKE-UP SIGNAL]\n"
             f"channel: {_sanitize_meta(channel_name)} ({channel})\n"
             f"sender: {_sanitize_meta(sender_name)} ({sender})  tier: data\n"
-            + (
-                "system-notice: yes — automated membership/administrative "
-                "notice from the Filament service\n"
-                if is_system
-                else ""
-            )
             + f"trigger: {safe_trigger}"
             + (f" on message {target_event_id}" if target_event_id else "")
         )
@@ -1688,7 +1694,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             instructions_length=len(instructions),
             envelope_length=len(envelope),
-            is_system=is_system,
         )
         current_zone.set("data")
         # Pin this turn's tool-capability grant (resolved above) so the
