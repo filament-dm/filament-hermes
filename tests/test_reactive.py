@@ -325,6 +325,42 @@ def test_feature_flag_set_preserves_other_flags():
         assert store2.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is True
 
 
+def test_messaging_bundle_includes_download_media():
+    # The fail-closed default must be able to fetch attachments, or enabling the
+    # feature would regress media handling vs an ungated (flag-off) agent.
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    assert "download_media" in store.expand_bundle("messaging")
+
+
+def test_resolve_survives_malformed_policy():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "capability_policy.json"
+        store = reactive.CapabilityPolicyStore(path)
+        # Non-list values where lists are expected must fail closed, not crash.
+        store.write(
+            {
+                "default_capabilities": 1,  # not a list
+                "per_channel": {"!room:x": 42},  # not a list
+                "per_user": "nope",  # not even a dict
+            }
+        )
+        allowed = store.resolve("!room:x", "@u:x")  # must not raise
+        assert allowed == frozenset()
+
+
+def test_deep_acyclic_bundle_chain_not_truncated():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        # A 30-deep acyclic @include chain (b0 -> b1 -> ... -> b29 + tool_29).
+        depth = 30
+        bundles = {f"b{i}": [f"@b{i + 1}"] for i in range(depth - 1)}
+        bundles[f"b{depth - 1}"] = ["tool_deep"]
+        store.write({"bundles": bundles})
+        policy = store.read()
+        # No arbitrary depth cap: the terminal tool is still reached.
+        assert "tool_deep" in store.expand_bundle("b0", policy)
+
+
 def test_advanced_tool_controls_is_a_known_feature():
     # The tool layer offers exactly the flags the code checks.
     assert reactive.FEATURE_ADVANCED_TOOL_CONTROLS in reactive.KNOWN_FEATURES

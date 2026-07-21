@@ -13,6 +13,7 @@ and the next event uses the new value — no restart. ``current_zone`` is the
 per-turn gate that keeps those tools control-plane-only.
 """
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -194,6 +195,22 @@ def _default_dir() -> Path:
     )
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically: write a sibling temp file, then
+    ``os.replace`` it into place. A crash or disk error mid-write leaves the
+    original file intact rather than a half-written one — important for the
+    fresh-read policy/flag files, where a truncated file would parse-fail and
+    silently revert the gate to its (less restrictive) default."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
 class InstructionsStore:
     """The agent's standing instructions for reactive channels.
 
@@ -367,6 +384,10 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
         "mark_read",
         "post_message",
         "reply_in_thread",
+        # Handle attachments a channel participant sends. Without this, enabling
+        # the feature would regress the default: an ungated agent can fetch
+        # media, so the fail-closed default profile must be able to as well.
+        "download_media",
     ],
     # Reach the principal — the one channel-independent escalation path. Kept
     # separate so the principal can grant "read + reply" without also letting a
@@ -388,10 +409,6 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
 # entry: read the channel, reply in it, and escalate to the principal — but no
 # membership actions, no profile edits, and no non-Filament tools.
 DEFAULT_CAPABILITIES: list[str] = ["messaging", "escalate"]
-
-# Guard against a self-referential or mutually-recursive custom bundle
-# ("@a" includes "@b" includes "@a") blowing the stack during expansion.
-_MAX_BUNDLE_DEPTH = 16
 
 
 class CapabilityPolicyStore:
@@ -460,8 +477,7 @@ class CapabilityPolicyStore:
         return policy
 
     def write(self, policy: dict) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
+        _atomic_write_text(self._path, json.dumps(policy, indent=2))
         logger.info("filament-fcm: capability policy updated")
 
     # ── Bundle expansion ────────────────────────────────────────────
@@ -482,28 +498,38 @@ class CapabilityPolicyStore:
         name: str,
         policy: dict | None = None,
         _defs: dict[str, list[str]] | None = None,
-        _depth: int = 0,
+        _seen: "frozenset[str] | None" = None,
     ) -> frozenset[str]:
         """Expand one bundle name to its concrete set of tool names, resolving
-        ``@include`` references recursively. Unknown bundle names and over-deep
-        recursion expand to nothing (logged), never raise — a typo in the policy
-        must fail closed, not crash the turn."""
+        ``@include`` references recursively. Unknown names and cycles expand to
+        nothing (logged), never raise — a typo in the policy must fail closed,
+        not crash the turn.
+
+        Cycles are detected by tracking the bundle names on the *current path*
+        (``_seen``), so a genuinely deep-but-acyclic chain expands fully (no
+        arbitrary depth cap that would silently drop its terminal tools) while a
+        self- or mutually-recursive chain terminates the moment a name repeats.
+        A ``list`` entry that isn't a ``list`` is ignored (malformed policy)."""
         defs = _defs if _defs is not None else self.bundles(policy)
-        if _depth > _MAX_BUNDLE_DEPTH:
+        seen = _seen if _seen is not None else frozenset()
+        if name in seen:
             logger.warning(
-                "filament-fcm: capability bundle recursion too deep at %r", name
+                "filament-fcm: capability bundle cycle at %r (granting nothing)", name
             )
             return frozenset()
         entries = defs.get(name)
-        if entries is None:
-            logger.warning(
-                "filament-fcm: unknown capability bundle %r (granting nothing)", name
-            )
+        if not isinstance(entries, list):
+            if entries is None:
+                logger.warning(
+                    "filament-fcm: unknown capability bundle %r (granting nothing)",
+                    name,
+                )
             return frozenset()
+        seen = seen | {name}
         tools: set[str] = set()
         for entry in entries:
             if isinstance(entry, str) and entry.startswith("@"):
-                tools |= self.expand_bundle(entry[1:], policy, defs, _depth + 1)
+                tools |= self.expand_bundle(entry[1:], policy, defs, seen)
             elif entry:
                 tools.add(str(entry))
         return frozenset(tools)
@@ -524,13 +550,19 @@ class CapabilityPolicyStore:
         Fail-closed — unlisted scopes contribute nothing and the minimal default
         always applies."""
         policy = self.read()
-        granted: list[str] = list(policy.get("default_capabilities") or [])
+
+        def _names(value: object) -> list[str]:
+            # A malformed policy (non-list where a list is expected) must fail
+            # closed — contribute nothing — not raise from list(non_iterable).
+            return list(value) if isinstance(value, list) else []
+
+        granted: list[str] = _names(policy.get("default_capabilities"))
         per_channel = policy.get("per_channel") or {}
-        if isinstance(per_channel, dict) and room_id in per_channel:
-            granted += list(per_channel.get(room_id) or [])
+        if isinstance(per_channel, dict):
+            granted += _names(per_channel.get(room_id))
         per_user = policy.get("per_user") or {}
-        if isinstance(per_user, dict) and sender in per_user:
-            granted += list(per_user.get(sender) or [])
+        if isinstance(per_user, dict):
+            granted += _names(per_user.get(sender))
         allowed = self.expand_capabilities(granted, policy)
         logger.info(
             "filament-fcm: capabilities room=%s sender=%s grants=%s → %d tool(s)",
@@ -605,7 +637,6 @@ class FeatureFlagStore:
     def set(self, name: str, enabled: bool) -> dict:
         flags = self.read()
         flags[name] = bool(enabled)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(flags, indent=2), encoding="utf-8")
+        _atomic_write_text(self._path, json.dumps(flags, indent=2))
         logger.info("filament-fcm: feature %r set to %s", name, bool(enabled))
         return flags
