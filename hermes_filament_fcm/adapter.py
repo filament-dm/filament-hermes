@@ -1300,18 +1300,22 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="reactive")
 
-        # ENG-645: never reply to a Filament system notice. filament_god
-        # authors exactly one kind of timeline message today — the "X vouched
-        # for Y to join <loop>" Welcome announcement; its other actions are
-        # state events, redactions, kicks, and power-level edits, none of which
-        # arrive as a reactive message wake — and the product requirement is
-        # that agents don't respond to it at all. Skip before wake-policy,
-        # media-note, and breadcrumb work so no turn or API call is spent. If
-        # filament_god ever gains a second timeline message the principal WOULD
-        # want the agent to see, gate this on the notice shape too so the new
-        # one isn't suppressed. is_system_sender fails closed: it only matches
-        # @filament_god:<the agent's own homeserver>, so a federated or
-        # impersonating sender is not treated as system.
+        # ENG-645: never reply to a Filament system notice. Across the whole
+        # synapse server, filament_god authors exactly one kind of timeline
+        # (m.room.message) event today: the Welcome-room join announcement
+        # "X vouched for Y to join <loop>" (AutoJoinRooms._maybe_announce_join).
+        # That one path fires on ANY new join and always uses the "vouched for"
+        # body, so both member vouches and admin invites collapse into it — the
+        # vouch/invite distinction is client-side presentation only. Every other
+        # filament_god action is a state event, redaction, kick, or power-level
+        # edit, none of which arrive as a reactive message wake. The product
+        # requirement is that agents don't respond to the announcement at all.
+        # Skip before wake-policy, media-note, and breadcrumb work so no turn or
+        # API call is spent. If filament_god ever gains a second timeline message
+        # the principal WOULD want the agent to see, gate this on the notice
+        # shape too so the new one isn't suppressed. is_system_sender fails
+        # closed: it only matches @filament_god:<the agent's own homeserver>, so
+        # a federated or impersonating sender is not treated as system.
         if is_system_sender(msg.sender, self._user_id):
             logger.info(
                 "filament-fcm: skipping system notice from %s in %s",
