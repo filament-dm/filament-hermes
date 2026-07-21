@@ -36,7 +36,10 @@ from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .observability import bound_context
 from .reactive import (
     BUILTIN_BUNDLES,
+    FEATURE_ADVANCED_TOOL_CONTROLS,
+    KNOWN_FEATURES,
     CapabilityPolicyStore,
+    FeatureFlagStore,
     InstructionsStore,
     WakePolicyStore,
     capability_denies,
@@ -510,6 +513,7 @@ def _register_reactive_tools(ctx: Any) -> None:
     instructions_store = InstructionsStore()
     wake_store = WakePolicyStore()
     capability_store = CapabilityPolicyStore()
+    feature_flags = FeatureFlagStore()
 
     def _deny(tool: str) -> str:
         logger.info(
@@ -575,10 +579,25 @@ def _register_reactive_tools(ctx: Any) -> None:
             logger.debug("filament-fcm: tool inventory unavailable", exc_info=True)
             return None
 
+    def _feature_off_notice(tool: str) -> str:
+        return json.dumps(
+            {
+                "error": (
+                    "Advanced tool controls are not enabled, so this does "
+                    "nothing yet. Ask your principal to 'enable the advanced tool "
+                    "controls feature' first (set_feature), then retry."
+                ),
+                "feature": FEATURE_ADVANCED_TOOL_CONTROLS,
+                "enabled": False,
+            }
+        )
+
     async def _get_capabilities(args: dict, **kwargs: Any) -> str:
         logger.info("filament-fcm: get_capabilities (zone=%s)", current_zone.get())
         if current_zone.get() != "control":
             return _deny("get_capabilities")
+        if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
+            return _feature_off_notice("get_capabilities")
         policy = capability_store.read()
         # Expand every known bundle to its concrete tool list so the principal
         # sees exactly what each capability grants (their explicit ask).
@@ -601,6 +620,8 @@ def _register_reactive_tools(ctx: Any) -> None:
         logger.info("filament-fcm: set_capabilities (zone=%s)", current_zone.get())
         if current_zone.get() != "control":
             return _deny("set_capabilities")
+        if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
+            return _feature_off_notice("set_capabilities")
         policy = args.get("policy")
         if not isinstance(policy, dict):
             return json.dumps(
@@ -614,6 +635,41 @@ def _register_reactive_tools(ctx: Any) -> None:
             return json.dumps({"error": err})
         capability_store.write(policy)
         return json.dumps({"ok": True, "policy": policy})
+
+    async def _get_features(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: get_features (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("get_features")
+        flags = feature_flags.read()
+        return json.dumps(
+            {
+                "features": {
+                    name: {"enabled": bool(flags.get(name, False)), "description": desc}
+                    for name, desc in KNOWN_FEATURES.items()
+                }
+            },
+            indent=2,
+        )
+
+    async def _set_feature(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: set_feature (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("set_feature")
+        name = args.get("feature")
+        enabled = args.get("enabled")
+        if name not in KNOWN_FEATURES:
+            return json.dumps(
+                {
+                    "error": f"Unknown feature {name!r}.",
+                    "known_features": sorted(KNOWN_FEATURES),
+                }
+            )
+        if not isinstance(enabled, bool):
+            return json.dumps({"error": "enabled must be true or false."})
+        flags = feature_flags.set(name, enabled)
+        return json.dumps(
+            {"ok": True, "feature": name, "enabled": enabled, "flags": flags}
+        )
 
     def _reg(name: str, desc: str, params: dict, handler: Any) -> None:
         ctx.register_tool(
@@ -689,4 +745,31 @@ def _register_reactive_tools(ctx: Any) -> None:
             "required": ["policy"],
         },
         _set_capabilities,
+    )
+    _reg(
+        "set_feature",
+        "Turn a Filament agent feature on or off at runtime (backchannel/owner "
+        "only). Use this when your principal asks to enable or disable a feature "
+        "by name — e.g. \"enable the advanced tool controls feature\" → "
+        "set_feature(feature='advanced_tool_controls', enabled=true). Known "
+        "features: 'advanced_tool_controls' — per-channel/per-user tool "
+        "capability gating for shared channels (off by default; when off the "
+        "agent behaves like a fresh install). The change takes effect on the "
+        "next turn, no restart. Call get_features to see names and current state.",
+        {
+            "type": "object",
+            "properties": {
+                "feature": {"type": "string"},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["feature", "enabled"],
+        },
+        _set_feature,
+    )
+    _reg(
+        "get_features",
+        "List the agent's toggleable features, each with its description and "
+        "whether it's currently enabled. Backchannel/owner only.",
+        _empty,
+        _get_features,
     )

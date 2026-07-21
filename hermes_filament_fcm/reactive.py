@@ -540,3 +540,72 @@ class CapabilityPolicyStore:
             len(allowed),
         )
         return allowed
+
+
+# ── Feature flags ────────────────────────────────────────────────────
+#
+# Runtime, principal-toggled, default OFF. This lets the whole advanced
+# tool-controls surface (capability gating + the per-turn tool hint + the
+# get/set_capabilities tools) ship DARK: installing the plugin changes nothing
+# until the principal turns it on from the backchannel ("enable the advanced
+# tool controls feature"). File-backed and read fresh per event like the wake
+# policy, so a toggle takes effect on the next turn with no restart.
+FEATURE_ADVANCED_TOOL_CONTROLS = "advanced_tool_controls"
+
+# Human-facing descriptions for the flags the code actually checks. Keep in
+# sync with the checks; surfaced by get_features and the set_feature tool so the
+# principal (and the agent mapping their request) knows what can be toggled.
+KNOWN_FEATURES: dict[str, str] = {
+    FEATURE_ADVANCED_TOOL_CONTROLS: (
+        "Per-channel / per-user tool capability gating for shared (data-plane) "
+        "channels: hard-limits which tools the agent may use when woken there, "
+        "tunable from the backchannel with set_capabilities. Off by default; "
+        "when off the agent behaves exactly as a fresh install (all tools "
+        "available in shared channels, subject only to the standing framing)."
+    ),
+}
+
+
+class FeatureFlagStore:
+    """Runtime feature flags for the adapter, default OFF.
+
+    Declarative JSON on disk, read fresh per event so the principal flips a flag
+    from the backchannel and the next turn honors it — no restart::
+
+        {"advanced_tool_controls": true}
+
+    A missing file, a missing key, or an unreadable file all read as OFF, so
+    every gated feature ships dark until explicitly enabled. Stdlib-only for
+    unit testing.
+    """
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(
+            path
+            or os.environ.get("FILAMENT_FEATURE_FLAGS_FILE")
+            or _default_dir() / "feature_flags.json"
+        )
+
+    def read(self) -> dict:
+        try:
+            loaded = json.loads(self._path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning("filament-fcm: failed to read feature flags", exc_info=True)
+        return {}
+
+    def is_enabled(self, name: str) -> bool:
+        """True only if the flag is present AND truthy. Absent/unknown → False
+        (fail-dark)."""
+        return bool(self.read().get(name, False))
+
+    def set(self, name: str, enabled: bool) -> dict:
+        flags = self.read()
+        flags[name] = bool(enabled)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(json.dumps(flags, indent=2), encoding="utf-8")
+        logger.info("filament-fcm: feature %r set to %s", name, bool(enabled))
+        return flags

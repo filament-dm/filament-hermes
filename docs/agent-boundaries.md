@@ -125,6 +125,14 @@ This upgrades the Warden's **capability boundary from soft to hard** while cogni
 unified — the stronger Warden §8 says Hermes "can't offer today." (Open follow-up: grants are
 additive/union, so restricting one user *below* a channel grant needs a deny-list.)
 
+**Opt-in (default OFF).** The whole hard layer ships behind the `advanced_tool_controls`
+feature flag (`reactive.py:FeatureFlagStore`, default OFF): installing the plugin changes
+nothing, so the hard boundary never surprises an existing deployment. The principal turns it on
+from the backchannel ("enable the advanced tool controls feature" → the `set_feature` tool
+writes `feature_flags.json`), read fresh per event so it takes effect next turn with no restart.
+While OFF the adapter leaves `current_capabilities` `None` and injects no tool hint, so the
+always-registered hook is inert and behavior is identical to a pre-feature install.
+
 **On Filament:** today's adapter has the hooks — it knows `cc_room_id` (backchannel)
 and `owner_id`. Implemented: (a) a zone classifier, (b) per-zone message framing in
 `_handle_push_message`, and (c) **per-turn capability gating** — the `pre_tool_call` hook +

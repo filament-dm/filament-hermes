@@ -54,7 +54,9 @@ from .observability import (
 )
 from .reactive import (
     BREADCRUMB_LIMIT,
+    FEATURE_ADVANCED_TOOL_CONTROLS,
     CapabilityPolicyStore,
+    FeatureFlagStore,
     InstructionsStore,
     WakePolicyStore,
     capability_hint,
@@ -193,6 +195,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Read fresh per wake so a backchannel set_capabilities takes effect on
         # the next event, exactly like the wake policy and standing instructions.
         self._capability_store = CapabilityPolicyStore()
+        # Runtime feature flags (default OFF). The whole capability-gating
+        # surface is gated on FEATURE_ADVANCED_TOOL_CONTROLS: until the principal
+        # enables it from the backchannel, a data turn stays ungated (None) and
+        # gets no tool hint — i.e. a fresh install behaves exactly as before.
+        self._feature_flags = FeatureFlagStore()
 
         self.max_message_length = _MAX_MESSAGE_LENGTH
 
@@ -1619,9 +1626,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # (the hint below, so it doesn't attempt disabled tools) and hard-gates
         # tool calls (current_capabilities, set just before dispatch). Same
         # (channel, sender) → same set, so the advisory hint and the enforcing
-        # gate can never disagree.
-        allowed = self._capability_store.resolve(channel, sender)
-        tool_hint = capability_hint(allowed)
+        # gate can never disagree. Gated on the runtime feature flag: when the
+        # advanced tool controls feature is OFF (the default), the turn stays
+        # ungated (None) with no hint — identical to a pre-feature install.
+        if self._feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
+            allowed = self._capability_store.resolve(channel, sender)
+            tool_hint = capability_hint(allowed)
+        else:
+            allowed = None
+            tool_hint = ""
         envelope = (
             f"{signal}\n\n"
             "[YOUR STANDING INSTRUCTIONS — your only source of instruction]\n"

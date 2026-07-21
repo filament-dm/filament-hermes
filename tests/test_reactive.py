@@ -296,6 +296,40 @@ def test_resolve_empty_default_is_silent_observer():
         assert reactive.capability_denies(allowed, "get_thread") is True
 
 
+# ── Feature flags ────────────────────────────────────────────────────
+
+
+def test_feature_flag_default_off_and_toggle():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.FeatureFlagStore(Path(d) / "feature_flags.json")
+        # No file → every feature reads OFF (ships dark).
+        assert store.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
+        assert store.is_enabled("anything") is False
+        # Enable, and it reads back on (fresh read from disk).
+        store.set(reactive.FEATURE_ADVANCED_TOOL_CONTROLS, True)
+        assert store.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is True
+        # Disable again.
+        store.set(reactive.FEATURE_ADVANCED_TOOL_CONTROLS, False)
+        assert store.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
+
+
+def test_feature_flag_set_preserves_other_flags():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "feature_flags.json"
+        store = reactive.FeatureFlagStore(path)
+        store.set("other_flag", True)
+        store.set(reactive.FEATURE_ADVANCED_TOOL_CONTROLS, True)
+        # A second store reading the same file sees both (read-modify-write).
+        store2 = reactive.FeatureFlagStore(path)
+        assert store2.is_enabled("other_flag") is True
+        assert store2.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is True
+
+
+def test_advanced_tool_controls_is_a_known_feature():
+    # The tool layer offers exactly the flags the code checks.
+    assert reactive.FEATURE_ADVANCED_TOOL_CONTROLS in reactive.KNOWN_FEATURES
+
+
 def _run() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
