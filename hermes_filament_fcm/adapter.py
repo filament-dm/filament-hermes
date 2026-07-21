@@ -1594,30 +1594,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # trigger is partly attacker-controlled (reaction.key), so sanitize it
         # before it goes into the trusted framing.
         safe_trigger = _sanitize_meta(trigger)
-        # A message wake authored by the local filament_god is a genuine system
-        # notice (membership/administrative). Mark it in the trusted framing so
-        # the standing instructions can suppress it without trusting the body —
-        # anything that merely *looks* like a membership notice but isn't marked
-        # carries the typist's own id and is handled by its content instead.
-        #
-        # filament_god authors exactly one kind of timeline message: the
-        # "X vouched for Y to join <loop>" announcement. Its other actions are
-        # state events, redactions, kicks, and power-level edits, none of which
-        # arrive as a reactive message wake. So marking every god-authored
-        # message wake as a system notice is safe today. If it ever gains a
-        # second timeline message that the principal WOULD want to see, gate
-        # this on the notice shape too, so the new one isn't suppressed.
-        is_system = data is not None and is_system_sender(sender, self._user_id)
+        # A message wake authored by the local filament_god (a system notice —
+        # today only the "X vouched for Y to join <loop>" Welcome announcement)
+        # never reaches here: _handle_push_message_turn skips it before wake
+        # (ENG-645). So no system-notice framing is needed on this path.
         signal = (
             "[WAKE-UP SIGNAL]\n"
             f"channel: {_sanitize_meta(channel_name)} ({channel})\n"
             f"sender: {_sanitize_meta(sender_name)} ({sender})  tier: data\n"
-            + (
-                "system-notice: yes — automated membership/administrative "
-                "notice from the Filament service\n"
-                if is_system
-                else ""
-            )
             + f"trigger: {safe_trigger}"
             + (f" on message {target_event_id}" if target_event_id else "")
         )
@@ -1683,7 +1667,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             instructions_length=len(instructions),
             envelope_length=len(envelope),
-            is_system=is_system,
         )
         current_zone.set("data")
         await self.handle_message(event)
