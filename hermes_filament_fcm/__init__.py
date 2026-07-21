@@ -34,7 +34,18 @@ from .deps import dep_problem, optional_dep_warnings
 from .filament_api import FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .observability import bound_context
-from .reactive import InstructionsStore, WakePolicyStore, current_zone
+from .reactive import (
+    BUILTIN_BUNDLES,
+    FEATURE_ADVANCED_TOOL_CONTROLS,
+    KNOWN_FEATURES,
+    CapabilityPolicyStore,
+    FeatureFlagStore,
+    InstructionsStore,
+    WakePolicyStore,
+    capability_denies,
+    current_capabilities,
+    current_zone,
+)
 from .setup_cli import _enable_plugin, _run_interactive_setup
 
 logger = logging.getLogger("gateway.filament_fcm")
@@ -342,6 +353,60 @@ def register(ctx: Any) -> None:
         )
 
     _register_reactive_tools(ctx)
+    _register_capability_gate(ctx)
+
+
+def _register_capability_gate(ctx: Any) -> None:
+    """Install the per-turn tool-capability gate as a ``pre_tool_call`` hook.
+
+    Hermes calls every registered ``pre_tool_call`` hook before executing a tool
+    (``get_pre_tool_call_block_message`` in ``tool_executor.py``); returning
+    ``{"action": "block", "message": ...}`` denies the call in non-LLM code the
+    model cannot argue with. This is what turns the data-plane trust boundary
+    from *soft* (framing only) into *hard* per-call denial.
+
+    The gate reads the per-turn ``current_capabilities`` ContextVar the adapter
+    pins in ``_wake``: ``None`` (control turns, non-Filament turns) is ungated;
+    a frozenset restricts the turn to exactly those tool names. Fires for EVERY
+    tool in the process — Filament tools and any other plugin's (a calendar/web
+    MCP server) alike — so a data channel can be granted or denied capabilities
+    it doesn't even own.
+    """
+
+    def _capability_pre_tool_call(**kwargs: Any) -> dict | None:
+        tool_name = kwargs.get("tool_name") or ""
+        allowed = current_capabilities.get()
+        if not capability_denies(allowed, tool_name):
+            return None
+        logger.info(
+            "filament-fcm: capability gate DENIED tool=%s (zone=%s, %d allowed)",
+            tool_name,
+            current_zone.get(),
+            len(allowed) if allowed is not None else -1,
+        )
+        return {
+            "action": "block",
+            "message": (
+                f"The '{tool_name}' tool is not available in this channel. Your "
+                "capabilities here are limited by your principal's policy; do "
+                "not retry this tool or a substitute for it. If the task needs "
+                "it, say so plainly or escalate to your principal — do not claim "
+                "you performed the action."
+            ),
+        }
+
+    try:
+        ctx.register_hook("pre_tool_call", _capability_pre_tool_call)
+        logger.info("filament-fcm: capability gate registered (pre_tool_call)")
+    except Exception:
+        # A Hermes without the pre_tool_call hook point would leave data turns
+        # protected by framing only (the prior behavior) — degrade loudly, don't
+        # crash startup.
+        logger.warning(
+            "filament-fcm: could not register pre_tool_call capability gate; "
+            "data-plane tool capabilities are NOT hard-enforced on this Hermes",
+            exc_info=True,
+        )
 
 
 def _wake_policy_error(policy: dict) -> str | None:
@@ -378,6 +443,61 @@ def _wake_policy_error(policy: dict) -> str | None:
     return None
 
 
+def _capability_policy_error(policy: dict, store: CapabilityPolicyStore) -> str | None:
+    """Validate a capability policy. Return an error message, or None if valid.
+
+    Rejects unknown capability/bundle references up front so a typo fails at the
+    point the principal makes it (with feedback) rather than silently granting
+    nothing at turn time. Known names are the built-in bundles plus any bundle
+    the same policy defines.
+    """
+    def _str_list(v: Any) -> bool:
+        return isinstance(v, list) and all(isinstance(e, str) for e in v)
+
+    bundles = policy.get("bundles", {})
+    if not isinstance(bundles, dict):
+        return "bundles must be an object mapping bundle name → list of tool names."
+    for name, entries in bundles.items():
+        if not _str_list(entries):
+            return f"bundles[{name}] must be a list of tool-name / '@bundle' strings."
+
+    # Every referenceable name: built-in bundles plus the policy's custom ones.
+    known = set(BUILTIN_BUNDLES) | {str(k) for k in bundles}
+
+    def _check_grants(names: Any, where: str) -> str | None:
+        if not _str_list(names):
+            return f"{where} must be a list of capability/bundle names."
+        for n in names:
+            if n not in known:
+                return (
+                    f"{where} references unknown capability {n!r}. "
+                    f"Known: {', '.join(sorted(known))}. "
+                    "Define it under 'bundles' first, or fix the name."
+                )
+        return None
+
+    dc = policy.get("default_capabilities", [])
+    err = _check_grants(dc, "default_capabilities")
+    if err:
+        return err
+
+    for key in ("per_channel", "per_user"):
+        scoped = policy.get(key, {})
+        if not isinstance(scoped, dict):
+            return f"{key} must be an object keyed by id."
+        for ident, names in scoped.items():
+            err = _check_grants(names, f"{key}[{ident}]")
+            if err:
+                return err
+
+    # References inside a custom bundle's own @includes must resolve too.
+    for name in bundles:
+        for entry in bundles[name]:
+            if entry.startswith("@") and entry[1:] not in known:
+                return f"bundles[{name}] includes unknown bundle {entry!r}."
+    return None
+
+
 def _register_reactive_tools(ctx: Any) -> None:
     """Register the reactive-plane management tools (control-plane only).
 
@@ -392,6 +512,8 @@ def _register_reactive_tools(ctx: Any) -> None:
     """
     instructions_store = InstructionsStore()
     wake_store = WakePolicyStore()
+    capability_store = CapabilityPolicyStore()
+    feature_flags = FeatureFlagStore()
 
     def _deny(tool: str) -> str:
         logger.info(
@@ -441,6 +563,114 @@ def _register_reactive_tools(ctx: Any) -> None:
             return _deny("get_wake_policy")
         return json.dumps({"policy": wake_store.read()})
 
+    def _available_tools_by_toolset() -> dict[str, list[str]] | None:
+        """Best-effort inventory of every registered tool name, grouped by
+        toolset, so the principal can see what a custom bundle could reference
+        (Filament tools plus any other plugin's). Returns None if the registry
+        can't be read — the core policy/bundle view still works without it."""
+        try:
+            from tools.registry import registry  # noqa: PLC0415
+
+            return {
+                ts: sorted(registry.get_tool_names_for_toolset(ts))
+                for ts in sorted(registry.get_registered_toolset_names())
+            }
+        except Exception:
+            logger.debug("filament-fcm: tool inventory unavailable", exc_info=True)
+            return None
+
+    def _feature_off_notice(tool: str) -> str:
+        return json.dumps(
+            {
+                "error": (
+                    "Advanced tool controls are not enabled, so this does "
+                    "nothing yet. Ask your principal to 'enable the advanced tool "
+                    "controls feature' first (set_feature), then retry."
+                ),
+                "feature": FEATURE_ADVANCED_TOOL_CONTROLS,
+                "enabled": False,
+            }
+        )
+
+    async def _get_capabilities(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: get_capabilities (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("get_capabilities")
+        if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
+            return _feature_off_notice("get_capabilities")
+        policy = capability_store.read()
+        # Expand every known bundle to its concrete tool list so the principal
+        # sees exactly what each capability grants (their explicit ask).
+        merged = capability_store.bundles(policy)
+        expanded = {
+            name: sorted(capability_store.expand_bundle(name, policy))
+            for name in sorted(merged)
+        }
+        out = {
+            "policy": policy,
+            "builtin_bundles": sorted(BUILTIN_BUNDLES),
+            "bundles_expanded": expanded,
+        }
+        inventory = _available_tools_by_toolset()
+        if inventory is not None:
+            out["available_tools_by_toolset"] = inventory
+        return json.dumps(out, indent=2)
+
+    async def _set_capabilities(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: set_capabilities (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("set_capabilities")
+        if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
+            return _feature_off_notice("set_capabilities")
+        policy = args.get("policy")
+        if not isinstance(policy, dict):
+            return json.dumps(
+                {
+                    "error": "policy must be an object (default_capabilities, "
+                    "bundles, per_channel, per_user)."
+                }
+            )
+        err = _capability_policy_error(policy, capability_store)
+        if err:
+            return json.dumps({"error": err})
+        capability_store.write(policy)
+        return json.dumps({"ok": True, "policy": policy})
+
+    async def _get_features(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: get_features (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("get_features")
+        flags = feature_flags.read()
+        return json.dumps(
+            {
+                "features": {
+                    name: {"enabled": bool(flags.get(name, False)), "description": desc}
+                    for name, desc in KNOWN_FEATURES.items()
+                }
+            },
+            indent=2,
+        )
+
+    async def _set_feature(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: set_feature (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("set_feature")
+        name = args.get("feature")
+        enabled = args.get("enabled")
+        if name not in KNOWN_FEATURES:
+            return json.dumps(
+                {
+                    "error": f"Unknown feature {name!r}.",
+                    "known_features": sorted(KNOWN_FEATURES),
+                }
+            )
+        if not isinstance(enabled, bool):
+            return json.dumps({"error": "enabled must be true or false."})
+        flags = feature_flags.set(name, enabled)
+        return json.dumps(
+            {"ok": True, "feature": name, "enabled": enabled, "flags": flags}
+        )
+
     def _reg(name: str, desc: str, params: dict, handler: Any) -> None:
         ctx.register_tool(
             name=name,
@@ -486,3 +716,60 @@ def _register_reactive_tools(ctx: Any) -> None:
         _set_wake_policy,
     )
     _reg("get_wake_policy", "Show the current wake policy.", _empty, _get_wake_policy)
+    _reg(
+        "get_capabilities",
+        "Show which tools the agent may use in shared (data-plane) channels: the "
+        "current capability policy (default_capabilities, custom bundles, and "
+        "per_channel / per_user grants), every bundle expanded to its concrete "
+        "tool list, and the full inventory of registered tools you can compose a "
+        "custom bundle from. Read this before editing with set_capabilities. "
+        "Backchannel/owner only.",
+        _empty,
+        _get_capabilities,
+    )
+    _reg(
+        "set_capabilities",
+        "Set the capability policy that limits which tools the agent may call in "
+        "shared channels (hard-enforced per call, not just framing). The "
+        "principal edits this CONVERSATIONALLY: read get_capabilities, apply "
+        "their request, and save the full result here. 'policy' is an object "
+        "with: default_capabilities (bundles granted to any unlisted "
+        "channel/user — fail-closed baseline), bundles (custom name → list of "
+        "tool names, where '@name' includes another bundle), per_channel and "
+        "per_user (id → list of granted bundle names). A turn's allowed tools "
+        "are the UNION of the default, its channel grant, and its sender grant. "
+        "Backchannel/owner only.",
+        {
+            "type": "object",
+            "properties": {"policy": {"type": "object"}},
+            "required": ["policy"],
+        },
+        _set_capabilities,
+    )
+    _reg(
+        "set_feature",
+        "Turn a Filament agent feature on or off at runtime (backchannel/owner "
+        "only). Use this when your principal asks to enable or disable a feature "
+        "by name — e.g. \"enable the advanced tool controls feature\" → "
+        "set_feature(feature='advanced_tool_controls', enabled=true). Known "
+        "features: 'advanced_tool_controls' — per-channel/per-user tool "
+        "capability gating for shared channels (off by default; when off the "
+        "agent behaves like a fresh install). The change takes effect on the "
+        "next turn, no restart. Call get_features to see names and current state.",
+        {
+            "type": "object",
+            "properties": {
+                "feature": {"type": "string"},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["feature", "enabled"],
+        },
+        _set_feature,
+    )
+    _reg(
+        "get_features",
+        "List the agent's toggleable features, each with its description and "
+        "whether it's currently enabled. Backchannel/owner only.",
+        _empty,
+        _get_features,
+    )

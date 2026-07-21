@@ -104,19 +104,45 @@ invites, so anyone can pull the agent into a loop, and with `FILAMENT_ALLOW_DATA
 (the default) that loop immediately becomes data plane. Gating invite acceptance (e.g. an
 invite allowlist, or principal-approval) is a follow-up; until then, membership is effectively
 open, and the data-plane framing — not loop scoping — is what contains untrusted input. Tool
-rings are soft
-(prompt-level) for now; hard per-call tool denial is a follow-up (no per-message tool-filter
-hook in the gateway). The `enforces_own_access_policy` + `dm_policy`/`group_policy` route was
+rings are now **hard-enforced per call** (see the capability gate below), not prompt-level
+only. The `enforces_own_access_policy` + `dm_policy`/`group_policy` route was
 considered and dropped: with no per-loop allowlist, opening loops is an `open` policy the
 gateway refuses (§2.6), so the standard `allow_all_env` switch is used instead.
 
+**Capability gate (hard per-call tool denial — implemented).** Contrary to the earlier note
+that "the gateway exposes no per-message tool-filter hook," Hermes *does* have a non-LLM
+deny-point in the tool path: a plugin `pre_tool_call` hook (`get_pre_tool_call_block_message`
+in `agent/tool_executor.py`) can return `{"action": "block", …}` to refuse a call. This is the
+same shape as Claude Code's `PreToolUse` hook that §8 holds up as the gold standard. We use it:
+`__init__.py:_register_capability_gate` installs a hook that reads the per-turn
+`current_capabilities` ContextVar the adapter pins in `_wake`, and denies any tool not in the
+turn's allowed set. Because the hook fires for *every* tool, this gates tools the plugin
+doesn't even own (a separate calendar/web MCP plugin) — capability, not identity, is the axis.
+The policy is `reactive.py:CapabilityPolicyStore` (per-channel / per-user grants of named tool
+*bundles*), fail-closed (an unlisted channel/user gets only a minimal default profile), read
+fresh per event, and retuned from the backchannel with `set_capabilities` / `get_capabilities`.
+This upgrades the Warden's **capability boundary from soft to hard** while cognition stays
+unified — the stronger Warden §8 says Hermes "can't offer today." (Open follow-up: grants are
+additive/union, so restricting one user *below* a channel grant needs a deny-list.)
+
+**Opt-in (default OFF).** The whole hard layer ships behind the `advanced_tool_controls`
+feature flag (`reactive.py:FeatureFlagStore`, default OFF): installing the plugin changes
+nothing, so the hard boundary never surprises an existing deployment. The principal turns it on
+from the backchannel ("enable the advanced tool controls feature" → the `set_feature` tool
+writes `feature_flags.json`), read fresh per event so it takes effect next turn with no restart.
+While OFF the adapter leaves `current_capabilities` `None` and injects no tool hint, so the
+always-registered hook is inert and behavior is identical to a pre-feature install.
+
 **On Filament:** today's adapter has the hooks — it knows `cc_room_id` (backchannel)
-and `owner_id`. Implemented: (a) a zone classifier and (b) per-zone message framing in
-`_handle_push_message`. **Not yet** implemented: (c) per-zone tool gating — every MCP tool
-is registered unconditionally in `__init__.py` and each handler forwards the call without a
-zone check, so a data-plane turn is held back only by prompt framing (it can still *invoke*
-privileged tools like `post_message`/`accept_invite`). Hard per-call tool denial is the
-follow-up (the gateway exposes no per-message tool-filter hook today).
+and `owner_id`. Implemented: (a) a zone classifier, (b) per-zone message framing in
+`_handle_push_message`, and (c) **per-turn capability gating** — the `pre_tool_call` hook +
+`CapabilityPolicyStore` described above. A data-plane turn is now held back both by prompt
+framing *and* by hard per-call tool denial keyed on `(room_id, sender)`, so it can no longer
+*invoke* a privileged tool (`post_message` to an ungranted degree, `accept_invite`,
+`set_profile`, or any non-Filament tool) unless the principal granted the bundle that
+contains it. All MCP tools are still *registered* unconditionally; the gate denies at call
+time rather than hiding the tool, which is the same enforcement property (the model sees a
+refusal it cannot bypass).
 
 ### 4.2 The Twins — two instances, shared identity, hard partition
 
