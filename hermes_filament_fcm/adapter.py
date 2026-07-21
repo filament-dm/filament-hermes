@@ -1594,10 +1594,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # trigger is partly attacker-controlled (reaction.key), so sanitize it
         # before it goes into the trusted framing.
         safe_trigger = _sanitize_meta(trigger)
-        # A message wake authored by the local filament_god (a system notice —
-        # today only the "X vouched for Y to join <loop>" Welcome announcement)
-        # never reaches here: _handle_push_message_turn skips it before wake.
-        # So no system-notice framing is needed on this path.
         signal = (
             "[WAKE-UP SIGNAL]\n"
             f"channel: {_sanitize_meta(channel_name)} ({channel})\n"
