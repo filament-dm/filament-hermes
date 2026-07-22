@@ -123,6 +123,41 @@ def test_wake_policy_off():
         assert wp.should_wake_message("!room", is_mention=True) is False
 
 
+def test_reply_style_default_is_thread():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        # Unconfigured channels thread every reply — the long-standing default.
+        assert wp.reply_style("!room") == "thread"
+
+
+def test_reply_style_global_and_per_channel():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        wp.write(
+            {
+                "reply_style": "thread",
+                "per_channel": {"!c2": {"reply_style": "channel"}},
+            }
+        )
+        # Per-channel override wins; unlisted channels fall back to the global.
+        assert wp.reply_style("!c2") == "channel"
+        assert wp.reply_style("!other") == "thread"
+
+
+def test_reply_style_global_channel_applies_everywhere():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        wp.write({"reply_style": "channel"})
+        assert wp.reply_style("!anything") == "channel"
+
+
+def test_reply_style_unknown_value_fails_safe_to_thread():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        wp.write({"reply_style": "bogus"})
+        assert wp.reply_style("!room") == "thread"
+
+
 def test_current_zone_default_is_data():
     # Fail-closed: control-plane tools refuse unless a turn explicitly set this.
     assert reactive.current_zone.get() == "data"

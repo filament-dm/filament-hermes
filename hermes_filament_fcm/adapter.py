@@ -1371,6 +1371,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if media_note:
             data = f"{data}\n{media_note}" if data else media_note
 
+        # Where the reply lands is a per-channel wake-policy choice. Default
+        # ("thread") threads off the triggering message: a top-level message
+        # roots a new thread (thread_id = event_id). A channel configured
+        # "channel" behaves like the backchannel — a top-level message gets a
+        # top-level reply (thread_id None → post_message), while a reply inside
+        # an existing thread stays threaded. Resolving to None here (rather than
+        # coaxing the model to call post_message) is what makes main-timeline
+        # replies reliable: send() already routes None → post_message.
+        if self._wake_policy.reply_style(msg.room_id) == "channel":
+            thread_id = msg.thread_id
+        else:
+            thread_id = msg.thread_id or msg.event_id
         await self._wake(
             channel=msg.room_id,
             channel_name=msg.room_name,
@@ -1381,7 +1393,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # mention-only one — is never mistaken for a reaction in _wake.
             data=data,
             target_event_id=msg.event_id,
-            thread_id=msg.thread_id or msg.event_id,
+            thread_id=thread_id,
             raw=msg.raw,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
@@ -1660,7 +1672,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             chat_type="group",
             user_id=sender,
             user_name=sender_name,
-            thread_id=thread_id or message_id,
+            # thread_id is pre-resolved by the caller: a thread root to reply
+            # in, or None to post on the main timeline. Don't fall back to
+            # message_id — that would force threading and defeat a "channel"
+            # reply_style. (Both callers already pass a concrete root when they
+            # want threading: reactions off their target, messages off the
+            # triggering event unless the channel opts into main-timeline.)
+            thread_id=thread_id,
             message_id=message_id,
         )
         # Reinforce the envelope's get_recent_messages hint with a concrete

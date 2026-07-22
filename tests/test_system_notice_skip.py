@@ -109,6 +109,9 @@ class _AlwaysWakePolicy:
     def should_wake_message(self, room_id, is_mention):
         return True
 
+    def reply_style(self, room_id):
+        return "thread"
+
 
 def _make_adapter():
     a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)

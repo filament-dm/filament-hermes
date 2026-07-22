@@ -281,17 +281,21 @@ class WakePolicyStore:
         {
           "trigger_emojis": ["🐞", "🐛", "🤖"],   # reactions that wake
           "reactive_wake": "mention",               # "mention" | "all" | "off"
+          "reply_style": "thread",                  # "thread" | "channel"
           "per_channel": {"<room_id>": {"reactive_wake": "all",
+                                         "reply_style": "channel",
                                          "trigger_emojis": [...]}}
         }
 
-    Defaults are conservative: respond only when @-mentioned, no reaction
-    triggers, until the principal configures it from the backchannel.
+    Defaults are conservative: respond only when @-mentioned, thread every
+    reply off the triggering message, no reaction triggers, until the principal
+    configures it from the backchannel.
     """
 
     _DEFAULTS: ClassVar[dict] = {
         "trigger_emojis": [],
         "reactive_wake": "mention",
+        "reply_style": "thread",
         "per_channel": {},
     }
 
@@ -338,6 +342,26 @@ class WakePolicyStore:
             woke,
         )
         return woke
+
+    def reply_style(self, room_id: str) -> str:
+        """Where a reactive reply lands, resolved per-channel then global.
+
+        "thread" (default) — thread the reply off the triggering message, the
+        long-standing shared-channel behavior. "channel" — deliver on the main
+        timeline like the backchannel: a top-level message gets a top-level
+        reply, while a reply to something already inside a thread stays in that
+        thread. An unrecognized value fails safe to "thread"."""
+        policy = self.read()
+        ch = self._channel(policy, room_id)
+        style = ch.get("reply_style", policy.get("reply_style", "thread"))
+        resolved = style if style in ("thread", "channel") else "thread"
+        logger.info(
+            "filament-fcm: reply_style room=%s style=%s → %s",
+            room_id,
+            style,
+            resolved,
+        )
+        return resolved
 
     def should_wake_reaction(self, room_id: str, emoji: str) -> bool:
         policy = self.read()
