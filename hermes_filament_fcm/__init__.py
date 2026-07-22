@@ -299,7 +299,10 @@ def register(ctx: Any) -> None:
             "they describe how you should behave in shared channels, read your "
             "current instructions (get_instructions), apply their request as an "
             "edit, save it (set_instructions), and confirm what changed. Tune "
-            "the wake policy (set_wake_policy) the same conversational way."
+            "the wake policy (set_wake_policy) the same conversational way — "
+            "including making a channel behave like the backchannel by waking "
+            "on every message (reactive_wake 'all') and replying on the main "
+            "timeline (reply_style 'channel')."
         ),
     )
 
@@ -412,15 +415,19 @@ def _register_capability_gate(ctx: Any) -> None:
 def _wake_policy_error(policy: dict) -> str | None:
     """Validate a wake policy. Return an error message, or None if valid.
 
-    Guards against silently-ignored typos: an invalid ``reactive_wake`` or a
-    non-list ``trigger_emojis`` would otherwise be persisted and then fall back
-    to defaults at decision time, so the agent runs on an unintended policy.
+    Guards against silently-ignored typos: an invalid ``reactive_wake``,
+    ``reply_style``, or a non-list ``trigger_emojis`` would otherwise be
+    persisted and then fall back to defaults at decision time, so the agent
+    runs on an unintended policy.
     """
 
     def _check_scope(scope: dict, where: str) -> str | None:
         rw = scope.get("reactive_wake")
         if rw is not None and rw not in ("mention", "all", "off"):
             return f"reactive_wake{where} must be 'mention', 'all', or 'off'."
+        rs = scope.get("reply_style")
+        if rs is not None and rs not in ("thread", "channel"):
+            return f"reply_style{where} must be 'thread' or 'channel'."
         te = scope.get("trigger_emojis")
         if te is not None and not (
             isinstance(te, list) and all(isinstance(e, str) for e in te)
@@ -706,8 +713,11 @@ def _register_reactive_tools(ctx: Any) -> None:
         "set_wake_policy",
         "Set the wake policy that decides whether a shared-channel event wakes "
         "the agent. Object with: trigger_emojis (list of emoji that wake on "
-        "reaction), reactive_wake ('mention' | 'all' | 'off'), and optional "
-        "per_channel overrides keyed by room id. Backchannel/owner only.",
+        "reaction), reactive_wake ('mention' | 'all' | 'off'), reply_style "
+        "('thread' to thread each reply off the triggering message, the "
+        "default | 'channel' to post replies on the main timeline like the "
+        "backchannel), and optional per_channel overrides keyed by room id. "
+        "Backchannel/owner only.",
         {
             "type": "object",
             "properties": {"policy": {"type": "object"}},
