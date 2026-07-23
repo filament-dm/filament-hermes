@@ -7,6 +7,7 @@ is stdlib-only and has no relative imports, so it loads directly.
 import importlib.util
 import sys
 import types
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 _DEPS_PATH = Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "deps.py"
@@ -60,7 +61,19 @@ def test_satisfies_equality():
 
 def test_dep_problem_missing_import(monkeypatch):
     # No firebase_messaging importable → a message pointing at the refresh path.
+    # firebase-messaging is a real installed dependency, so clearing the import
+    # cache is not enough — ``import firebase_messaging`` would just re-import the
+    # installed package. Install a meta_path finder that raises for the target so
+    # the import fails deterministically regardless of what's installed.
     monkeypatch.delitem(sys.modules, "firebase_messaging", raising=False)
+
+    class _BlockFirebase:
+        def find_spec(self, name, path=None, target=None):
+            if name == "firebase_messaging":
+                raise ModuleNotFoundError(name)
+            return None
+
+    monkeypatch.setattr(sys, "meta_path", [_BlockFirebase(), *sys.meta_path])
     monkeypatch.setattr(
         deps, "REQUIRED", {"firebase-messaging": ">=0.4.5,<1"}, raising=False
     )
@@ -72,9 +85,16 @@ def test_dep_problem_missing_import(monkeypatch):
 
 def test_dep_problem_present_but_no_metadata(monkeypatch):
     # firebase importable (stubbed) but no dist-info → still flagged, since we
-    # can't confirm the version satisfies the requirement.
+    # can't confirm the version satisfies the requirement. Because the real
+    # distribution may be installed, force ``_dist_version`` to raise so the
+    # "importable but no dist metadata" branch is exercised deterministically.
     stub = types.ModuleType("firebase_messaging")
     monkeypatch.setitem(sys.modules, "firebase_messaging", stub)
+
+    def _no_metadata(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(deps, "_dist_version", _no_metadata)
     problem = deps.dep_problem()
     assert problem is not None
     assert deps.REFRESH_HINT in problem
