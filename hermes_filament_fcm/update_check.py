@@ -3,9 +3,9 @@
 The plugin is installed from git main (see install.sh), so "latest
 available version" means the version currently on main. Once a day the
 adapter fetches the raw pyproject.toml from GitHub, compares it to the
-installed version, and — when a newer one exists — reminds the principal
-once per new version via the backchannel (every check still logs, so
-operators watching logs see it too).
+installed version, and — when a newer one exists — logs a warning. The
+reminder is log-only for now (there is no backchannel post), so operators
+watching logs are the audience.
 
 Set FILAMENT_DISABLE_UPDATE_CHECK=true to turn the whole thing off (e.g.
 air-gapped deployments, or devs running a checkout).
@@ -41,19 +41,6 @@ def update_check_disabled() -> bool:
         "1",
         "true",
         "yes",
-    )
-
-
-def build_reminder(latest: str, current: str) -> str:
-    """The small backchannel note shown to the principal."""
-    return (
-        f"📦 A new version of the Filament↔Hermes plugin is available: "
-        f"v{latest} (this agent runs v{current}). To update, run on the "
-        f"machine hosting this agent:\n"
-        f"```\nhermes plugins update filament-fcm && hermes gateway restart\n```\n"
-        f"If the plugin reports a dependency problem after updating (rare — only "
-        f"when a release bumps a dependency), re-run the connect command from "
-        f"the Filament app instead, which also refreshes dependencies."
     )
 
 

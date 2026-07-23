@@ -983,24 +983,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             await asyncio.sleep(interval_seconds)
 
     async def _notify_update_available(self, latest: str) -> None:
-        """Post the small update reminder to the principal's backchannel.
+        """Record that this newer version has been noticed.
 
-        Marked as notified only after the post succeeds, so a failed
-        delivery retries on the next daily check. Without a backchannel
-        there's nowhere to remind — the warning already logged by
-        UpdateChecker.check is the whole reminder then.
+        There is currently no backchannel post — the user-facing signal is
+        the warning already logged by ``UpdateChecker.check``. This just
+        marks the version as notified so it isn't re-flagged on later daily
+        checks. With no backchannel configured there's nowhere to remind
+        anyway, so we simply return.
         """
         if not self._cc_room_id:
             return
-        # result = await self._filament_api.post_message(
-        #     self._cc_room_id, build_reminder(latest, PLUGIN_VERSION)
-        # )
-        # if isinstance(result, dict) and result.get("error"):
-        #     logger.warning(
-        #         "filament-fcm: update reminder failed to send: %s",
-        #         result.get("error"),
-        #     )
-        #     return
         self._update_checker.mark_notified(latest)
 
     # ── Disconnect ──────────────────────────────────────────────────
