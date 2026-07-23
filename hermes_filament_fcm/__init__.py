@@ -450,7 +450,7 @@ def _wake_policy_error(policy: dict) -> str | None:
     return None
 
 
-def _capability_policy_error(policy: dict, store: CapabilityPolicyStore) -> str | None:
+def _capability_policy_error(policy: dict) -> str | None:
     """Validate a capability policy. Return an error message, or None if valid.
 
     Rejects unknown capability/bundle references up front so a typo fails at the
@@ -458,6 +458,7 @@ def _capability_policy_error(policy: dict, store: CapabilityPolicyStore) -> str 
     nothing at turn time. Known names are the built-in bundles plus any bundle
     the same policy defines.
     """
+
     def _str_list(v: Any) -> bool:
         return isinstance(v, list) and all(isinstance(e, str) for e in v)
 
@@ -586,7 +587,7 @@ def _register_reactive_tools(ctx: Any) -> None:
             logger.debug("filament-fcm: tool inventory unavailable", exc_info=True)
             return None
 
-    def _feature_off_notice(tool: str) -> str:
+    def _feature_off_notice() -> str:
         return json.dumps(
             {
                 "error": (
@@ -604,7 +605,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         if current_zone.get() != "control":
             return _deny("get_capabilities")
         if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
-            return _feature_off_notice("get_capabilities")
+            return _feature_off_notice()
         policy = capability_store.read()
         # Expand every known bundle to its concrete tool list so the principal
         # sees exactly what each capability grants (their explicit ask).
@@ -628,7 +629,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         if current_zone.get() != "control":
             return _deny("set_capabilities")
         if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
-            return _feature_off_notice("set_capabilities")
+            return _feature_off_notice()
         policy = args.get("policy")
         if not isinstance(policy, dict):
             return json.dumps(
@@ -637,7 +638,7 @@ def _register_reactive_tools(ctx: Any) -> None:
                     "bundles, per_channel, per_user)."
                 }
             )
-        err = _capability_policy_error(policy, capability_store)
+        err = _capability_policy_error(policy)
         if err:
             return json.dumps({"error": err})
         capability_store.write(policy)
@@ -760,7 +761,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         "set_feature",
         "Turn a Filament agent feature on or off at runtime (backchannel/owner "
         "only). Use this when your principal asks to enable or disable a feature "
-        "by name — e.g. \"enable the advanced tool controls feature\" → "
+        'by name — e.g. "enable the advanced tool controls feature" → '
         "set_feature(feature='advanced_tool_controls', enabled=true). Known "
         "features: 'advanced_tool_controls' — per-channel/per-user tool "
         "capability gating for shared channels (off by default; when off the "
