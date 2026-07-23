@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from ._version import DIST_NAME, PLUGIN_VERSION, version_headers
-from .observability import Stopwatch, current_context, get_logger
+from .observability import Stopwatch, get_logger
 
 logger = logging.getLogger("gateway.filament_fcm")
 slog = get_logger()
@@ -388,7 +388,6 @@ class FilamentAPI:
         timer = Stopwatch.start()
         slog.debug(
             "filament_fcm.http.side_channel.start",
-            **current_context(),
             path="/media",
             method="GET",
             timeout_ms=timeout_ms,
@@ -405,7 +404,6 @@ class FilamentAPI:
                     detail = (await resp.aread())[:200]
                     slog.warning(
                         "filament_fcm.http.side_channel.complete",
-                        **current_context(),
                         path="/media",
                         method="GET",
                         http_status=resp.status_code,
@@ -423,7 +421,6 @@ class FilamentAPI:
             os.replace(tmp, dest)
             slog.debug(
                 "filament_fcm.http.side_channel.complete",
-                **current_context(),
                 path="/media",
                 method="GET",
                 http_status=200,
@@ -465,7 +462,6 @@ class FilamentAPI:
         timer = Stopwatch.start()
         slog.debug(
             "filament_fcm.http.side_channel.start",
-            **current_context(),
             path=path,
             method="POST",
             has_body=body is not None,
@@ -477,7 +473,6 @@ class FilamentAPI:
         )
         slog.debug(
             "filament_fcm.http.side_channel.complete",
-            **current_context(),
             path=path,
             method="POST",
             http_status=resp.status_code,
@@ -531,7 +526,6 @@ class FilamentAPI:
         timer = Stopwatch.start()
         slog.debug(
             "filament_fcm.mcp.request.start",
-            **current_context(),
             rpc_id=rpc_id,
             method=method,
             tool_name=tool_name,
@@ -554,7 +548,6 @@ class FilamentAPI:
         if resp.status_code in (202, 204):
             slog.debug(
                 "filament_fcm.mcp.request.complete",
-                **current_context(),
                 rpc_id=rpc_id,
                 method=method,
                 tool_name=tool_name,
@@ -568,7 +561,6 @@ class FilamentAPI:
             logger.error("MCP request failed: %d %s", resp.status_code, resp.text[:200])
             slog.warning(
                 "filament_fcm.mcp.request.complete",
-                **current_context(),
                 rpc_id=rpc_id,
                 method=method,
                 tool_name=tool_name,
@@ -584,7 +576,6 @@ class FilamentAPI:
             logger.error("Failed to parse MCP response: %s", resp.text[:200])
             slog.warning(
                 "filament_fcm.mcp.request.complete",
-                **current_context(),
                 rpc_id=rpc_id,
                 method=method,
                 tool_name=tool_name,
@@ -603,7 +594,6 @@ class FilamentAPI:
         log = slog.warning if error_code is not None else slog.debug
         log(
             event,
-            **current_context(),
             rpc_id=rpc_id,
             method=method,
             tool_name=tool_name,
