@@ -347,6 +347,22 @@ class FilamentAPI:
         """List pending vouches (loop members who vouched the agent into a loop)."""
         return await self.call_tool("list_vouches", {})
 
+    @staticmethod
+    def result_error(result: Any) -> str | None:
+        """The JSON-RPC error in a tool response, or None on success.
+
+        call_tool returns the raw envelope; a server-side rejection (e.g.
+        accept_vouch's knock 403 → -32602) comes back as {"error": {...}}
+        with HTTP 200. Callers that log success without checking this
+        report actions that never happened — live-observed: 'accepted
+        vouch' logged while every knock 403'd, making a broken flow
+        invisible to the principal, the admin, and the logs alike."""
+        if isinstance(result, dict) and isinstance(result.get("error"), dict):
+            err = result["error"]
+            msg = err.get("message") or f"code {err.get('code')}"
+            return str(msg)
+        return None
+
     async def accept_vouch(self, loop_id: str) -> dict[str, Any]:
         """Accept a vouch: knock on the loop so a loop admin can approve the agent."""
         return await self.call_tool("accept_vouch", {"loop_id": loop_id})
