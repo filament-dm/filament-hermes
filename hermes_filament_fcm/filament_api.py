@@ -357,10 +357,13 @@ class FilamentAPI:
         report actions that never happened — live-observed: 'accepted
         vouch' logged while every knock 403'd, making a broken flow
         invisible to the principal, the admin, and the logs alike."""
-        if isinstance(result, dict) and isinstance(result.get("error"), dict):
-            err = result["error"]
-            msg = err.get("message") or f"code {err.get('code')}"
-            return str(msg)
+        if isinstance(result, dict):
+            err = result.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or f"code {err.get('code')}"
+                return str(msg)
+            if isinstance(err, str) and err:
+                return err
         return None
 
     async def accept_vouch(self, loop_id: str) -> dict[str, Any]:
