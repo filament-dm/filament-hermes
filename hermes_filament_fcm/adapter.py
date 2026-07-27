@@ -779,7 +779,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 if not loop_id:
                     continue
                 try:
-                    await self._filament_api.accept_vouch(loop_id)
+                    result = await self._filament_api.accept_vouch(loop_id)
+                    err = self._filament_api.result_error(result)
+                    if err:
+                        logger.warning(
+                            "filament-fcm: accept_vouch for %s REJECTED by "
+                            "server: %s",
+                            loop_id,
+                            err,
+                        )
+                        continue
                     logger.info(
                         "filament-fcm: accepted vouch into %s "
                         "(pending loop-admin approval)",
@@ -1208,7 +1217,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 logger.warning("filament-fcm: vouch received but API not ready")
                 return
             try:
-                await self._filament_api.accept_vouch(vouch.loop_id)
+                result = await self._filament_api.accept_vouch(vouch.loop_id)
+                err = self._filament_api.result_error(result)
+                if err:
+                    logger.warning(
+                        "filament-fcm: accept_vouch for %s REJECTED by "
+                        "server: %s",
+                        vouch.loop_name or vouch.loop_id,
+                        err,
+                    )
+                    return
                 logger.info(
                     "filament-fcm: accepted vouch into %s from %s "
                     "(pending loop-admin approval)",
