@@ -1300,6 +1300,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             return
 
+        if self._user_id and msg.sender == self._user_id:
+            logger.info("filament-fcm: ignoring our own message %s", msg.event_id)
+            slog.info(
+                "filament_fcm.turn.skipped",
+                turn_id=turn_id,
+                event_id=msg.event_id,
+                reason="own_message",
+            )
+            return
+
         if self._is_control_channel(msg.room_id):
             logger.info("filament-fcm: → CONTROL plane (backchannel %s)", msg.room_id)
             slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
