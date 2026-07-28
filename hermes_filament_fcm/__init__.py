@@ -46,6 +46,7 @@ from .reactive import (
     current_capabilities,
     current_zone,
 )
+from .server_config import ServerConfigSync
 from .setup_cli import _enable_plugin, _run_interactive_setup
 
 logger = logging.getLogger("gateway.filament_fcm")
@@ -211,10 +212,25 @@ def register(ctx: Any) -> None:
     # established later in adapter.connect().
     api = FilamentAPI(mcp_url, mcp_token)
 
+    # Descriptions of every tool this plugin registers, collected as they are
+    # registered below. Feeds the tool-inventory report to the server (the
+    # registry knows only names) and the registry-less fallback inventory.
+    tool_descriptions: dict[str, str] = {}
+
+    # Server-held config document sync: ONE instance shared by the adapter
+    # (fetch-and-apply per wake, seed at startup) and the set_* tool handlers
+    # (write-back after a local edit), so the remembered document revision and
+    # the once-only failure warnings are process-wide. No network calls here.
+    server_sync = ServerConfigSync(
+        api, inventory_provider=lambda: _tool_inventory(tool_descriptions)
+    )
+
     ctx.register_platform(
         name="filament-fcm",
         label="Filament (FCM)",
-        adapter_factory=lambda cfg: FCMFilamentAdapter(cfg, filament_api=api),
+        adapter_factory=lambda cfg: FCMFilamentAdapter(
+            cfg, filament_api=api, server_sync=server_sync
+        ),
         check_fn=check_requirements,
         setup_fn=interactive_setup,
         plugin_name="filament-fcm",
@@ -333,6 +349,7 @@ def register(ctx: Any) -> None:
             is_async=True,
             description=tool.get("description", ""),
         )
+        tool_descriptions[name] = tool.get("description", "")
         registered += 1
 
     logger.info(
@@ -354,9 +371,46 @@ def register(ctx: Any) -> None:
             is_async=True,
             description=DOWNLOAD_MEDIA_SCHEMA["description"],
         )
+        tool_descriptions["download_media"] = DOWNLOAD_MEDIA_SCHEMA["description"]
 
-    _register_reactive_tools(ctx)
+    _register_reactive_tools(ctx, server_sync, tool_descriptions)
     _register_capability_gate(ctx)
+
+
+def _tool_inventory(descriptions: dict[str, str]) -> list[dict]:
+    """The registered-tool inventory to report to the server.
+
+    Enumerates every tool name the process has registered via the same
+    registry read ``get_capabilities`` uses — Filament tools and any other
+    plugin's alike. Origin is "filament" for this plugin's own toolset, the
+    toolset name otherwise; descriptions ride along where this plugin knows
+    them (the registry itself stores only names per toolset). If the registry
+    is unreadable, fall back to the tools this plugin registered itself.
+    """
+    try:
+        from tools.registry import registry  # noqa: PLC0415
+
+        entries: list[dict] = []
+        for ts in sorted(registry.get_registered_toolset_names()):
+            origin = "filament" if ts == "filament" else str(ts)
+            for name in sorted(registry.get_tool_names_for_toolset(ts)):
+                entry: dict = {"name": name, "origin": origin}
+                desc = descriptions.get(name)
+                if desc:
+                    entry["description"] = desc
+                entries.append(entry)
+        return entries
+    except Exception:
+        logger.debug(
+            "filament-fcm: tool registry unavailable — reporting own tools only",
+            exc_info=True,
+        )
+        return [
+            {"name": name, "description": desc, "origin": "filament"}
+            if desc
+            else {"name": name, "origin": "filament"}
+            for name, desc in sorted(descriptions.items())
+        ]
 
 
 def _register_capability_gate(ctx: Any) -> None:
@@ -506,7 +560,11 @@ def _capability_policy_error(policy: dict) -> str | None:
     return None
 
 
-def _register_reactive_tools(ctx: Any) -> None:
+def _register_reactive_tools(
+    ctx: Any,
+    server_sync: ServerConfigSync,
+    tool_descriptions: dict[str, str] | None = None,
+) -> None:
     """Register the reactive-plane management tools (control-plane only).
 
     ``set_instructions`` / ``set_wake_policy`` let the principal retune the
@@ -517,6 +575,10 @@ def _register_reactive_tools(ctx: Any) -> None:
     (``current_zone`` == "control"), so a shared-channel participant can never
     rewrite the agent's instructions. The stores are file-backed (same paths the
     adapter reads), so writes take effect on the next event with no restart.
+
+    Every successful ``set_*`` write is followed by ``server_sync.write_back()``
+    — the local files stay the working copy, and the server document mirrors
+    them so other readers (the app, a future gateway) see the same config.
     """
     instructions_store = InstructionsStore()
     wake_store = WakePolicyStore()
@@ -539,6 +601,9 @@ def _register_reactive_tools(ctx: Any) -> None:
             return _deny("set_instructions")
         text = args.get("instructions", "") or ""
         instructions_store.write(text)
+        # Mirror the local edit to the server document (never raises; on
+        # failure the local change stands and reconciliation happens later).
+        await server_sync.write_back()
         return json.dumps({"ok": True, "bytes": len(text)})
 
     async def _get_instructions(args: dict, **kwargs: Any) -> str:
@@ -563,6 +628,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         if err:
             return json.dumps({"error": err})
         wake_store.write(policy)
+        await server_sync.write_back()
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_wake_policy(args: dict, **kwargs: Any) -> str:
@@ -642,6 +708,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         if err:
             return json.dumps({"error": err})
         capability_store.write(policy)
+        await server_sync.write_back()
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_features(args: dict, **kwargs: Any) -> str:
@@ -675,6 +742,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         if not isinstance(enabled, bool):
             return json.dumps({"error": "enabled must be true or false."})
         flags = feature_flags.set(name, enabled)
+        await server_sync.write_back()
         return json.dumps(
             {"ok": True, "feature": name, "enabled": enabled, "flags": flags}
         )
@@ -688,6 +756,8 @@ def _register_reactive_tools(ctx: Any) -> None:
             is_async=True,
             description=desc,
         )
+        if tool_descriptions is not None:
+            tool_descriptions[name] = desc
 
     _empty = {"type": "object", "properties": {}}
     _reg(

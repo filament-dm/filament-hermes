@@ -65,6 +65,7 @@ from .reactive import (
     current_zone,
     is_system_sender,
 )
+from .server_config import ServerConfigSync
 from .update_check import UpdateChecker, update_check_disabled
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
@@ -175,7 +176,12 @@ def _summarize_media(media: Any) -> str | None:
 class FCMFilamentAdapter(BasePlatformAdapter):
     """Filament gateway adapter using FCM push for message reception."""
 
-    def __init__(self, config: Any, filament_api: FilamentAPI) -> None:
+    def __init__(
+        self,
+        config: Any,
+        filament_api: FilamentAPI,
+        server_sync: ServerConfigSync | None = None,
+    ) -> None:
         super().__init__(config, Platform("filament-fcm"))
 
         # ── Control plane vs reactive plane ───────────────────────────────
@@ -200,6 +206,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # enables it from the backchannel, a data turn stays ungated (None) and
         # gets no tool hint — i.e. a fresh install behaves exactly as before.
         self._feature_flags = FeatureFlagStore()
+        # Server-held config document sync (fetch-and-apply into the store
+        # files above). Normally the instance built in register() — shared
+        # with the set_* tool handlers so write-backs and per-wake applies
+        # agree on the remembered revision.
+        self._server_config = server_sync or ServerConfigSync(filament_api)
 
         self.max_message_length = _MAX_MESSAGE_LENGTH
 
@@ -465,6 +476,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 return False
 
             self._mark_connected()
+
+            # Pull the server-held agent config into the local store files (or
+            # seed the server from them if it holds no document yet), and
+            # report the registered tool inventory. Both are best-effort and
+            # internally error-silenced — they never fail or delay reconnects.
+            with bound_context(call_origin="startup"):
+                await self._server_config.sync(force=True)
+                await self._server_config.maybe_report_tools()
+
             logger.info("filament-fcm: connected successfully")
             slog.info(
                 "filament_fcm.connect.complete",
@@ -963,6 +983,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 logger.debug("filament-fcm: presence heartbeat sent")
             except Exception:
                 logger.warning("filament-fcm: presence heartbeat failed", exc_info=True)
+            # The hourly tool-inventory refresh piggybacks this timer: the
+            # call rate-limits itself (at most one POST per hour) and never
+            # raises, so it can't disturb the presence cadence.
+            with bound_context(call_origin="heartbeat"):
+                await self._server_config.maybe_report_tools()
 
     # ── Update check ────────────────────────────────────────────────
 
@@ -1328,6 +1353,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             return
 
+        # Refresh the local store files from the server-held config before the
+        # fresh-read consumers below (wake policy, standing instructions,
+        # capability policy, feature flags) run. TTL-cached, so an event burst
+        # costs at most one HTTP call; never raises.
+        await self._server_config.sync()
+
         if self._is_control_channel(msg.room_id):
             logger.info("filament-fcm: → CONTROL plane (backchannel %s)", msg.room_id)
             slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
@@ -1588,6 +1619,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 reason="processing_reaction",
             )
             return
+        # Same server-config refresh as the message path, before the wake
+        # policy below is read fresh. TTL-cached; never raises.
+        await self._server_config.sync()
         if self._is_control_channel(reaction.room_id):
             logger.info("filament-fcm: ignoring reaction in backchannel")
             slog.info(

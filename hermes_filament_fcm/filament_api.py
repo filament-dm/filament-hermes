@@ -469,6 +469,85 @@ class FilamentAPI:
         """
         return await self._side_channel_post("/pong", body={"nonce": nonce})
 
+    async def get_config(self) -> tuple[int, dict[str, Any]]:
+        """GET /mcp/agents/config — the server-held agent config document.
+
+        Returns ``(status_code, parsed_json)``. A 200 body carries
+        ``{"agent_user_id", "config": <object|null>, "revision": <int, 0 if
+        never written>, "updated_ms", "updated_by"}``. The raw status is
+        surfaced (not collapsed to an ``error`` dict) because the caller
+        branches on it: 404 means the server predates the endpoint.
+        """
+        return await self._side_channel_request("GET", "/config")
+
+    async def put_config(self, body: dict) -> tuple[int, dict[str, Any]]:
+        """PUT /mcp/agents/config — replace the agent config document.
+
+        ``body`` is ``{"config": {...}}`` plus an optional ``base_revision``
+        for compare-and-set (the create-once seed uses ``base_revision=0``; a
+        plain replace omits it). Returns ``(status_code, parsed_json)`` — 200
+        carries the new ``revision``, 409 carries ``current_revision`` on a
+        revision conflict, 400 an ``invalid_config`` detail.
+        """
+        return await self._side_channel_request("PUT", "/config", body=body)
+
+    async def post_tools(self, tools: list[dict]) -> tuple[int, dict[str, Any]]:
+        """POST /mcp/agents/tools — report the registered tool inventory.
+
+        ``tools`` is a list of ``{"name", "description"?, "origin"?}`` dicts.
+        Returns ``(status_code, parsed_json)``; older servers 404 (the caller
+        tolerates that).
+        """
+        return await self._side_channel_request("POST", "/tools", body={"tools": tools})
+
+    async def _side_channel_request(
+        self, method: str, path: str, body: dict | None = None
+    ) -> tuple[int, dict[str, Any]]:
+        """Send a request to a side-channel endpoint under the MCP base URL,
+        returning ``(status_code, parsed_json_dict)``.
+
+        Unlike ``_side_channel_post`` this surfaces the raw status code and
+        body so callers can branch on protocol-level responses (404 = endpoint
+        absent, 409 = revision conflict) instead of a flattened error string.
+        A non-JSON / non-object body parses to ``{}``. Transport failures
+        raise (httpx exceptions) — the caller owns the fallback behavior.
+        """
+        url = self._mcp_url.rstrip("/") + path
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {self._mcp_token}",
+        }
+        content: str | None = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            content = json.dumps(body)
+        timer = Stopwatch.start()
+        slog.debug(
+            "filament_fcm.http.side_channel.start",
+            **current_context(),
+            path=path,
+            method=method,
+            has_body=body is not None,
+        )
+        resp = await self._client_for_loop().request(
+            method,
+            url,
+            content=content,
+            headers=headers,
+        )
+        slog.debug(
+            "filament_fcm.http.side_channel.complete",
+            **current_context(),
+            path=path,
+            method=method,
+            http_status=resp.status_code,
+            duration_ms=timer.elapsed_ms(),
+        )
+        parsed: Any = {}
+        if resp.text:
+            with contextlib.suppress(Exception):
+                parsed = resp.json()
+        return resp.status_code, parsed if isinstance(parsed, dict) else {}
+
     async def _side_channel_post(
         self, path: str, body: dict | None = None
     ) -> dict[str, Any]:

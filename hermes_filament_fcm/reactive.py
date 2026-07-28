@@ -241,6 +241,11 @@ class InstructionsStore:
             or _default_dir() / "instructions.md"
         )
 
+    @property
+    def path(self) -> Path:
+        """The principal's instructions file (the editable layer on disk)."""
+        return self._path
+
     def read(self) -> str:
         for label, path in (("user", self._path), ("bundled-default", self._BUNDLED)):
             try:
@@ -267,8 +272,7 @@ class InstructionsStore:
         return f"{CORE_RULES}\n\n{self.read()}"
 
     def write(self, text: str) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(text, encoding="utf-8")
+        _atomic_write_text(self._path, text)
         logger.info("filament-fcm: standing instructions updated (%d bytes)", len(text))
 
 
@@ -306,6 +310,11 @@ class WakePolicyStore:
             or _default_dir() / "wake_policy.json"
         )
 
+    @property
+    def path(self) -> Path:
+        """The wake-policy JSON file on disk."""
+        return self._path
+
     def read(self) -> dict:
         policy = dict(self._DEFAULTS)
         try:
@@ -319,8 +328,7 @@ class WakePolicyStore:
         return policy
 
     def write(self, policy: dict) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
+        _atomic_write_text(self._path, json.dumps(policy, indent=2))
         logger.info("filament-fcm: wake policy updated")
 
     # ── Wake decisions (read fresh each call) ───────────────────────
@@ -483,6 +491,11 @@ class CapabilityPolicyStore:
             or _default_dir() / "capability_policy.json"
         )
 
+    @property
+    def path(self) -> Path:
+        """The capability-policy JSON file on disk."""
+        return self._path
+
     def read(self) -> dict:
         policy = {
             k: (list(v) if isinstance(v, list) else dict(v))
@@ -642,6 +655,11 @@ class FeatureFlagStore:
             or _default_dir() / "feature_flags.json"
         )
 
+    @property
+    def path(self) -> Path:
+        """The feature-flags JSON file on disk."""
+        return self._path
+
     def read(self) -> dict:
         try:
             loaded = json.loads(self._path.read_text(encoding="utf-8"))
@@ -658,9 +676,14 @@ class FeatureFlagStore:
         (fail-dark)."""
         return bool(self.read().get(name, False))
 
+    def write(self, flags: dict) -> None:
+        """Replace the whole flag file (same serialization ``set`` uses)."""
+        _atomic_write_text(self._path, json.dumps(flags, indent=2))
+        logger.info("filament-fcm: feature flags updated")
+
     def set(self, name: str, enabled: bool) -> dict:
         flags = self.read()
         flags[name] = bool(enabled)
-        _atomic_write_text(self._path, json.dumps(flags, indent=2))
+        self.write(flags)
         logger.info("filament-fcm: feature %r set to %s", name, bool(enabled))
         return flags
