@@ -127,6 +127,14 @@ class _NoEngagedThreads:
         pass
 
 
+class _NoopServerConfig:
+    """Server-config sync stub: the turn path awaits sync() before reading the
+    stores fresh; these tests exercise the system-notice gate only."""
+
+    async def sync(self, *, force=False):
+        return None
+
+
 def _make_adapter():
     a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)
     a._user_id = _AGENT
@@ -135,6 +143,7 @@ def _make_adapter():
     a._engaged_threads = _NoEngagedThreads()
     a._sender_is_agent_cache = {}
     a._filament_api = None
+    a._server_config = _NoopServerConfig()
     a._is_new_event = lambda event_id: True
     a._is_control_channel = lambda room_id: False
 
