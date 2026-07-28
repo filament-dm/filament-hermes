@@ -35,6 +35,19 @@ from hermes_cli.setup import (
 
 from .filament_api import FilamentAPI
 
+# The Firebase project the gateway registers with. It must be the same project
+# the homeserver pushes from, or FCM rejects every token as cross-project and
+# the agent is never woken — it connects, looks healthy, and silently answers
+# nothing. The plugin defaults to production (see fcm_client), so only other
+# homeservers export these; persist them like FILAMENT_MCP_URL below, because
+# the gateway starts from .env and never sees the installer's environment.
+_FIREBASE_ENV_KEYS = (
+    "FILAMENT_FIREBASE_PROJECT_ID",
+    "FILAMENT_FIREBASE_API_KEY",
+    "FILAMENT_FIREBASE_APP_ID",
+    "FILAMENT_FIREBASE_SENDER_ID",
+)
+
 
 def _find_hermes_home() -> Path:
     """Resolve the Hermes home directory."""
@@ -238,6 +251,12 @@ def _run_interactive_setup() -> bool:
     # Token validated — persist all configuration.
     save_env_value("FILAMENT_MCP_TOKEN", token)
     save_env_value("FILAMENT_MCP_URL", url)
+
+    # Carry the Firebase project through to the gateway (see _FIREBASE_ENV_KEYS).
+    for key in _FIREBASE_ENV_KEYS:
+        value = (get_env_value(key) or "").strip()
+        if value:
+            save_env_value(key, value)
 
     # Seed FILAMENT_CONTROL_USERS with the principal we learned from get_self.
     # It is the platform's allowed_users_env, so the gateway admits these senders
