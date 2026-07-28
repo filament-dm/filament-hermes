@@ -39,7 +39,7 @@ The package imports `gateway.*`, `agent.*`, and `hermes_cli.*` from hermes-agent
 
 `server_config.py` — server-side agent config sync (see the dedicated section below). Stdlib-only; the HTTP client is injected (`FilamentAPI.get_config` / `put_config` / `post_tools`), so it is unit-testable without Hermes.
 
-`reactive.py` + `setup_cli.py` — reactive-plane stores and the setup wizard. `reactive.py` also holds the `current_capabilities` ContextVar, the `capability_denies` gate decision, `capability_hint`, `CapabilityPolicyStore` (per-channel / per-user grants of named tool *bundles*, fail-closed, read fresh per event, server-migratable), and `FeatureFlagStore` (runtime flags, default OFF, read fresh per event — gates the whole capability surface via `FEATURE_ADVANCED_TOOL_CONTROLS`).
+`reactive.py` + `setup_cli.py` — reactive-plane stores and the setup wizard. `reactive.py` also holds the `current_capabilities` ContextVar, the `capability_denies` gate decision, `capability_hint`, `CapabilityPolicyStore` (channel-scoped grants of named tool *bundles*: a channel's `per_channel` entry **overrides** `default_capabilities` — replace, not union — so a channel can be narrowed below the default; `per_user` is in the schema but **deferred** — `set_capabilities` still stores it and resolution ignores it; fail-closed, read fresh per event, server-migratable), and `FeatureFlagStore` (runtime flags, default OFF, read fresh per event — gates the whole capability surface via `FEATURE_ADVANCED_TOOL_CONTROLS`).
 
 ## The trust-zone model (read `docs/agent-boundaries.md` before touching message handling)
 
