@@ -815,11 +815,13 @@ def _register_reactive_tools(
         "principal edits this CONVERSATIONALLY: read get_capabilities, apply "
         "their request, and save the full result here. 'policy' is an object "
         "with: default_capabilities (bundles granted to any unlisted "
-        "channel/user — fail-closed baseline), bundles (custom name → list of "
+        "channel — fail-closed baseline), bundles (custom name → list of "
         "tool names, where '@name' includes another bundle), per_channel and "
-        "per_user (id → list of granted bundle names). A turn's allowed tools "
-        "are the UNION of the default, its channel grant, and its sender grant. "
-        "Backchannel/owner only.",
+        "per_user (id → list of granted bundle names). A channel's per_channel "
+        "entry REPLACES default_capabilities for that channel (override, not "
+        "union — it can narrow a channel below the default, even to nothing). "
+        "per_user may be stored but is currently IGNORED by resolution: grants "
+        "are channel-scoped only. Backchannel/owner only.",
         {
             "type": "object",
             "properties": {"policy": {"type": "object"}},

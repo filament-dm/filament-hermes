@@ -294,7 +294,57 @@ def test_resolve_fail_closed_default_for_unlisted():
         assert "accept_invite" not in allowed  # cannot join loops
 
 
-def test_resolve_unions_default_channel_and_user_grants():
+def test_resolve_channel_entry_overrides_default():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write(
+            {
+                "default_capabilities": ["messaging", "escalate"],
+                "bundles": {"calendar": ["list_events", "get_event"]},
+                # Narrow one channel, widen another.
+                "per_channel": {
+                    "!quiet:x": ["readonly"],
+                    "!busy:x": ["messaging", "escalate", "calendar"],
+                },
+            }
+        )
+        # Unlisted channel → exactly the default.
+        base = store.resolve("!other:x", "@nobody:x")
+        assert "post_message" in base and "message_principal" in base
+        assert "list_events" not in base
+        # NARROWING — the deterministic proof of override: the channel entry
+        # resolves to strictly LESS than the default. Under union these
+        # default-granted tools could never disappear.
+        quiet = store.resolve("!quiet:x", "@nobody:x")
+        assert "get_thread" in quiet  # readonly can still read
+        assert "post_message" not in quiet  # messaging default is GONE
+        assert "message_principal" not in quiet  # escalate default is GONE
+        # Widening still works: the entry replaces the default with a superset.
+        busy = store.resolve("!busy:x", "@nobody:x")
+        assert "list_events" in busy and "post_message" in busy
+
+
+def test_resolve_empty_channel_entry_narrows_to_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write(
+            {
+                "default_capabilities": ["messaging"],
+                "per_channel": {"!silent:x": []},
+            }
+        )
+        # A present-but-empty entry is a deliberate override to nothing (a
+        # silent-observer channel), not a fall-through to the default.
+        assert store.resolve("!silent:x", "@u:x") == frozenset()
+        # The default is untouched elsewhere.
+        assert "post_message" in store.resolve("!other:x", "@u:x")
+
+
+def test_resolve_ignores_per_user_grants():
+    # The headline regression test for channel-scoped resolution: a sender
+    # with a personal grant gets exactly the channel resolution — per_user
+    # stays in the document (set_capabilities may still write it) but it
+    # never changes what a turn may call.
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
         store.write(
@@ -308,16 +358,30 @@ def test_resolve_unions_default_channel_and_user_grants():
                 "per_user": {"@vip:x": ["notes"]},
             }
         )
-        # Unlisted channel/user → only the default (readonly), no calendar.
-        base = store.resolve("!other:x", "@nobody:x")
-        assert "get_thread" in base and "list_events" not in base
-        # Channel grant adds calendar (union with default).
-        in_room = store.resolve("!room:x", "@nobody:x")
-        assert "list_events" in in_room and "get_thread" in in_room
-        assert "write_note" not in in_room
-        # A VIP user in that same room gets default + channel + user (union).
+        # In the listed channel, VIP and nobody resolve identically.
         vip = store.resolve("!room:x", "@vip:x")
-        assert {"get_thread", "list_events", "write_note"}.issubset(vip)
+        nobody = store.resolve("!room:x", "@nobody:x")
+        assert vip == nobody
+        assert "list_events" in vip and "write_note" not in vip
+        # In an unlisted channel too: default only, no personal grant.
+        vip_elsewhere = store.resolve("!other:x", "@vip:x")
+        assert "get_thread" in vip_elsewhere and "write_note" not in vip_elsewhere
+        # The map itself is preserved on disk — deferred, not removed.
+        assert store.read()["per_user"] == {"@vip:x": ["notes"]}
+
+
+def test_resolve_unknown_bundle_in_channel_entry_grants_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write(
+            {
+                "default_capabilities": ["messaging"],
+                "per_channel": {"!room:x": ["no_such_bundle"]},
+            }
+        )
+        # The entry overrides the default, and its unknown bundle expands to
+        # nothing — fail closed, never a fall-back to the wider default.
+        assert store.resolve("!room:x", "@u:x") == frozenset()
 
 
 def test_resolve_empty_default_is_silent_observer():
@@ -381,6 +445,15 @@ def test_resolve_survives_malformed_policy():
         )
         allowed = store.resolve("!room:x", "@u:x")  # must not raise
         assert allowed == frozenset()
+        # A malformed (non-list) channel entry reads as absent — the default
+        # still applies rather than the turn crashing or the entry "winning".
+        store.write(
+            {
+                "default_capabilities": ["messaging"],
+                "per_channel": {"!room:x": 42},
+            }
+        )
+        assert "post_message" in store.resolve("!room:x", "@u:x")
 
 
 def test_deep_acyclic_bundle_chain_not_truncated():
@@ -399,6 +472,17 @@ def test_deep_acyclic_bundle_chain_not_truncated():
 def test_advanced_tool_controls_is_a_known_feature():
     # The tool layer offers exactly the flags the code checks.
     assert reactive.FEATURE_ADVANCED_TOOL_CONTROLS in reactive.KNOWN_FEATURES
+
+
+def test_flag_off_turn_stays_ungated():
+    # With the feature flag off the adapter never calls resolve: it leaves
+    # current_capabilities None, and None never denies — a fresh install
+    # behaves identically regardless of what the policy file says.
+    with tempfile.TemporaryDirectory() as d:
+        flags = reactive.FeatureFlagStore(Path(d) / "feature_flags.json")
+        assert flags.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
+        assert reactive.capability_denies(None, "set_profile") is False
+        assert reactive.capability_hint(None) == ""
 
 
 def _run() -> None:

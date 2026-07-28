@@ -59,14 +59,14 @@ current_zone: contextvars.ContextVar[str] = contextvars.ContextVar(
 # backchannel keeps full capability), and a concrete frozenset of allowed tool
 # names for a data turn. The ``pre_tool_call`` hook registered in ``__init__``
 # reads it and denies any tool not in the set, so a shared-channel turn can only
-# call what its (channel, sender) policy grants — enforcement in non-LLM code
+# call what its channel's policy grants — enforcement in non-LLM code
 # the framing can't be talked out of.
 #
 # ``None`` = ungated. This is deliberately the default so that turns which never
 # touch this ContextVar (a plain CLI session in the same Hermes process, a
 # control turn) are never gated. Fail-closed for the DATA plane is achieved by
 # the adapter ALWAYS resolving and setting an explicit (minimal-or-larger) set
-# for data turns — an unlisted channel/user resolves to the minimal default
+# for data turns — an unlisted channel resolves to the minimal default
 # profile, never to ``None``.
 current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
     contextvars.ContextVar("filament_capabilities", default=None)
@@ -389,9 +389,9 @@ class WakePolicyStore:
 # ── Capability policy ────────────────────────────────────────────────
 #
 # Built-in capability bundles: friendly names → the Filament tool names each
-# grants. The principal grants *bundles* (not raw tool names) per channel/user
-# from the backchannel; a data turn's allowed tool set is the union of the
-# bundles granted to it, expanded to tool names. Rings referenced below are the
+# grants. The principal grants *bundles* (not raw tool names) per channel
+# from the backchannel; a data turn's allowed tool set is its resolved grant
+# list expanded to tool names. Rings referenced below are the
 # capability rings from docs/agent-boundaries.md §3.
 #
 # Only Filament's own tools are named here — the plugin can't know the tool
@@ -437,14 +437,14 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
     ],
 }
 
-# Fail-closed default profile for a data channel/user with no explicit policy
+# Fail-closed default profile for a data channel with no explicit policy
 # entry: read the channel, reply in it, and escalate to the principal — but no
 # membership actions, no profile edits, and no non-Filament tools.
 DEFAULT_CAPABILITIES: list[str] = ["messaging", "escalate"]
 
 
 class CapabilityPolicyStore:
-    """Per-(channel, user) tool-capability policy for data-plane turns.
+    """Per-channel tool-capability policy for data-plane turns.
 
     Declarative JSON on disk, read fresh per event (like ``WakePolicyStore``),
     so the principal retunes it from the backchannel with ``set_capabilities``
@@ -465,13 +465,19 @@ class CapabilityPolicyStore:
     bundles override built-ins of the same name, which is how the principal
     tweaks a starter bundle ("modified bundles").
 
-    Resolution is fail-closed and additive: a data turn's allowed tools are the
-    UNION of ``default_capabilities``, the channel's entry, and the sender's
-    entry, each expanded to tool names. An unlisted channel/user therefore gets
-    only ``default_capabilities`` (a minimal profile), never full access.
-    Union means an entry can only *grant*; restricting one user below a channel
-    grant would need a deny-list (a future addition — see
-    docs/agent-boundaries.md).
+    Resolution is channel-scoped and fail-closed: a data turn's allowed tools
+    are the channel's ``per_channel`` entry if one is present, else
+    ``default_capabilities``, expanded to tool names. The channel entry
+    REPLACES the default (override, not union) — the invariant is that a
+    listed channel resolves to exactly its own grant list, so a channel can be
+    narrowed below the default (down to an empty grant) as well as widened.
+    An unlisted channel gets exactly ``default_capabilities`` (a minimal
+    profile), never full access.
+
+    ``per_user`` is deferred: it stays in the document schema and
+    ``set_capabilities`` still accepts and stores it, but ``resolve`` ignores
+    it entirely — a sender's personal grant never changes what a turn may
+    call.
 
     Designed to migrate to a server-hosted policy later: replace ``read`` with
     an HTTP fetch returning the same shape and nothing else changes.
@@ -582,29 +588,48 @@ class CapabilityPolicyStore:
         return frozenset(tools)
 
     def resolve(self, room_id: str | None, sender: str | None) -> frozenset[str]:
-        """The allowed tool set for a data turn from (channel, sender): the
-        union of the default, per-channel, and per-user grants, expanded.
-        Fail-closed — unlisted scopes contribute nothing and the minimal default
-        always applies."""
+        """The allowed tool set for a data turn in ``room_id``: the channel's
+        ``per_channel`` grant list if one is present, else
+        ``default_capabilities``, expanded to tool names.
+
+        The channel entry REPLACES the default (override, not union) — the
+        invariant is that a listed channel resolves to exactly its own grant
+        list, so a channel can be narrowed below the default (an explicit
+        empty list grants nothing) as well as widened. Fail-closed: an
+        unlisted channel gets the minimal default, never full access, and a
+        malformed (non-list) entry is treated as absent.
+
+        ``sender`` is accepted so call sites don't churn, but resolution is
+        channel-scoped only: ``per_user`` grants are still stored in the
+        policy document and writable via ``set_capabilities``, yet they are
+        ignored here — a sender's personal grant never changes what a turn
+        may call.
+        """
         policy = self.read()
 
-        def _names(value: object) -> list[str]:
+        def _names(value: object) -> list[str] | None:
             # A malformed policy (non-list where a list is expected) must fail
-            # closed — contribute nothing — not raise from list(non_iterable).
-            return list(value) if isinstance(value, list) else []
+            # closed — read as absent — not raise from list(non_iterable).
+            return list(value) if isinstance(value, list) else None
 
-        granted: list[str] = _names(policy.get("default_capabilities"))
+        granted = _names(policy.get("default_capabilities")) or []
+        source = "default"
         per_channel = policy.get("per_channel") or {}
         if isinstance(per_channel, dict):
-            granted += _names(per_channel.get(room_id))
-        per_user = policy.get("per_user") or {}
-        if isinstance(per_user, dict):
-            granted += _names(per_user.get(sender))
+            channel_grant = _names(per_channel.get(room_id))
+            if channel_grant is not None:
+                # Present (even empty) → the channel's entry is the whole
+                # grant. A present-but-empty list deliberately narrows the
+                # channel to nothing.
+                granted = channel_grant
+                source = "channel"
         allowed = self.expand_capabilities(granted, policy)
         logger.info(
-            "filament-fcm: capabilities room=%s sender=%s grants=%s → %d tool(s)",
+            "filament-fcm: capabilities room=%s sender=%s source=%s grants=%s "
+            "→ %d tool(s)",
             room_id,
             sender,
+            source,
             granted,
             len(allowed),
         )
@@ -626,7 +651,7 @@ FEATURE_ADVANCED_TOOL_CONTROLS = "advanced_tool_controls"
 # principal (and the agent mapping their request) knows what can be toggled.
 KNOWN_FEATURES: dict[str, str] = {
     FEATURE_ADVANCED_TOOL_CONTROLS: (
-        "Per-channel / per-user tool capability gating for shared (data-plane) "
+        "Per-channel tool capability gating for shared (data-plane) "
         "channels: hard-limits which tools the agent may use when woken there, "
         "tunable from the backchannel with set_capabilities. Off by default; "
         "when off the agent behaves exactly as a fresh install (all tools "
