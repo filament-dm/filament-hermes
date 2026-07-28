@@ -601,9 +601,10 @@ def _register_reactive_tools(
             return _deny("set_instructions")
         text = args.get("instructions", "") or ""
         instructions_store.write(text)
-        # Mirror the local edit to the server document (never raises; on
-        # failure the local change stands and reconciliation happens later).
-        await server_sync.write_back()
+        # Mirror the local edit to the server document, rebased on the
+        # server copy so only this section changes (never raises; on failure
+        # the local change stands and reconciliation happens later).
+        await server_sync.write_back("instructions")
         return json.dumps({"ok": True, "bytes": len(text)})
 
     async def _get_instructions(args: dict, **kwargs: Any) -> str:
@@ -628,7 +629,7 @@ def _register_reactive_tools(
         if err:
             return json.dumps({"error": err})
         wake_store.write(policy)
-        await server_sync.write_back()
+        await server_sync.write_back("wake_policy")
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_wake_policy(args: dict, **kwargs: Any) -> str:
@@ -708,7 +709,7 @@ def _register_reactive_tools(
         if err:
             return json.dumps({"error": err})
         capability_store.write(policy)
-        await server_sync.write_back()
+        await server_sync.write_back("capability_policy")
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_features(args: dict, **kwargs: Any) -> str:
@@ -742,7 +743,7 @@ def _register_reactive_tools(
         if not isinstance(enabled, bool):
             return json.dumps({"error": "enabled must be true or false."})
         flags = feature_flags.set(name, enabled)
-        await server_sync.write_back()
+        await server_sync.write_back("feature_flags")
         return json.dumps(
             {"ok": True, "feature": name, "enabled": enabled, "flags": flags}
         )
