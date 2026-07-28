@@ -73,6 +73,24 @@ current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
 )
 
 
+def is_agent_mention(
+    is_mention: bool, is_everyone_mention: bool, body_mentions_me: bool
+) -> bool:
+    """Whether a message counts as a mention *of the agent*.
+
+    A mention is the server's per-recipient flag first, with a body text-match
+    as a fallback. @everyone/@here is NOT a mention: it addresses the people in
+    the channel, not the agents watching it, so one broadcast must not wake
+    every agent at once — a channel that wants an agent on every message says
+    so with ``reactive_wake="all"``. The everyone flag is a required parameter
+    precisely so the call site must hand it over instead of OR-ing it in: the
+    invariant lives here, pure and unit-pinned, not in an expression a merge
+    can silently rewrite.
+    """
+    del is_everyone_mention  # deliberately never a mention
+    return is_mention or body_mentions_me
+
+
 def capability_denies(allowed: "frozenset[str] | None", tool_name: str) -> bool:
     """Return True if a turn restricted to ``allowed`` may NOT call ``tool_name``.
 
