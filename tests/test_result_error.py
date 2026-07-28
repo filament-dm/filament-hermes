@@ -44,4 +44,7 @@ def test_success_and_junk_are_none():
     api = _load_filament_api().FilamentAPI
     assert api.result_error({"result": {"content": []}}) is None
     assert api.result_error(None) is None
-    assert api.result_error({"error": "stringy"}) is None
+    # A bare-string error (e.g. the {"error": "HTTP 500"} envelope _post
+    # synthesizes) is a real failure and must be surfaced, not swallowed.
+    assert api.result_error({"error": "stringy"}) == "stringy"
+    assert api.result_error({"error": ""}) is None
