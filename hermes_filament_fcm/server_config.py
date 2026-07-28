@@ -295,8 +295,12 @@ class ServerConfigSync:
                 "filament-fcm: server config document is not an object; ignoring"
             )
             return
-        if revision == self._revision:
-            return  # already applied — don't rewrite the files per wake
+        if self._revision is not None and revision <= self._revision:
+            # Never apply a revision at or below the one already known: a
+            # write-back can bump the server while this fetch was in flight,
+            # and applying the stale response would revert the fresh local
+            # edit until the next sync window. Equal = already applied.
+            return
         self._apply(config, revision)
 
     async def _seed(self) -> None:

@@ -139,6 +139,26 @@ def test_apply_writes_store_files_byte_identically(tmp_path):
     assert stores["capability_store"].read()["bundles"] == {"calendar": ["list_events"]}
 
 
+def test_stale_fetch_never_overwrites_a_newer_local_write(tmp_path):
+    # A write-back bumps the server to revision 8 while a fetch carrying
+    # revision 7 is still in flight; when that stale response lands it must
+    # NOT be applied over the files the write-back just mirrored.
+    api = FakeAPI(
+        get_results=[(200, {"config": _CONFIG, "revision": 7})],
+        put_results=[(200, {"revision": 8})],
+    )
+    sync, stores = _make_sync(tmp_path, api)
+
+    stores["capability_store"].write({"default_capabilities": ["messaging", "escalate"]})
+    asyncio.run(sync.write_back())  # server now at revision 8, remembered
+    assert sync.revision == 8
+    fresh = (tmp_path / "capability_policy.json").read_text()
+
+    asyncio.run(sync.sync())  # the in-flight fetch arrives carrying revision 7
+    assert (tmp_path / "capability_policy.json").read_text() == fresh
+    assert sync.revision == 8
+
+
 def test_apply_only_present_sections(tmp_path):
     (tmp_path / "instructions.md").write_text("keep me")
     api = FakeAPI(
