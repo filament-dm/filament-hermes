@@ -149,8 +149,10 @@ def test_stale_fetch_never_overwrites_a_newer_local_write(tmp_path):
     )
     sync, stores = _make_sync(tmp_path, api)
 
-    stores["capability_store"].write({"default_capabilities": ["messaging", "escalate"]})
-    asyncio.run(sync.write_back())  # server now at revision 8, remembered
+    stores["capability_store"].write(
+        {"default_capabilities": ["messaging", "escalate"]}
+    )
+    asyncio.run(sync.write_back("capability_policy"))  # server → revision 8, remembered
     assert sync.revision == 8
     fresh = (tmp_path / "capability_policy.json").read_text()
 
@@ -262,7 +264,7 @@ def test_404_disables_sync_for_process_lifetime(tmp_path, caplog):
     with caplog.at_level(logging.DEBUG, logger="gateway.filament_fcm"):
         asyncio.run(sync.sync())
         asyncio.run(sync.sync(force=True))
-        asyncio.run(sync.write_back())
+        asyncio.run(sync.write_back("instructions"))
     # One GET, then quiet: no retries, no write-backs, no warnings (an older
     # server is a normal condition, not an error).
     assert api.get_calls == 1
@@ -282,37 +284,90 @@ def test_ttl_caches_bursts(tmp_path):
 # ── Write-back: a local set_* edit mirrors to the server ─────────────
 
 
-def test_write_back_puts_full_document_without_base_revision(tmp_path):
-    (tmp_path / "wake_policy.json").write_text(json.dumps({"reactive_wake": "all"}))
-    (tmp_path / "feature_flags.json").write_text(
-        json.dumps({"advanced_tool_controls": True})
-    )
+def test_write_back_rebases_one_section_on_the_server_document(tmp_path):
+    # The server holds revision 8 with a newer wake_policy the local files
+    # don't have; a local instructions edit must PUT only its own section on
+    # top of the server document (compare-and-set on the fetched revision),
+    # preserving the newer wake_policy — and applying it locally too.
+    server_doc = {
+        "wake_policy": {"reactive_wake": "all"},
+        "instructions": "old text",
+    }
     (tmp_path / "instructions.md").write_text("post-edit text")
-    api = FakeAPI(put_results=[(200, {"revision": 9})])
-    sync, _ = _make_sync(tmp_path, api)
-    asyncio.run(sync.write_back())
+    api = FakeAPI(
+        get_results=[(200, {"config": server_doc, "revision": 8})],
+        put_results=[(200, {"revision": 9})],
+    )
+    sync, stores = _make_sync(tmp_path, api)
+    asyncio.run(sync.write_back("instructions"))
 
     assert len(api.put_bodies) == 1
     body = api.put_bodies[0]
-    # Whole-value setter: the full document, no compare-and-set.
-    assert "base_revision" not in body
+    assert body["base_revision"] == 8
     assert body["config"] == {
         "wake_policy": {"reactive_wake": "all"},
-        "feature_flags": {"advanced_tool_controls": True},
         "instructions": "post-edit text",
     }
     assert sync.revision == 9
+    # The server's newer wake_policy landed locally; the edited section kept
+    # the local (newer) value.
+    assert stores["wake_store"].read()["reactive_wake"] == "all"
+    assert (tmp_path / "instructions.md").read_text() == "post-edit text"
+
+
+def test_write_back_retries_once_on_revision_conflict(tmp_path):
+    # A concurrent writer bumps the revision between our GET and PUT: the 409
+    # refetches and rebases on the winner's document, composing both edits.
+    (tmp_path / "instructions.md").write_text("mine")
+    api = FakeAPI(
+        get_results=[
+            (200, {"config": {"instructions": "old"}, "revision": 3}),
+            (200, {"config": {"wake_policy": {"reactive_wake": "all"}}, "revision": 4}),
+        ],
+        put_results=[(409, {"current_revision": 4}), (200, {"revision": 5})],
+    )
+    sync, _ = _make_sync(tmp_path, api)
+    asyncio.run(sync.write_back("instructions"))
+
+    assert len(api.put_bodies) == 2
+    assert api.put_bodies[0]["base_revision"] == 3
+    retry = api.put_bodies[1]
+    assert retry["base_revision"] == 4
+    # Rebased on the winner: their wake_policy survives alongside our edit.
+    assert retry["config"] == {
+        "wake_policy": {"reactive_wake": "all"},
+        "instructions": "mine",
+    }
+    assert sync.revision == 5
 
 
 def test_write_back_failure_keeps_local_change(tmp_path, caplog):
     (tmp_path / "instructions.md").write_text("the local edit")
-    api = FakeAPI(put_results=[OSError("boom")])
+    api = FakeAPI(
+        get_results=[(200, {"config": None, "revision": 0})],
+        put_results=[OSError("boom")],
+    )
     sync, _ = _make_sync(tmp_path, api)
     with caplog.at_level(logging.DEBUG, logger="gateway.filament_fcm"):
-        asyncio.run(sync.write_back())  # must not raise
+        asyncio.run(sync.write_back("instructions"))  # must not raise
     assert (tmp_path / "instructions.md").read_text() == "the local edit"
     assert [r for r in caplog.records if r.levelno == logging.WARNING]
     assert sync.revision is None
+
+
+def test_apply_filesystem_failure_never_raises_and_retries_next_sync(tmp_path):
+    # A store writer blowing up (read-only disk, ENOSPC) must not raise out of
+    # sync() into the event turn, and must leave the revision unremembered so
+    # the next sync retries the apply.
+    api = FakeAPI(get_results=[(200, {"config": _CONFIG, "revision": 5})])
+    sync, stores = _make_sync(tmp_path, api)
+    original_write = stores["wake_store"].write
+    stores["wake_store"].write = lambda policy: (_ for _ in ()).throw(OSError("disk"))
+    asyncio.run(sync.sync())  # must not raise
+    assert sync.revision is None
+    stores["wake_store"].write = original_write
+    asyncio.run(sync.sync(force=True))
+    assert sync.revision == 5
 
 
 # ── Escape hatch ─────────────────────────────────────────────────────
@@ -323,7 +378,7 @@ def test_env_off_short_circuits_everything(tmp_path, monkeypatch):
     api = FakeAPI(get_results=[(200, {"config": _CONFIG, "revision": 1})])
     sync, _ = _make_sync(tmp_path, api, inventory_provider=lambda: [{"name": "x"}])
     asyncio.run(sync.sync(force=True))
-    asyncio.run(sync.write_back())
+    asyncio.run(sync.write_back("instructions"))
     asyncio.run(sync.maybe_report_tools(force=True))
     assert api.get_calls == 0
     assert api.put_bodies == []

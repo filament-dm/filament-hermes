@@ -494,6 +494,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 logger.error("filament-fcm: Stage 3 (push token registration) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="register_pusher")
                 return False
+            # Pull the server-held agent config into the local store files (or
+            # seed the server from them if it holds no document yet) BEFORE
+            # the listener starts: the very first push must already run
+            # against the server's policy (a revoked grant must not survive a
+            # restart even for one event). Best-effort and error-silenced —
+            # never fails or delays reconnects.
+            with bound_context(call_origin="startup"):
+                await self._server_config.sync(force=True)
+
             if not await self._start_listener():
                 logger.error("filament-fcm: Stage 4 (FCM listener) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="start_listener")
@@ -508,12 +517,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
             self._mark_connected()
 
-            # Pull the server-held agent config into the local store files (or
-            # seed the server from them if it holds no document yet), and
-            # report the registered tool inventory. Both are best-effort and
-            # internally error-silenced — they never fail or delay reconnects.
             with bound_context(call_origin="startup"):
-                await self._server_config.sync(force=True)
                 await self._server_config.maybe_report_tools()
 
             logger.info("filament-fcm: connected successfully")
