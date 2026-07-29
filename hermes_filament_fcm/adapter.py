@@ -63,6 +63,7 @@ from .reactive import (
     context_breadcrumb,
     current_capabilities,
     current_zone,
+    is_agent_mention,
     is_system_sender,
 )
 from .update_check import UpdateChecker, update_check_disabled
@@ -1369,19 +1370,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return
 
         # Reactive plane: wake only if the policy admits this message. A mention
-        # is the server's flag (is_mention_of_recipient / @everyone) first, with
-        # a body text-match as a fallback.
-        mentioned = (
-            msg.is_mention
-            or msg.is_everyone_mention
-            or self._mentions_me(msg.body or "")
+        # is the server's flag (is_mention_of_recipient) first, with a body
+        # text-match as a fallback. @everyone/@here is NOT a mention (see
+        # is_agent_mention): one broadcast must not wake every agent at once.
+        mentioned = is_agent_mention(
+            msg.is_mention,
+            msg.is_everyone_mention,
+            self._mentions_me(msg.body or ""),
         )
         if not self._wake_policy.should_wake_message(msg.room_id, mentioned):
             logger.info(
                 "filament-fcm: skipping message in %s (wake policy: not woken; "
-                "mention=%s)",
+                "mention=%s, everyone=%s)",
                 msg.room_name,
                 mentioned,
+                msg.is_everyone_mention,
             )
             slog.info(
                 "filament_fcm.turn.skipped",
