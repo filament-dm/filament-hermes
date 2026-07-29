@@ -513,6 +513,24 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # One-shot within this process; the server's gate covers reconnects.
         self._greet_pending = False
 
+        # Say something immediately. The hello below is a real agent turn, so it
+        # costs a model round trip — measured ~14s on a hosted agent, which from
+        # the app looks like an agent that connected and then ignored you. A
+        # direct post lands in well under a second.
+        #
+        # It also clears the server's greet gate (any post to the backchannel
+        # does), so a re-prompt on the next connect can no longer be relied on;
+        # the failure path below therefore posts its own hello rather than
+        # leaving the principal on "getting set up" forever.
+        try:
+            await self._filament_api.post_message(
+                self._cc_room_id, "Getting set up — one moment…"
+            )
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not post the setup placeholder", exc_info=True
+            )
+
         try:
             greet_id = new_id("greet")
             trigger_id = f"greet:{self._cc_room_id}"
@@ -560,38 +578,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     principal_id=self._owner_id,
                     synthetic_event_id=trigger_id,
                 )
-                # Now that the turn owns the session, tell the principal we're
-                # working. The hello it produces is a real model round trip —
-                # ~14s on a hosted agent — and until it lands the agent looks
-                # like it connected and then ignored them.
-                #
-                # Strictly after the dispatch above: posting first makes the
-                # agent's own message arrive as an event, which claims the
-                # session and gets the greet turn dropped as already-active
-                # (gateway/platforms/base.py). Ordered this way the placeholder
-                # is the one dropped, which is exactly what we want.
-                await self._post_setup_placeholder()
         except Exception:
             logger.exception("filament-fcm: greet turn failed")
             slog.exception("filament_fcm.greet.failed")
-            # Dispatch failed, so no hello is coming and the directive is
-            # consumed — say something rather than going silent.
-            await self._post_setup_placeholder(
-                "I'm connected and ready — say hello whenever you like."
-            )
-
-    async def _post_setup_placeholder(
-        self, text: str = "Getting set up — one moment…"
-    ) -> None:
-        """Post directly to the backchannel, bypassing the model."""
-        if not self._cc_room_id:
-            return
-        try:
-            await self._filament_api.post_message(self._cc_room_id, text)
-        except Exception:
-            logger.warning(
-                "filament-fcm: could not post the setup placeholder", exc_info=True
-            )
+            # The placeholder above already cleared the server's greet gate, so
+            # nothing will re-prompt us. Post a plain hello so a model failure
+            # can't leave the principal staring at "getting set up".
+            try:
+                await self._filament_api.post_message(
+                    self._cc_room_id,
+                    "I'm connected and ready — say hello whenever you like.",
+                )
+            except Exception:
+                logger.warning(
+                    "filament-fcm: fallback greeting failed too", exc_info=True
+                )
 
     def _note_reserved(self) -> None:
         """Mark this connect attempt blocked on an unfinalized agent, and tell
