@@ -501,7 +501,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # restart even for one event). Best-effort and error-silenced —
             # never fails or delays reconnects.
             with bound_context(call_origin="startup"):
-                await self._server_config.sync(force=True)
+                try:
+                    # Bounded: a hung server must delay connect by seconds,
+                    # not the shared client's full timeout.
+                    await asyncio.wait_for(
+                        self._server_config.sync(force=True), timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "filament-fcm: startup config sync timed out; "
+                        "continuing on local files"
+                    )
 
             if not await self._start_listener():
                 logger.error("filament-fcm: Stage 4 (FCM listener) failed")

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import ClassVar
 
@@ -259,7 +260,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     fresh-read policy/flag files, where a truncated file would parse-fail and
     silently revert the gate to its (less restrictive) default."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, path)
