@@ -55,7 +55,7 @@ Load-bearing invariants:
 
 ## Configuration (environment variables)
 
-`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra trusted commanders; the principal is auto-discovered via `get_self`), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_FCM_CREDENTIALS_DIR`, `FILAMENT_CAPABILITY_POLICY_FILE` (override the data-plane capability policy path; default `<creds dir>/capability_policy.json`), `FILAMENT_FEATURE_FLAGS_FILE` (override the feature-flag path; default `<creds dir>/feature_flags.json`), `FILAMENT_DISABLE_UPDATE_CHECK` (set true to turn off the daily new-version check/reminder — see `update_check.py`), `HERMES_HOME`.
+`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra trusted commanders; the principal is auto-discovered via `get_self`), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_FCM_CREDENTIALS_DIR`, `FILAMENT_CAPABILITY_POLICY_FILE` (override the data-plane capability policy path; default `<creds dir>/capability_policy.json`), `FILAMENT_FEATURE_FLAGS_FILE` (override the feature-flag path; default `<creds dir>/feature_flags.json`), `FILAMENT_DISABLE_UPDATE_CHECK` (set true to turn off the daily new-version check/reminder — see `update_check.py`), `FILAMENT_UPDATE_CHECK_URL` (override the pyproject.toml URL the update check fetches — a test seam so a harness can stand in for "the version on main"; production never sets it), `HERMES_HOME`.
 
 ## Versioning
 
