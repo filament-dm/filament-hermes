@@ -513,24 +513,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # One-shot within this process; the server's gate covers reconnects.
         self._greet_pending = False
 
-        # Say something immediately. The hello below is a real agent turn, so it
-        # costs a model round trip — measured ~14s on a hosted agent, which from
-        # the app looks like an agent that connected and then ignored you. A
-        # direct post lands in well under a second.
-        #
-        # It also clears the server's greet gate (any post to the backchannel
-        # does), so a re-prompt on the next connect can no longer be relied on;
-        # the failure path below therefore posts its own hello rather than
-        # leaving the principal on "getting set up" forever.
-        try:
-            await self._filament_api.post_message(
-                self._cc_room_id, "Getting set up — one moment…"
-            )
-        except Exception:
-            logger.warning(
-                "filament-fcm: could not post the setup placeholder", exc_info=True
-            )
-
         try:
             greet_id = new_id("greet")
             trigger_id = f"greet:{self._cc_room_id}"
@@ -581,18 +563,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("filament-fcm: greet turn failed")
             slog.exception("filament_fcm.greet.failed")
-            # The placeholder above already cleared the server's greet gate, so
-            # nothing will re-prompt us. Post a plain hello so a model failure
-            # can't leave the principal staring at "getting set up".
-            try:
-                await self._filament_api.post_message(
-                    self._cc_room_id,
-                    "I'm connected and ready — say hello whenever you like.",
-                )
-            except Exception:
-                logger.warning(
-                    "filament-fcm: fallback greeting failed too", exc_info=True
-                )
 
     def _note_reserved(self) -> None:
         """Mark this connect attempt blocked on an unfinalized agent, and tell
