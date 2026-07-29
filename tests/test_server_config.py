@@ -341,6 +341,42 @@ def test_write_back_retries_once_on_revision_conflict(tmp_path):
     assert sync.revision == 5
 
 
+def test_failed_write_back_retries_before_the_next_fetch_applies(tmp_path):
+    # A write-back that fails must be retried by the next sync BEFORE the
+    # fetched document is applied — otherwise the fetch would overwrite the
+    # local edit that never made it to the server.
+    (tmp_path / "instructions.md").write_text("my edit")
+    api = FakeAPI(
+        get_results=[(200, {"config": {"instructions": "server old"}, "revision": 3})],
+        put_results=[OSError("blip"), (200, {"revision": 4})],
+    )
+    sync, _ = _make_sync(tmp_path, api)
+    asyncio.run(sync.write_back("instructions"))  # fails; queued for retry
+
+    asyncio.run(sync.sync())
+    # The retry PUT happened, and the local edit survived the sync.
+    assert len(api.put_bodies) == 2
+    assert api.put_bodies[1]["config"]["instructions"] == "my edit"
+    assert (tmp_path / "instructions.md").read_text() == "my edit"
+
+
+def test_write_back_forgets_revision_when_other_sections_fail_to_apply(tmp_path):
+    # PUT succeeds but bringing the other sections' local files up to the
+    # rebased state fails: the revision must stay unremembered so the next
+    # sync re-applies instead of skipping on an already-known revision.
+    (tmp_path / "instructions.md").write_text("mine")
+    api = FakeAPI(
+        get_results=[
+            (200, {"config": {"wake_policy": {"reactive_wake": "all"}}, "revision": 3})
+        ],
+        put_results=[(200, {"revision": 4})],
+    )
+    sync, stores = _make_sync(tmp_path, api)
+    stores["wake_store"].write = lambda policy: (_ for _ in ()).throw(OSError("disk"))
+    asyncio.run(sync.write_back("instructions"))
+    assert sync.revision is None  # re-apply on the next sync, don't skip
+
+
 def test_write_back_failure_keeps_local_change(tmp_path, caplog):
     (tmp_path / "instructions.md").write_text("the local edit")
     api = FakeAPI(

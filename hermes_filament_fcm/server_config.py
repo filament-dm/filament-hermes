@@ -175,6 +175,11 @@ class ServerConfigSync:
         # so it skips instead of repeating the round-trip just completed.
         self._lock = asyncio.Lock()
 
+        # Sections whose write-back failed and must be retried by the next
+        # sync BEFORE it applies the server document (a failed push must not
+        # be overwritten by the subsequent fetch).
+        self._pending_write_back: set[str] = set()
+
         self._last_sync: float | None = None
         self._last_tools_report: float | None = None
 
@@ -240,27 +245,34 @@ class ServerConfigSync:
         """Write the present, well-typed, non-excluded sections to their store
         files. True on success; False (after a once-only warning) if any
         write failed."""
-        try:
-            cap = config.get(SECTION_CAPABILITY_POLICY)
-            if SECTION_CAPABILITY_POLICY not in exclude and isinstance(cap, dict):
-                self._capability_store.write(cap)
-            wake = config.get(SECTION_WAKE_POLICY)
-            if SECTION_WAKE_POLICY not in exclude and isinstance(wake, dict):
-                self._wake_store.write(wake)
-            instructions = config.get(SECTION_INSTRUCTIONS)
-            if SECTION_INSTRUCTIONS not in exclude and isinstance(instructions, str):
-                self._instructions_store.write(instructions)
-            flags = config.get(SECTION_FEATURE_FLAGS)
-            if SECTION_FEATURE_FLAGS not in exclude and isinstance(flags, dict):
-                self._feature_store.write(flags)
-        except Exception:
-            self._warn_sync_failure(
-                "filament-fcm: applying server config to local files failed; "
-                "continuing on the existing files",
-                exc_info=True,
-            )
-            return False
-        return True
+        # Each section writes independently (each file write is atomic on its
+        # own): one failing section must not block the others, and any failure
+        # leaves the revision unremembered so the next sync re-applies. A
+        # section absent from the document leaves its local file untouched —
+        # sections are replaced, never deleted, by the sync.
+        ok = True
+        writers = (
+            (SECTION_CAPABILITY_POLICY, dict, self._capability_store.write),
+            (SECTION_WAKE_POLICY, dict, self._wake_store.write),
+            (SECTION_INSTRUCTIONS, str, self._instructions_store.write),
+            (SECTION_FEATURE_FLAGS, dict, self._feature_store.write),
+        )
+        for section, typ, write in writers:
+            if section in exclude:
+                continue
+            value = config.get(section)
+            if not isinstance(value, typ):
+                continue
+            try:
+                write(value)
+            except Exception:
+                ok = False
+                self._warn_sync_failure(
+                    f"filament-fcm: applying server-config section {section} "
+                    "to its local file failed; continuing on the existing file",
+                    exc_info=True,
+                )
+        return ok
 
     def _read_section(self, section: str) -> Any:
         """The local file contents for *section* (parsed JSON object, or the
@@ -297,6 +309,12 @@ class ServerConfigSync:
             await self._sync_locked(force=force)
 
     async def _sync_locked(self, *, force: bool) -> None:
+        # A failed write-back retries before fetch-and-apply, so the fetch
+        # can't clobber a local edit that never made it to the server.
+        for section in sorted(self._pending_write_back):
+            if await self._write_back_locked(section):
+                self._pending_write_back.discard(section)
+
         # TTL re-checked under the lock: a caller that waited out an in-flight
         # sync (or write-back) skips instead of repeating the round-trip.
         now = time.monotonic()
@@ -438,7 +456,15 @@ class ServerConfigSync:
         if self._disabled or self._config_unavailable:
             return
         async with self._lock:
-            for _attempt in (1, 2):
+            if not await self._write_back_locked(section):
+                # Remember the section so the next sync retries the push
+                # BEFORE applying the server document — otherwise the fetch
+                # would overwrite the local edit that never made it up.
+                self._pending_write_back.add(section)
+
+    async def _write_back_locked(self, section: str) -> bool:
+        """The write-back body; caller holds the lock. True on success."""
+        for _attempt in (1, 2):
                 try:
                     status, body = await self._api.get_config()
                 except Exception:
@@ -447,20 +473,20 @@ class ServerConfigSync:
                         "local change kept, server copy is stale",
                         exc_info=True,
                     )
-                    return
+                    return False
                 if status == 404:
                     self._config_unavailable = True
                     logger.info(
                         "filament-fcm: server has no /config endpoint — "
                         "server-config sync disabled for this process"
                     )
-                    return
+                    return True
                 if status != 200:
                     self._warn_sync_failure(
                         f"filament-fcm: server-config write-back fetch returned "
                         f"HTTP {status}; local change kept, server copy is stale"
                     )
-                    return
+                    return False
                 server_config = body.get("config")
                 try:
                     base_revision = int(body.get("revision") or 0)
@@ -484,24 +510,26 @@ class ServerConfigSync:
                         "change kept, server copy is stale",
                         exc_info=True,
                     )
-                    return
+                    return False
                 if status == 200:
-                    rev = put_body.get("revision")
-                    if isinstance(rev, int):
-                        self._revision = rev
                     # Bring the OTHER sections' local files up to the server
-                    # state we just rebased on, so they don't sit stale behind
-                    # the now-remembered revision.
+                    # state we just rebased on. The revision is remembered
+                    # only if they all applied — otherwise the next sync must
+                    # re-apply rather than skip on an already-known revision.
+                    applied = True
                     if isinstance(server_config, dict):
-                        self._write_sections(
+                        applied = self._write_sections(
                             server_config, exclude=frozenset({section})
                         )
+                    rev = put_body.get("revision")
+                    if applied and isinstance(rev, int):
+                        self._revision = rev
                     logger.info(
                         "filament-fcm: server config updated (%s, revision %s)",
                         section,
                         rev,
                     )
-                    return
+                    return True
                 if status == 409:
                     continue  # rebased on a stale revision — refetch and retry
                 if status == 404:
@@ -510,16 +538,17 @@ class ServerConfigSync:
                         "filament-fcm: server has no /config endpoint — "
                         "server-config sync disabled for this process"
                     )
-                    return
+                    return True
                 self._warn_sync_failure(
                     f"filament-fcm: server-config write-back returned HTTP "
                     f"{status}; local change kept, server copy is stale"
                 )
-                return
-            self._warn_sync_failure(
-                "filament-fcm: server-config write-back kept conflicting; "
-                "local change kept, server copy is stale"
-            )
+                return False
+        self._warn_sync_failure(
+            "filament-fcm: server-config write-back kept conflicting; "
+            "local change kept, server copy is stale"
+        )
+        return False
 
     # ── Tool-inventory reporting ────────────────────────────────────
 
