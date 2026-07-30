@@ -68,7 +68,7 @@ from .reactive import (
     is_system_sender,
     sender_is_agent_in_thread,
 )
-from .update_check import UpdateChecker, update_check_disabled
+from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
 logger = logging.getLogger("gateway.filament_fcm")
