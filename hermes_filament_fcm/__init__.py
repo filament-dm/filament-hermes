@@ -116,11 +116,27 @@ def _make_tool_handler(tool_name: str, api: FilamentAPI):
         try:
             with bound_context(call_origin="tool_proxy"):
                 result = await api.call_tool(tool_name, args)
+            # A rejected call returns HTTP 200 with a JSON-RPC error envelope,
+            # which parse_tool_result would flatten into something resembling a
+            # result. Give the model the server's message so it can correct the
+            # call rather than repeat it.
+            if error := FilamentAPI.result_error(result):
+                logger.warning("filament-fcm: tool %s rejected: %s", tool_name, error)
+                return json.dumps({"error": error})
             parsed = api.parse_tool_result(result)
             return json.dumps(parsed, indent=2, default=str)
         except Exception as exc:
             logger.exception("filament-fcm: tool %s failed", tool_name)
-            return json.dumps({"error": str(exc)})
+            # Several transport errors, httpx.ReadError included, stringify to
+            # "". Name the class so the error is never empty.
+            detail = str(exc).strip()
+            return json.dumps(
+                {
+                    "error": f"{type(exc).__name__}: {detail}"
+                    if detail
+                    else type(exc).__name__
+                }
+            )
 
     handler.__name__ = f"filament_{tool_name}"
     handler.__qualname__ = f"filament_{tool_name}"
