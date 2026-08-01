@@ -56,6 +56,7 @@ from .reactive import (
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
     CapabilityPolicyStore,
+    EngagedThreadStore,
     FeatureFlagStore,
     InstructionsStore,
     WakePolicyStore,
@@ -65,6 +66,7 @@ from .reactive import (
     current_zone,
     is_agent_mention,
     is_system_sender,
+    sender_is_agent_in_thread,
 )
 from .update_check import UpdateChecker, update_check_disabled
 
@@ -201,6 +203,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # enables it from the backchannel, a data turn stays ungated (None) and
         # gets no tool hint — i.e. a fresh install behaves exactly as before.
         self._feature_flags = FeatureFlagStore()
+        # Threads the agent was @-mentioned in — the "already engaged" half of
+        # the engaged-thread wake rule (ENG-724). Recorded on admitted mention
+        # wakes; read fresh per event like the wake policy.
+        self._engaged_threads = EngagedThreadStore()
+        # sender → is-agent, learned from get_thread sender flags. Agent status
+        # is a property of the user and effectively immutable, so cache it for
+        # the process lifetime to keep the engaged-thread gate to one API call
+        # per unknown sender.
+        self._sender_is_agent_cache: dict[str, bool] = {}
 
         self.max_message_length = _MAX_MESSAGE_LENGTH
 
@@ -1378,13 +1389,29 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             msg.is_everyone_mention,
             self._mentions_me(msg.body or ""),
         )
-        if not self._wake_policy.should_wake_message(msg.room_id, mentioned):
+        # ENG-724: a NON-AGENT's reply in a thread the agent was already
+        # mentioned in counts as a mention, so a human back-and-forth doesn't
+        # need a re-tag every turn. Order matters for cost and safety: the
+        # local engagement record and the policy knob are checked before the
+        # one API call that classifies the sender, and the sender check fails
+        # closed to "agent" — agents never wake each other without an explicit
+        # @-mention (the storm that reverted filament-hermes#15).
+        thread_follow_up = (
+            not mentioned
+            and self._engaged_threads.is_engaged(msg.room_id, msg.thread_id)
+            and self._wake_policy.thread_wake(msg.room_id) == "engaged"
+            and await self._sender_is_agent(msg) is False
+        )
+        if not self._wake_policy.should_wake_message(
+            msg.room_id, mentioned or thread_follow_up
+        ):
             logger.info(
                 "filament-fcm: skipping message in %s (wake policy: not woken; "
-                "mention=%s, everyone=%s)",
+                "mention=%s, everyone=%s, thread_follow_up=%s)",
                 msg.room_name,
                 mentioned,
                 msg.is_everyone_mention,
+                thread_follow_up,
             )
             slog.info(
                 "filament_fcm.turn.skipped",
@@ -1393,6 +1420,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 mentioned=mentioned,
             )
             return
+
+        # Remember the thread this admitted wake engages: the mention's own
+        # thread root, or — for a top-level mention — its event id, which IS
+        # the thread root once replies thread off it. A follow-up wake
+        # re-records to refresh the thread's eviction slot.
+        if mentioned or thread_follow_up:
+            self._engaged_threads.record(
+                msg.room_id, msg.thread_id or msg.event_id
+            )
 
         # The push never includes attachments (ENG-603): describe any media on
         # the event so the agent knows it exists. Only for admitted wakes, so
@@ -1460,6 +1496,44 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             "set" if crumb else "none",
         )
         return crumb
+
+    async def _sender_is_agent(self, msg: PushMessage) -> bool | None:
+        """Whether the message's sender is an agent (bot) — the storm-guard
+        input for engaged-thread wakes (ENG-724).
+
+        The push payload carries no such flag, so read it from the thread via
+        ``get_thread``, whose messages each carry the server-computed
+        ``is_from_agent``. One call per unknown sender: the answer is cached
+        for the process lifetime (agent status is a property of the user).
+        Returns ``None`` when unclassifiable (API failure, sender not found in
+        the thread) — the caller treats that as "agent" and stays asleep,
+        because waking on an unknown sender is what re-opens the agent storm.
+        """
+        if msg.sender in self._sender_is_agent_cache:
+            return self._sender_is_agent_cache[msg.sender]
+        if not self._filament_api or not msg.thread_id:
+            return None
+        try:
+            raw = await self._filament_api.get_thread(msg.thread_id)
+            parsed = FilamentAPI.parse_tool_result(raw)
+        except Exception:
+            logger.warning(
+                "filament-fcm: get_thread failed classifying sender %s in %s",
+                msg.sender,
+                msg.room_id,
+                exc_info=True,
+            )
+            return None
+        verdict = sender_is_agent_in_thread(parsed, msg.event_id, msg.sender)
+        if verdict is not None:
+            self._sender_is_agent_cache[msg.sender] = verdict
+        logger.info(
+            "filament-fcm: sender %s classified is_agent=%s (thread %s)",
+            msg.sender,
+            verdict,
+            msg.thread_id,
+        )
+        return verdict
 
     async def _handle_control_message(self, msg: PushMessage) -> None:
         """Backchannel (control plane): the principal commands the agent

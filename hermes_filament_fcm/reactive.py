@@ -18,6 +18,7 @@ import contextvars
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -89,6 +90,44 @@ def is_agent_mention(
     """
     del is_everyone_mention  # deliberately never a mention
     return is_mention or body_mentions_me
+
+
+def sender_is_agent_in_thread(
+    thread: object, event_id: str, sender: str
+) -> bool | None:
+    """From a ``get_thread`` payload, decide whether the author of ``event_id``
+    is an agent (bot) — the storm-guard input for engaged-thread wakes.
+
+    The push payload carries no sender-is-agent flag, but every message in a
+    ``get_thread`` response does (``is_from_agent``, computed server-side from
+    the users table). Prefer the triggering event's own flag; if that event
+    isn't in the response yet (persistence race, or a thread longer than the
+    server's reply window), fall back to any other message by the same sender —
+    agent status is a property of the user, not the message.
+
+    Returns ``True``/``False`` when determinable, ``None`` when not (malformed
+    payload, sender never seen in the thread). Callers must treat ``None`` as
+    "agent" — fail closed, because waking on an unclassifiable sender is what
+    re-opens the agent-storm loop this guard exists to prevent (ENG-724 /
+    filament-hermes#20).
+    """
+    if not isinstance(thread, dict):
+        return None
+    root = thread.get("root")
+    replies = thread.get("replies")
+    messages = ([root] if isinstance(root, dict) else []) + (
+        [m for m in replies if isinstance(m, dict)] if isinstance(replies, list) else []
+    )
+    by_sender: bool | None = None
+    for m in messages:
+        flag = m.get("is_from_agent")
+        if not isinstance(flag, bool):
+            continue
+        if event_id and m.get("event_id") == event_id:
+            return flag
+        if sender and m.get("sender") == sender:
+            by_sender = flag
+    return by_sender
 
 
 def capability_denies(allowed: "frozenset[str] | None", tool_name: str) -> bool:
@@ -300,6 +339,7 @@ class WakePolicyStore:
           "trigger_emojis": ["🐞", "🐛", "🤖"],   # reactions that wake
           "reactive_wake": "mention",               # "mention" | "all" | "off"
           "reply_style": "thread",                  # "thread" | "channel"
+          "thread_wake": "engaged",                 # "engaged" | "off"
           "per_channel": {"<room_id>": {"reactive_wake": "all",
                                          "reply_style": "channel",
                                          "trigger_emojis": [...]}}
@@ -308,12 +348,23 @@ class WakePolicyStore:
     Defaults are conservative: respond only when @-mentioned, thread every
     reply off the triggering message, no reaction triggers, until the principal
     configures it from the backchannel.
+
+    ``thread_wake`` is the one exception, and it defaults on ("engaged"): a
+    reply from a NON-AGENT in a thread the agent was already @-mentioned in
+    counts as a mention, so a human back-and-forth doesn't need a re-tag every
+    turn (ENG-724). Both guards are load-bearing: "already mentioned in" comes
+    from the adapter's local record of past mention wakes (never from mere
+    delivery — trusting delivery is what let subscribed agents wake each other,
+    filament-hermes#20), and "non-agent" is checked against the server's
+    sender classification, failing closed to "agent" when unknown. Agents
+    therefore never wake each other without an explicit @-mention.
     """
 
     _DEFAULTS: ClassVar[dict] = {
         "trigger_emojis": [],
         "reactive_wake": "mention",
         "reply_style": "thread",
+        "thread_wake": "engaged",
         "per_channel": {},
     }
 
@@ -381,6 +432,26 @@ class WakePolicyStore:
         )
         return resolved
 
+    def thread_wake(self, room_id: str) -> str:
+        """Whether an un-mentioned non-agent reply in an engaged thread counts
+        as a mention, resolved per-channel then global.
+
+        "engaged" (default) — count it, keeping the agent in a back-and-forth
+        without a re-tag every turn. "off" — mention-only, even in threads the
+        agent was mentioned in. An unrecognized value fails safe to "engaged"
+        (the adapter's non-agent + already-mentioned guards still apply)."""
+        policy = self.read()
+        ch = self._channel(policy, room_id)
+        mode = ch.get("thread_wake", policy.get("thread_wake", "engaged"))
+        resolved = mode if mode in ("engaged", "off") else "engaged"
+        logger.info(
+            "filament-fcm: thread_wake room=%s mode=%s → %s",
+            room_id,
+            mode,
+            resolved,
+        )
+        return resolved
+
     def should_wake_reaction(self, room_id: str, emoji: str) -> bool:
         policy = self.read()
         ch = self._channel(policy, room_id)
@@ -394,6 +465,83 @@ class WakePolicyStore:
             woke,
         )
         return woke
+
+
+class EngagedThreadStore:
+    """The threads the agent was @-mentioned in — the "already engaged" half of
+    the engaged-thread wake rule (ENG-724).
+
+    When a mention wakes the agent, the adapter records the thread root: the
+    mention's own ``thread_id`` when it arrived inside a thread, else its
+    ``event_id`` (a top-level message's id IS the thread root once replies
+    thread off it). A later un-mentioned reply then counts as engaged iff its
+    thread root is recorded here. This is deliberately LOCAL knowledge — the
+    plugin saw the mention push itself — never "the server delivered it", which
+    is the inference that let subscribed agents wake each other
+    (filament-hermes#20).
+
+    JSON on disk (``{"threads": {"<room_id> <root_id>": <epoch secs>}}``), read
+    fresh per event like the wake policy. Bounded: the oldest entries are
+    evicted past ``_MAX_ENTRIES``, and ``record`` refreshes a thread's slot, so
+    active conversations stay while stale ones age out. An unreadable file
+    reads as empty — fail closed, no thread wakes.
+    """
+
+    _MAX_ENTRIES: ClassVar[int] = 500
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(
+            path
+            or os.environ.get("FILAMENT_ENGAGED_THREADS_FILE")
+            or _default_dir() / "engaged_threads.json"
+        )
+
+    @staticmethod
+    def _key(room_id: str, thread_root_id: str) -> str:
+        # A space never appears in a room id or event id, so the composite
+        # key is unambiguous.
+        return f"{room_id} {thread_root_id}"
+
+    def _read(self) -> dict[str, float]:
+        try:
+            loaded = json.loads(self._path.read_text(encoding="utf-8"))
+            threads = loaded.get("threads") if isinstance(loaded, dict) else None
+            if isinstance(threads, dict):
+                return {
+                    str(k): float(v)
+                    for k, v in threads.items()
+                    if isinstance(v, (int, float))
+                }
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning(
+                "filament-fcm: failed to read engaged threads", exc_info=True
+            )
+        return {}
+
+    def record(self, room_id: str, thread_root_id: str) -> None:
+        if not room_id or not thread_root_id:
+            return
+        threads = self._read()
+        threads[self._key(room_id, thread_root_id)] = time.time()
+        if len(threads) > self._MAX_ENTRIES:
+            for key in sorted(threads, key=threads.__getitem__)[
+                : len(threads) - self._MAX_ENTRIES
+            ]:
+                del threads[key]
+        _atomic_write_text(self._path, json.dumps({"threads": threads}, indent=2))
+        logger.info(
+            "filament-fcm: engaged thread recorded room=%s root=%s (%d tracked)",
+            room_id,
+            thread_root_id,
+            len(threads),
+        )
+
+    def is_engaged(self, room_id: str, thread_root_id: str | None) -> bool:
+        if not room_id or not thread_root_id:
+            return False
+        return self._key(room_id, thread_root_id) in self._read()
 
 
 # ── Capability policy ────────────────────────────────────────────────
