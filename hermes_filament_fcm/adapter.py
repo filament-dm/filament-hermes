@@ -86,6 +86,12 @@ _PROCESSING_REACTIONS = ("👀",)
 # but not finalized (connect token valid, account not created yet).
 _NOT_FINALIZED_CODE = -32002
 
+# accept_vouch retry budget. A vouch that fails to be accepted leaves the loop
+# admin with nothing to approve, so a blip is worth riding out; the waits are
+# linear (2s, 4s) to stay well inside a connect attempt.
+_VOUCH_ACCEPT_ATTEMPTS = 3
+_VOUCH_ACCEPT_BACKOFF_S = 2.0
+
 
 def _is_not_finalized(result: dict | None) -> bool:
     """True if a tool result is the reserved-but-not-finalized error."""
@@ -235,6 +241,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # Agent identity (populated during Stage 1 via get_self MCP tool).
         self._user_id: str | None = None
+
+        # Loops whose vouch is mid-accept. The startup sweep and a live
+        # knock_invite_received push can name the same loop at once (the sweep
+        # now runs with the listener already up), and a duplicate accept_vouch
+        # would knock twice and log a spurious rejection. See _accept_vouch.
+        self._vouch_accepts_in_flight: set[str] = set()
 
         # First-contact greeting state (populated during Stage 1). The server
         # decides whether a hello is due — it appends a one-shot greet
@@ -475,6 +487,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 logger.error("filament-fcm: Stage 4 (FCM listener) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="start_listener")
                 return False
+
+            # Offline catch-up for vouches, after Stage 4 on purpose. Run before
+            # the listener was up and a vouch landing in between was missed by
+            # both paths — no push to receive, mailbox already read — leaving the
+            # admin nothing to approve until the next restart. _accept_vouch
+            # dedupes the overlap this ordering creates instead.
+            await self._accept_pending_vouches()
 
             self._mark_connected()
             logger.info("filament-fcm: connected successfully")
@@ -718,10 +737,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # it's been invited to while it was offline.
             await self._accept_pending_invites()
 
-            # Accept any pending vouches so a loop admin can approve the agent
-            # into loops it was vouched for while offline.
-            await self._accept_pending_vouches()
-
             return True
         except Exception:
             logger.exception("filament-fcm: [Stage 1] MCP initialization failed")
@@ -765,15 +780,107 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 "filament-fcm: failed to list pending invites", exc_info=True
             )
 
-    async def _accept_pending_vouches(self) -> None:
-        """Accept all pending vouches via MCP tools.
+    async def _accept_vouch(
+        self, loop_id: str, label: str | None = None, inviter: str | None = None
+    ) -> bool:
+        """Accept one vouch, retrying transient failures. True if it knocked.
 
-        A member vouching the agent into a loop lands a pending vouch in the
-        agent's knock-invite mailbox — not an ``m.room.member`` invite, so
-        ``_accept_pending_invites`` never sees it. Accepting it (``accept_vouch``)
-        knocks on the loop, turning the vouch into a member proposal a loop admin
-        then approves; without this the vouch is invisible to the admin and can
-        never be approved. Failures are logged but do not block startup.
+        Both entry points funnel through here: the startup sweep and the live
+        ``knock_invite_received`` push. Without a retry a single blip left the
+        vouch unaccepted, so no member proposal existed and the loop admin had
+        nothing to approve — indistinguishable to them from never being vouched,
+        and only recoverable by restarting the gateway.
+
+        A server rejection is *not* retried (see
+        ``FilamentAPI.is_retryable_error``); it is a decision, not a blip.
+        """
+        if not self._filament_api:
+            logger.warning("filament-fcm: vouch for %s but API not ready", loop_id)
+            return False
+        name = label or loop_id
+        if loop_id in self._vouch_accepts_in_flight:
+            logger.debug("filament-fcm: vouch for %s already being accepted", name)
+            return False
+        self._vouch_accepts_in_flight.add(loop_id)
+        try:
+            for attempt in range(1, _VOUCH_ACCEPT_ATTEMPTS + 1):
+                last = attempt == _VOUCH_ACCEPT_ATTEMPTS
+                try:
+                    result = await self._filament_api.accept_vouch(loop_id)
+                    err = self._filament_api.result_error(result)
+                    if not err:
+                        logger.info(
+                            "filament-fcm: accepted vouch into %s%s "
+                            "(pending loop-admin approval)",
+                            name,
+                            f" from {inviter}" if inviter else "",
+                        )
+                        return True
+                    if not self._filament_api.is_retryable_error(err) or last:
+                        logger.warning(
+                            "filament-fcm: accept_vouch for %s REJECTED by "
+                            "server after %d attempt(s): %s",
+                            name,
+                            attempt,
+                            err,
+                        )
+                        slog.warning(
+                            "filament_fcm.vouch.accept_failed",
+                            loop_id=loop_id,
+                            attempts=attempt,
+                            error=err,
+                        )
+                        return False
+                    logger.warning(
+                        "filament-fcm: accept_vouch for %s failed transiently "
+                        "(attempt %d/%d): %s",
+                        name,
+                        attempt,
+                        _VOUCH_ACCEPT_ATTEMPTS,
+                        err,
+                    )
+                except Exception:
+                    if last:
+                        logger.warning(
+                            "filament-fcm: accept_vouch for %s failed after "
+                            "%d attempt(s)",
+                            name,
+                            attempt,
+                            exc_info=True,
+                        )
+                        slog.warning(
+                            "filament_fcm.vouch.accept_failed",
+                            loop_id=loop_id,
+                            attempts=attempt,
+                            error="exception",
+                        )
+                        return False
+                    logger.warning(
+                        "filament-fcm: accept_vouch for %s raised "
+                        "(attempt %d/%d), retrying",
+                        name,
+                        attempt,
+                        _VOUCH_ACCEPT_ATTEMPTS,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(_VOUCH_ACCEPT_BACKOFF_S * attempt)
+            return False
+        finally:
+            self._vouch_accepts_in_flight.discard(loop_id)
+
+    async def _accept_pending_vouches(self) -> None:
+        """Accept every pending vouch in the agent's knock-invite mailbox.
+
+        A member vouching the agent into a loop lands a pending vouch in that
+        mailbox — not an ``m.room.member`` invite, so ``_accept_pending_invites``
+        never sees it. Accepting it (``accept_vouch``) knocks on the loop, turning
+        the vouch into a member proposal a loop admin then approves; without this
+        the vouch is invisible to the admin and can never be approved.
+
+        This is the offline catch-up path: a vouch that arrived while the agent
+        was down has no push to replay, and the mailbox is the only record of it.
+        Runs after the listener is live so a vouch landing mid-startup is caught
+        by one path or the other. Failures are logged but never block startup.
         """
         if not self._filament_api:
             return
@@ -790,28 +897,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 loop_id = vouch.get("loop_id") if isinstance(vouch, dict) else vouch
                 if not loop_id:
                     continue
-                try:
-                    result = await self._filament_api.accept_vouch(loop_id)
-                    err = self._filament_api.result_error(result)
-                    if err:
-                        logger.warning(
-                            "filament-fcm: accept_vouch for %s REJECTED by "
-                            "server: %s",
-                            loop_id,
-                            err,
-                        )
-                        continue
-                    logger.info(
-                        "filament-fcm: accepted vouch into %s "
-                        "(pending loop-admin approval)",
-                        loop_id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "filament-fcm: failed to accept vouch into %s",
-                        loop_id,
-                        exc_info=True,
-                    )
+                await self._accept_vouch(loop_id)
         except Exception:
             logger.warning("filament-fcm: failed to list vouches", exc_info=True)
 
@@ -1225,31 +1311,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
 
         async def _accept() -> None:
-            if not self._filament_api:
-                logger.warning("filament-fcm: vouch received but API not ready")
-                return
-            try:
-                result = await self._filament_api.accept_vouch(vouch.loop_id)
-                err = self._filament_api.result_error(result)
-                if err:
-                    logger.warning(
-                        "filament-fcm: accept_vouch for %s REJECTED by "
-                        "server: %s",
-                        vouch.loop_name or vouch.loop_id,
-                        err,
-                    )
-                    return
-                logger.info(
-                    "filament-fcm: accepted vouch into %s from %s "
-                    "(pending loop-admin approval)",
-                    vouch.loop_name or vouch.loop_id,
-                    vouch.inviter,
-                )
-            except Exception:
-                logger.exception(
-                    "filament-fcm: failed to accept vouch into %s",
-                    vouch.loop_id,
-                )
+            await self._accept_vouch(
+                vouch.loop_id,
+                label=vouch.loop_name or vouch.loop_id,
+                inviter=vouch.inviter,
+            )
 
         self._schedule_async(_accept(), "vouch accept")
 
