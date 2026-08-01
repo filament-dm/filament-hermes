@@ -74,6 +74,37 @@ current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
 )
 
 
+# What a turn writes to say "post nothing".
+NO_REPLY_SENTINEL = "[[NO_REPLY]]"
+
+# Fencing, emphasis and punctuation a model wraps around a literal it was told
+# to emit. Stripped as one set, in a single pass: chained strips would leave
+# interleaved wrappers behind, because each call only sees the current ends
+# (``**`X`**`` strips the asterisks, exposing backticks a prior pass already
+# looked for).
+_TOKEN_WRAPPERS = "`\"'*_.,! \t\r\n"
+
+
+def _bare_token(line: str) -> str:
+    """A line stripped of surrounding fencing and punctuation, upper-cased."""
+    return line.strip(_TOKEN_WRAPPERS).upper()
+
+
+def is_no_reply(content: str | None) -> bool:
+    """True when *content* is empty, or is the sentinel and nothing else.
+
+    A reply that also contains other text is posted in full, sentinel included.
+    Suppressing those would throw away real content: a model that answers and
+    then appends the sentinel has still produced an answer.
+    """
+    if content is None:
+        return True
+    stripped = content.strip()
+    if not stripped:
+        return True
+    return _bare_token(stripped) == NO_REPLY_SENTINEL
+
+
 def is_agent_mention(
     is_mention: bool, is_everyone_mention: bool, body_mentions_me: bool
 ) -> bool:
@@ -163,6 +194,7 @@ def capability_hint(allowed: "frozenset[str] | None") -> str:
         "channel and will be refused, so do not attempt it (and don't claim you "
         f"used it): {names}]"
     )
+
 
 # How many recent messages the adapter reads to build the context breadcrumb.
 # A bounded window: enough to notice the agent is walking into a conversation

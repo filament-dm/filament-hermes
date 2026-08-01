@@ -55,6 +55,7 @@ from .observability import (
 from .reactive import (
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
+    NO_REPLY_SENTINEL,
     CapabilityPolicyStore,
     EngagedThreadStore,
     FeatureFlagStore,
@@ -65,6 +66,7 @@ from .reactive import (
     current_capabilities,
     current_zone,
     is_agent_mention,
+    is_no_reply,
     is_system_sender,
     sender_is_agent_in_thread,
 )
@@ -1150,8 +1152,40 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         metadata: Any = None,
     ) -> SendResult:
         """Send a message via the Filament MCP API."""
+        # A turn can decline to reply (see default_instructions.md). Checked
+        # before the connection guard, because it needs no API call and
+        # returning failure would have the framework retry a turn that
+        # intentionally produced nothing.
+        if is_no_reply(content):
+            slog.info(
+                "filament_fcm.send.suppressed",
+                installation_id=self._installation_id,
+                chat_id=chat_id,
+                reason="no_reply",
+                content_length=len(content or ""),
+            )
+            logger.info("filament-fcm: turn declined to reply in %s", chat_id)
+            return SendResult(success=True)
+
         if not self._filament_api:
             return SendResult(success=False, error="Not connected")
+
+        # The sentinel survived, so it is about to be posted as visible text.
+        # Warn rather than strip it: the standing instructions are what needs
+        # fixing, and stripping cannot tell a stray token from a quoted one.
+        if content and NO_REPLY_SENTINEL.lower() in content.lower():
+            slog.warning(
+                "filament_fcm.send.sentinel_leak",
+                installation_id=self._installation_id,
+                chat_id=chat_id,
+                content_length=len(content),
+            )
+            logger.warning(
+                "filament-fcm: posting a message that still contains %s to %s — "
+                "the standing instructions are being half-followed",
+                NO_REPLY_SENTINEL,
+                chat_id,
+            )
 
         parent_context = current_context()
         send_id = new_id("send")
@@ -1492,9 +1526,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # the thread root once replies thread off it. A follow-up wake
         # re-records to refresh the thread's eviction slot.
         if mentioned or thread_follow_up:
-            self._engaged_threads.record(
-                msg.room_id, msg.thread_id or msg.event_id
-            )
+            self._engaged_threads.record(msg.room_id, msg.thread_id or msg.event_id)
 
         # The push never includes attachments (ENG-603): describe any media on
         # the event so the agent knows it exists. Only for admitted wakes, so
