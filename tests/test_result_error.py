@@ -48,3 +48,25 @@ def test_success_and_junk_are_none():
     # synthesizes) is a real failure and must be surfaced, not swallowed.
     assert api.result_error({"error": "stringy"}) == "stringy"
     assert api.result_error({"error": ""}) is None
+
+
+_INIT_SRC = (
+    Path(__file__).parent.parent / "hermes_filament_fcm" / "__init__.py"
+).read_text()
+
+
+def _tool_handler_src() -> str:
+    return _INIT_SRC.split("def _make_tool_handler(", 1)[1].split("\ndef ", 1)[0]
+
+
+def test_tool_proxy_checks_result_error():
+    """The proxy must consult result_error. parse_tool_result flattens an error
+    envelope into something that reads like a result."""
+    assert "result_error(result)" in _tool_handler_src()
+
+
+def test_tool_proxy_never_returns_an_empty_error():
+    """str(exc) is "" for several transport errors, so the class is named."""
+    src = _tool_handler_src()
+    assert "type(exc).__name__" in src
+    assert 'json.dumps({"error": str(exc)})' not in src
