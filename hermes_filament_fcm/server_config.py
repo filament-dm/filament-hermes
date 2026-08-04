@@ -15,10 +15,11 @@ token, same HTTP stack — see ``FilamentAPI.get_config`` / ``put_config``):
 The document's only allowed top-level sections map 1:1 onto the local
 reactive-store files, **verbatim**:
 
-    capability_policy → capability_policy.json   (CapabilityPolicyStore)
-    wake_policy       → wake_policy.json         (WakePolicyStore)
-    instructions      → instructions.md contents (InstructionsStore; a string)
-    feature_flags     → feature_flags.json       (FeatureFlagStore)
+    capability_policy    → capability_policy.json    (CapabilityPolicyStore)
+    wake_policy          → wake_policy.json          (WakePolicyStore)
+    instructions         → instructions.md contents  (InstructionsStore; a string)
+    feature_flags        → feature_flags.json        (FeatureFlagStore)
+    channel_instructions → channel_instructions.json (ChannelInstructionsStore)
 
 The sync is fetch-and-apply: applying a fetched document writes each present
 section to the corresponding store file atomically (each store's writer is
@@ -49,6 +50,7 @@ from typing import Any
 
 from .reactive import (
     CapabilityPolicyStore,
+    ChannelInstructionsStore,
     FeatureFlagStore,
     InstructionsStore,
     WakePolicyStore,
@@ -60,6 +62,7 @@ SECTION_CAPABILITY_POLICY = "capability_policy"
 SECTION_WAKE_POLICY = "wake_policy"
 SECTION_INSTRUCTIONS = "instructions"
 SECTION_FEATURE_FLAGS = "feature_flags"
+SECTION_CHANNEL_INSTRUCTIONS = "channel_instructions"
 
 # Per-wake syncs are TTL-cached: a burst of events costs at most one HTTP
 # round-trip per window, and the window is short enough that a backchannel
@@ -187,6 +190,7 @@ class ServerConfigSync:
         wake_store: WakePolicyStore | None = None,
         instructions_store: InstructionsStore | None = None,
         feature_store: FeatureFlagStore | None = None,
+        channel_instructions_store: ChannelInstructionsStore | None = None,
         inventory_provider: Callable[[], list[dict]] | None = None,
         ttl_seconds: float = SYNC_TTL_SECONDS,
         tools_interval_seconds: float = TOOLS_REPORT_INTERVAL_SECONDS,
@@ -196,6 +200,9 @@ class ServerConfigSync:
         self._wake_store = wake_store or WakePolicyStore()
         self._instructions_store = instructions_store or InstructionsStore()
         self._feature_store = feature_store or FeatureFlagStore()
+        self._channel_instructions_store = (
+            channel_instructions_store or ChannelInstructionsStore()
+        )
         self._inventory_provider = inventory_provider
         self._ttl = float(ttl_seconds)
         self._tools_interval = float(tools_interval_seconds)
@@ -261,6 +268,7 @@ class ServerConfigSync:
             (SECTION_CAPABILITY_POLICY, self._capability_store.path),
             (SECTION_WAKE_POLICY, self._wake_store.path),
             (SECTION_FEATURE_FLAGS, self._feature_store.path),
+            (SECTION_CHANNEL_INSTRUCTIONS, self._channel_instructions_store.path),
         ):
             value = _read_json_file(path)
             if isinstance(value, dict):
@@ -304,6 +312,11 @@ class ServerConfigSync:
             (SECTION_WAKE_POLICY, dict, self._wake_store.write),
             (SECTION_INSTRUCTIONS, str, self._instructions_store.write),
             (SECTION_FEATURE_FLAGS, dict, self._feature_store.write),
+            (
+                SECTION_CHANNEL_INSTRUCTIONS,
+                dict,
+                self._channel_instructions_store.write,
+            ),
         )
         for section, typ, write in writers:
             if section in exclude:
@@ -331,6 +344,7 @@ class ServerConfigSync:
             SECTION_CAPABILITY_POLICY: self._capability_store.path,
             SECTION_WAKE_POLICY: self._wake_store.path,
             SECTION_FEATURE_FLAGS: self._feature_store.path,
+            SECTION_CHANNEL_INSTRUCTIONS: self._channel_instructions_store.path,
         }[section]
         value = _read_json_file(path)
         return value if isinstance(value, dict) else None

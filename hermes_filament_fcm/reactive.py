@@ -334,6 +334,75 @@ class InstructionsStore:
         logger.info("filament-fcm: standing instructions updated (%d bytes)", len(text))
 
 
+class ChannelInstructionsStore:
+    """Per-channel guidance layered on top of the standing instructions.
+
+    A JSON object on disk mapping Matrix room id → guidance string, read fresh
+    on every wake so a config change takes effect on the next event — no
+    restart. Written by the server-config sync (the app edits the server
+    document; there is deliberately no ``set_*`` backchannel tool for this
+    section). Fail-closed: a missing, malformed, or unreadable file reads as
+    empty, so no channel is ever framed with guidance the principal didn't
+    save.
+    """
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(
+            path
+            or os.environ.get("FILAMENT_CHANNEL_INSTRUCTIONS_FILE")
+            or _default_dir() / "channel_instructions.json"
+        )
+
+    @property
+    def path(self) -> Path:
+        """The channel-instructions JSON file on disk."""
+        return self._path
+
+    def read(self) -> dict:
+        try:
+            loaded = json.loads(self._path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug(
+                "filament-fcm: failed to read channel instructions", exc_info=True
+            )
+        return {}
+
+    def get(self, room_id: str | None) -> str:
+        """The guidance saved for ``room_id``, or "" when there is none.
+
+        A non-string entry is malformed config and reads as absent — the
+        envelope must only ever carry principal-authored text."""
+        value = self.read().get(room_id, "")
+        return value if isinstance(value, str) else ""
+
+    def write(self, mapping: dict) -> None:
+        _atomic_write_text(self._path, json.dumps(mapping, indent=2))
+        logger.info(
+            "filament-fcm: channel instructions updated (%d channel(s))",
+            len(mapping),
+        )
+
+
+def guidance_block(text: str) -> str:
+    """Framing block carrying the principal's guidance for the waking channel,
+    or "" when there is none (no empty header in the envelope).
+
+    ``text`` is principal-authored trusted config — the same trust class as
+    the standing instructions. It must come only from
+    ``ChannelInstructionsStore``, never from event data, and no event-derived
+    metadata may be interpolated here: the block is trusted framing, so
+    anything untrusted in it would be an injection surface. Pure and
+    stdlib-only so it is unit-testable without Hermes.
+    """
+    if not text:
+        return ""
+    return f"[YOUR GUIDANCE FOR THIS CHANNEL]\n{text}"
+
+
 class WakePolicyStore:
     """The wake policy — the cheap, pre-LLM gate deciding *whether* to spend a
     turn (separate from the standing instructions, which decide *what* to do).
