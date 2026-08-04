@@ -212,11 +212,6 @@ def register(ctx: Any) -> None:
     # established later in adapter.connect().
     api = FilamentAPI(mcp_url, mcp_token)
 
-    # The PLATFORM keeps the name it has always had. It is the key for
-    # platform_toolsets, `hermes gateway status` and the gateway's own per-
-    # platform state, so renaming it would strand all three on an existing
-    # install for no gain. Only the PLUGIN id changed (to `filament`, see
-    # plugin.yaml); plugin_name below is that id.
     ctx.register_platform(
         name="filament-fcm",
         label="Filament (FCM)",

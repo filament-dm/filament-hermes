@@ -1,18 +1,8 @@
 # Directory-plugin manifest. `hermes plugins install filament-dm/filament-hermes
 # --enable` git-clones this repo into ~/.hermes/plugins/<name>, where Hermes
-# discovers it via this manifest plus the root __init__.py (which re-exports
-# register()). That is also what makes `hermes plugins list` / `enable` /
-# `update` work.
-#
-# `name` is the plugin id: the install directory, the entry in
-# `plugins.enabled`, and the argument to `hermes plugins update <id>`. It used to
-# be `filament-fcm`; install.sh migrates an older install onto this one.
-#
-# The *platform* deliberately keeps the old name (see register_platform in
-# hermes_filament_fcm/__init__.py), and so does the runtime state directory
-# ~/.hermes/filament-fcm/ — a hardcoded path, not one derived from either name.
-# That is what lets this rename leave a running agent's FCM registration,
-# standing instructions and wake policy exactly where they are.
+# discovers it via this manifest plus the root __init__.py. `name` is the plugin
+# id: the install directory, the entry in `plugins.enabled`, and the argument to
+# `hermes plugins update <id>`.
 name: filament
 label: Filament (FCM)
 kind: platform

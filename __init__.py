@@ -1,12 +1,6 @@
-"""Directory-plugin entry point.
+"""Directory-plugin entry point: Hermes executes this file and calls register().
 
-Hermes reads ``plugin.yaml`` for the manifest and this file for the code. Its
-loader requires an ``__init__.py`` here, executes it, then calls ``register()``
-(``hermes_cli/plugins.py:_load_directory_module``). The code lives in the nested
-``hermes_filament_fcm`` package, so this file is a shim.
-
-Keep this file committed. ``hermes plugins install`` copies the cloned tree as
-it is, so a generated file does not exist in the installed plugin.
+Must stay committed — `hermes plugins install` copies the cloned tree as-is.
 """
 
 from __future__ import annotations
@@ -14,14 +8,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Put the vendored dependencies on sys.path before anything imports the package.
-# The package imports firebase_messaging, and no step of the install provides it:
-# `hermes plugins install` is a git clone and runs neither pip nor uv, and the
-# gateway runs as an unprivileged uid that cannot write /opt/hermes/.venv. See
-# scripts/vendor-deps.sh for the tree.
-#
-# Append, do not prepend. Python then finds an installed copy first, for each
-# package, and vendor/ supplies only what the machine does not have.
+# On sys.path before anything imports the package, which needs
+# firebase_messaging. Appended, not prepended, so an installed copy wins per
+# package and vendor/ fills only what is missing. Rebuild it with
+# scripts/vendor-deps.sh.
 _VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
 if _VENDOR_DIR.is_dir() and str(_VENDOR_DIR) not in sys.path:
     sys.path.append(str(_VENDOR_DIR))

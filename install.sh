@@ -258,15 +258,10 @@ else
   "$GIT" -C "$CLONE_TMP" checkout -q --detach FETCH_HEAD || err "git checkout of '$PLUGIN_REF' failed."
 fi
 
-# The directory-plugin entry point is committed as of 0.8.0, so a clone brings it.
-# A ref from before that has none, and this script no longer generates one — the
-# bare re-export it used to write would skip the vendored-dependency bootstrap the
-# committed shim performs, which is the whole point of that file now.
-#
-# Only FILAMENT_FCM_REF can land here (the default branch has the file), so this
-# is the developer override, not a user path. Stop rather than install a tree the
-# loader cannot enter: an absent entry point surfaces as "No messaging platforms
-# enabled" long after the fact, which is a miserable thing to debug.
+# The entry point is committed as of 0.8.0 and no longer generated here, so a ref
+# from before that has none. Only FILAMENT_FCM_REF reaches this. Stop rather than
+# install a tree the loader cannot enter, which would surface much later as "No
+# messaging platforms enabled".
 [ -f "$CLONE_TMP/__init__.py" ] || err \
   "ref '${PLUGIN_REF:-default}' has no plugin entry point (__init__.py), so it \
 predates 0.8.0. Install an older ref with that ref's own installer instead: \

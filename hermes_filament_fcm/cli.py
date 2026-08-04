@@ -1,21 +1,8 @@
-"""The ``hermes filament`` subcommand.
+"""Installs the ``hermes filament`` top-level CLI command.
 
-Hermes lets a plugin add real top-level CLI commands
-(``PluginContext.register_cli_command``), and ``main.py`` builds them into its
-argparse tree after ``discover_plugins()``. So once the plugin is installed and
-enabled, the next ``hermes`` invocation has ``hermes filament connect <token>``.
-
-That is what makes the connect flow a plain pair of commands with the token as
-an argument, instead of a shell that pipes a token into a prompt or writes .env
-by hand:
-
-    hermes plugins install filament-dm/filament-hermes --enable
-    hermes filament connect fmcp_...
-
-The command runs in the CLI process, not the gateway, so it can persist the
-token where the gateway will find it and then restart the gateway.
+    hermes plugins install filament-dm/filament-hermes --enable --force
+    hermes filament connect fmcp_YOURTOKEN
 """
-
 from __future__ import annotations
 
 import logging
@@ -43,9 +30,7 @@ def _setup(parser: Any) -> None:
         "--prompt",
         action="store_true",
         dest="from_stdin",
-        help="read the token from stdin rather than the command line — asked "
-        "for with the input hidden, or piped in. Keeps it out of argv and shell "
-        "history, which is what you want on a shared machine.",
+        help="read the token from stdin rather than the command line",
     )
     connect.add_argument(
         "--url",

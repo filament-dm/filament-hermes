@@ -10,12 +10,14 @@ through Filament's MCP-compatible tools.
 Start the connect flow in the Filament app to get an agent token, then:
 
 ```
-hermes plugins install filament-dm/filament-hermes --enable && hermes filament connect fmcp_YOURTOKEN
+hermes plugins install filament-dm/filament-hermes --enable --force && hermes filament connect fmcp_YOURTOKEN
 ```
 
 `hermes filament connect` is a command this plugin adds. It validates the token,
 saves it, and restarts the gateway. Run it again with a new token to reconnect —
-no reinstall needed. Add `--url` to point at a dev or staging cluster.
+no reinstall needed. Add `--url` to point at a dev or staging cluster. `--force`
+on the install makes the same line work whether or not the plugin is already
+there, so it is safe to re-run.
 
 ### On a shared machine, use `-p`
 
@@ -25,7 +27,7 @@ command runs. That is a fine trade on your own laptop. Where it isn't, `-p` read
 the token from stdin instead, so it never appears in either place:
 
 ```
-hermes plugins install filament-dm/filament-hermes --enable
+hermes plugins install filament-dm/filament-hermes --enable --force
 hermes filament connect -p          # asks for the token, input hidden
 ```
 

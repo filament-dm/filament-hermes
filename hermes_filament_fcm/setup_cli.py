@@ -60,8 +60,12 @@ def _find_hermes_home() -> Path:
 
 
 # The plugin id: the install directory under $HERMES_HOME/plugins, the entry in
-# plugins.enabled, and the argument to `hermes plugins update`. LEGACY_ID is what
-# it was called before, which an older install still has enabled.
+# plugins.enabled, and the argument to `hermes plugins update`.
+# LEGACY_PLUGIN_ID is what it was called before, which an older install
+# still has enabled.
+#
+# Neither the platform name nor the state directory ~/.hermes/filament-fcm/
+# follows this id — both keep the old spelling, so renaming moves no state.
 PLUGIN_ID = "filament"
 LEGACY_PLUGIN_ID = "filament-fcm"
 
@@ -106,26 +110,16 @@ def running_from(path: Path) -> bool:
 def retire_legacy_plugin_dir() -> bool:
     """Move an install off the legacy plugin id. True if anything changed.
 
-    Renaming the id installs the plugin at a new path, which leaves the old
-    directory in place — still enabled, and still registering the same platform.
-    Loaded second, it *overwrites* the new plugin's platform entry, so the
-    gateway runs the old adapter with the new plugin's tools. Rewriting
-    plugins.enabled stops it loading, but the directory stays behind and re-arms
-    if anything enables that id again, so deal with the tree too.
+    No current install: the legacy tree IS the install (what `hermes plugins
+    update` on the old id leaves behind), so rename it. That keeps the git remote,
+    and on POSIX is safe even when this code is running out of it — the rename
+    keeps the inode.
 
-    Which way depends on whether a current install exists:
+    Current install present: the legacy tree is a leftover, so remove it. Left in
+    place it re-arms whenever anything enables that id, and being loaded second it
+    overwrites the new plugin's platform entry.
 
-    * none — the legacy tree IS the install, which is what `hermes plugins
-      update` on the old id leaves behind. Renaming it preserves the git remote
-      (so future updates work) and, on POSIX, is safe even when this very code is
-      running out of it: the rename keeps the inode, so already-imported modules
-      stay valid.
-    * one already there — the legacy tree is a leftover, so remove it. Unless we
-      are running out of it, in which case leave it for the next run, which will
-      execute from the new path.
-
-    Only ever the plugin tree. The state directory (~/.hermes/filament-fcm/) is a
-    separate path and keeps its name — see plugin.yaml.
+    Never the state directory ~/.hermes/filament-fcm/ — that is a separate path.
     """
     plugins = _find_hermes_home() / "plugins"
     legacy, current = plugins / LEGACY_PLUGIN_ID, plugins / PLUGIN_ID
@@ -167,11 +161,8 @@ def retire_legacy_plugin_dir() -> bool:
 def migrate_legacy_install() -> None:
     """Enable the current plugin id, then move the tree off the legacy one.
 
-    Config first. Either order closes the window where both ids are enabled,
-    because the gateway only reads config when it starts — but only this order
-    is safe if the second step never happens. Once config names the current id
-    the installed plugin loads; a tree left behind is disabled and inert, whereas
-    a tree removed before config is rewritten leaves nothing loadable at all.
+    Config first: if the second step never runs, a leftover tree is disabled and
+    inert, whereas a removed tree leaves nothing loadable.
     """
     _enable_plugin()
     retire_legacy_plugin_dir()
@@ -233,28 +224,11 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     - ``(False, None)`` when the token is definitively rejected (auth
       error) or the user pressed Ctrl+C.
 
-    While the agent is reserved, ``get_self`` returns -32002; we show a
-    one-time nudge and keep polling, so the flow connects automatically
-    once the user finishes naming the agent.
-
-    That reserved wait is deliberately **unbounded**, and it is the reason this
-    loop looks so patient. It is paced by a human: the documented flow is to run
-    connect and *then* go and name the agent in the app (see after-install.md), so
-    minutes are normal and a timeout here would break the feature.
-
-    Being unreachable is different, and is **bounded** at
-    ``UNREACHABLE_BUDGET_S``. A mistyped URL, a dead host or a TLS failure will
-    not resolve itself no matter how long we wait, and an indefinite hang is the
-    worst possible report of it — the user cannot tell it apart from the patient
-    case above. Any reply at all resets that budget, because a reply proves the
-    endpoint is right, so a network blip during a long legitimate wait cannot
-    trip it.
-
-    An endpoint that answers but errs — HTTP 500, a non-dict error, an unknown
-    JSON-RPC code — is still retried forever. Reachability says the URL is
-    correct, so the sane assumption is a server that will recover. Only a
-    well-formed auth rejection (-32001) means the token itself is bad, and that
-    aborts immediately.
+    While the agent is reserved, ``get_self`` returns -32002; we nudge once and
+    keep polling, unbounded, because that wait is paced by a human naming the
+    agent in the app. Being unreachable is bounded at ``UNREACHABLE_BUDGET_S``
+    instead — a bad URL never resolves itself. Any reply resets that budget. An
+    endpoint that answers but errs is retried forever; only -32001 aborts.
     """
     # Only this specific error code means the token itself is bad and
     # retrying won't help. Everything else is transient or reserved.
@@ -481,33 +455,6 @@ def _run_interactive_setup() -> bool:
     return True
 
 
-def merge_control_users(prior: str, principal_id: str) -> list[str]:
-    """The control-plane set to save: the principal first, then kept extras.
-
-    FILAMENT_CONTROL_USERS is the platform's allowed_users_env, so entries here
-    can command the agent. Writing only the principal would revoke every
-    teammate the owner had granted, which on a reconnect is a silent
-    de-authorisation.
-
-    Extras are kept only when the *owner is unchanged*. We always write the
-    principal first, so ``prior``'s first entry is the principal the last write
-    saw; if it differs, this agent has been reconnected under a different owner's
-    token and the old list is that owner's, not this one's. Carrying it over
-    would leave the previous owner able to command the agent — so the set resets
-    to the new principal alone. The interactive path can afford to keep the list
-    and let a human edit it in a prompt; a non-interactive connect cannot.
-    """
-    entries = [e.strip() for e in prior.split(",")]
-    entries = [e for e in entries if e]
-    if not entries or entries[0] != principal_id:
-        return [principal_id]
-    out: list[str] = []
-    for e in entries:
-        if e not in out:
-            out.append(e)
-    return out
-
-
 def _persist(token: str, url: str, principal_id: str | None) -> None:
     """Write the validated connection to the engine's .env.
 
@@ -527,39 +474,25 @@ def _persist(token: str, url: str, principal_id: str | None) -> None:
         if value:
             save_env_value(key, value)
 
+    # The principal alone, matching what the interactive path writes on this
+    # same (CONNECT_TOKEN) branch. That path also prompts for extra commanders,
+    # and re-writing this key drops any that were granted — but that is main's
+    # behaviour and predates this command, so it is fixed separately.
     if principal_id:
-        prior = get_env_value("FILAMENT_CONTROL_USERS") or ""
-        users = merge_control_users(prior, principal_id)
-        save_env_value("FILAMENT_CONTROL_USERS", ",".join(users))
-        dropped = [
-            u for u in (e.strip() for e in prior.split(",")) if u and u not in users
-        ]
-        if dropped:
-            print_warning(
-                f"This token belongs to a different owner, so the previous "
-                f"control-plane users were cleared ({len(dropped)}). Re-add any "
-                f"that should still command this agent via FILAMENT_CONTROL_USERS."
-            )
-        elif len(users) > 1:
-            print_info(f"Kept {len(users) - 1} additional control-plane user(s)")
+        save_env_value("FILAMENT_CONTROL_USERS", principal_id)
     else:
-        # Left as it was, deliberately. get_self can succeed and still omit
-        # owner metadata, so this is not an auth failure — and clearing the
-        # allowlist would revoke the owner and every teammate on what the user
-        # sees as a successful connect.
+        remove_env_value("FILAMENT_CONTROL_USERS")
         print_warning(
-            "Could not determine the principal (owner) from the token, so "
-            "FILAMENT_CONTROL_USERS was left unchanged. Run `hermes pairing "
-            "approve` once, or set it manually."
+            "Could not determine the principal (owner) from the token. Run "
+            "`hermes pairing approve` once, or set FILAMENT_CONTROL_USERS."
         )
 
 
 def token_source(token: str, from_stdin: bool) -> str:
     """Where to read the token: "argv", "stdin", or "conflict".
 
-    Passing both -p and a positional token is a mistake worth stopping on rather
-    than resolving: whichever we honoured, the one on the command line has
-    already been written to the shell's history.
+    Both together is a conflict rather than a preference: the one on the command
+    line is already in the shell's history whichever we honour.
     """
     if from_stdin and token:
         return "conflict"
@@ -569,11 +502,7 @@ def token_source(token: str, from_stdin: bool) -> str:
 
 
 def _read_token_without_argv() -> str:
-    """The token from stdin when it is piped or redirected, else from a prompt.
-
-    Keeps the credential out of argv and shell history for anyone who wants that.
-    A pipe is checked first so this stays usable from a script with no terminal.
-    """
+    """The token from stdin when it is piped or redirected, else from a prompt."""
     if not sys.stdin.isatty():
         return (sys.stdin.readline() or "").strip()
     return (prompt("Agent token (fmcp_...)", password=True) or "").strip()
@@ -587,31 +516,9 @@ def connect(
 ) -> int:
     """Connect this agent to Filament with *token*. Returns an exit code.
 
-    The non-interactive path behind ``hermes filament connect <token>``. It
-    replaces the token prompt that ``hermes plugins install`` raises from
-    ``requires_env``, so the whole install is two commands with no prompt:
-
-        hermes plugins install filament-dm/filament-hermes --enable
-        hermes filament connect fmcp_...
-
-    Unlike the prompt, this overwrites an existing token, so it is also the
-    reconnect path. It blocks while the agent is reserved — the user may still
-    be naming the agent in the app — and connects as soon as that finishes.
-
-    A token on the command line is what makes the connect flow one copy-pasteable
-    line, and that convenience is the point for most people. But argv is not
-    private: /proc/<pid>/cmdline is world-readable on Linux (unlike
-    /proc/<pid>/environ), and shells keep history. The wait above can last
-    minutes, so the window is not brief. On a shared machine, pass *from_stdin*
-    (``-p``) and the token is read from a pipe, or asked for with the input
-    hidden, never appearing in argv or history:
-
-        hermes filament connect -p                    # asks, input hidden
-        hermes filament connect -p < token.txt
-        printf %s "$TOKEN" | hermes filament connect -p
-
-    Omitting the token entirely does the same thing, so a script that forgets the
-    argument still works rather than failing obscurely.
+    Blocks while the agent is reserved, so it may be run before the agent is
+    named in the app. Overwrites an existing token, so it is the reconnect path
+    too. With *from_stdin*, the token is read from stdin instead of *token*.
     """
     token = (token or "").strip()
     source = token_source(token, from_stdin)
