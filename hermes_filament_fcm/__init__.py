@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
+from .cli import register_cli
 from .deps import dep_problem, optional_dep_warnings
 from .filament_api import FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
@@ -358,6 +359,7 @@ def register(ctx: Any) -> None:
 
     _register_reactive_tools(ctx)
     _register_capability_gate(ctx)
+    register_cli(ctx)
 
 
 def _register_capability_gate(ctx: Any) -> None:

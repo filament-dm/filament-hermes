@@ -1,16 +1,13 @@
 # Filament (FCM) installed
 
-Two things left, and the first one is probably already done:
+Connect it with the agent token from Filament's connect flow:
 
-1. **Finish the connect flow in the Filament app** — naming your agent is what
-   creates it. Until then the gateway will report the agent as reserved and keep
-   retrying, which is harmless.
+```
+hermes filament connect fmcp_YOURTOKEN
+```
 
-2. **Restart the gateway** so it loads the plugin:
-
-   ```
-   hermes gateway restart
-   ```
+That saves the token and restarts the gateway. If you are still naming your
+agent in the app, run it anyway — it waits, then connects as soon as you finish.
 
 Then check it came up:
 

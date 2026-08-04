@@ -17,6 +17,7 @@ Usage:
 import asyncio
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -312,6 +313,171 @@ def _run_interactive_setup() -> bool:
     print_success("Configuration saved to ~/.hermes/.env")
 
     return True
+
+
+def merge_control_users(prior: str, principal_id: str) -> list[str]:
+    """The control-plane set to save: the principal first, then kept extras.
+
+    FILAMENT_CONTROL_USERS is the platform's allowed_users_env, so entries here
+    can command the agent. Writing only the principal would revoke every
+    teammate the owner had granted, which on a reconnect is a silent
+    de-authorisation.
+
+    Extras are kept only when the *owner is unchanged*. We always write the
+    principal first, so ``prior``'s first entry is the principal the last write
+    saw; if it differs, this agent has been reconnected under a different owner's
+    token and the old list is that owner's, not this one's. Carrying it over
+    would leave the previous owner able to command the agent — so the set resets
+    to the new principal alone. The interactive path can afford to keep the list
+    and let a human edit it in a prompt; a non-interactive connect cannot.
+    """
+    entries = [e.strip() for e in prior.split(",")]
+    entries = [e for e in entries if e]
+    if not entries or entries[0] != principal_id:
+        return [principal_id]
+    out: list[str] = []
+    for e in entries:
+        if e not in out:
+            out.append(e)
+    return out
+
+
+def _persist(token: str, url: str, principal_id: str | None) -> None:
+    """Write the validated connection to the engine's .env.
+
+    Seeds FILAMENT_CONTROL_USERS with the principal, which is the platform's
+    allowed_users_env. The owner then reaches the agent from the first message,
+    with no `hermes pairing approve` step.
+    """
+    save_env_value("FILAMENT_MCP_TOKEN", token)
+    save_env_value("FILAMENT_MCP_URL", url)
+
+    # Carry the Firebase project through, as the interactive path does (see
+    # _FIREBASE_ENV_KEYS). Against a non-production homeserver these come from
+    # the invoking environment, and a gateway that starts without them registers
+    # with the wrong project: it connects, looks healthy, and is never woken.
+    for key in _FIREBASE_ENV_KEYS:
+        value = (get_env_value(key) or "").strip()
+        if value:
+            save_env_value(key, value)
+
+    if principal_id:
+        prior = get_env_value("FILAMENT_CONTROL_USERS") or ""
+        users = merge_control_users(prior, principal_id)
+        save_env_value("FILAMENT_CONTROL_USERS", ",".join(users))
+        dropped = [
+            u for u in (e.strip() for e in prior.split(",")) if u and u not in users
+        ]
+        if dropped:
+            print_warning(
+                f"This token belongs to a different owner, so the previous "
+                f"control-plane users were cleared ({len(dropped)}). Re-add any "
+                f"that should still command this agent via FILAMENT_CONTROL_USERS."
+            )
+        elif len(users) > 1:
+            print_info(f"Kept {len(users) - 1} additional control-plane user(s)")
+    else:
+        remove_env_value("FILAMENT_CONTROL_USERS")
+        print_warning(
+            "Could not determine the principal (owner) from the token. Run "
+            "`hermes pairing approve` once, or set FILAMENT_CONTROL_USERS."
+        )
+
+
+def token_source(token: str, from_stdin: bool) -> str:
+    """Where to read the token: "argv", "stdin", or "conflict".
+
+    Passing both -p and a positional token is a mistake worth stopping on rather
+    than resolving: whichever we honoured, the one on the command line has
+    already been written to the shell's history.
+    """
+    if from_stdin and token:
+        return "conflict"
+    if from_stdin or not token:
+        return "stdin"
+    return "argv"
+
+
+def _read_token_without_argv() -> str:
+    """The token from stdin when it is piped or redirected, else from a prompt.
+
+    Keeps the credential out of argv and shell history for anyone who wants that.
+    A pipe is checked first so this stays usable from a script with no terminal.
+    """
+    if not sys.stdin.isatty():
+        return (sys.stdin.readline() or "").strip()
+    return (prompt("Agent token (fmcp_...)", password=True) or "").strip()
+
+
+def connect(
+    token: str,
+    url: str | None = None,
+    restart: bool = True,
+    from_stdin: bool = False,
+) -> int:
+    """Connect this agent to Filament with *token*. Returns an exit code.
+
+    The non-interactive path behind ``hermes filament connect <token>``. It
+    replaces the token prompt that ``hermes plugins install`` raises from
+    ``requires_env``, so the whole install is two commands with no prompt:
+
+        hermes plugins install filament-dm/filament-hermes --enable
+        hermes filament connect fmcp_...
+
+    Unlike the prompt, this overwrites an existing token, so it is also the
+    reconnect path. It blocks while the agent is reserved — the user may still
+    be naming the agent in the app — and connects as soon as that finishes.
+
+    A token on the command line is what makes the connect flow one copy-pasteable
+    line, and that convenience is the point for most people. But argv is not
+    private: /proc/<pid>/cmdline is world-readable on Linux (unlike
+    /proc/<pid>/environ), and shells keep history. The wait above can last
+    minutes, so the window is not brief. On a shared machine, pass *from_stdin*
+    (``-p``) and the token is read from a pipe, or asked for with the input
+    hidden, never appearing in argv or history:
+
+        hermes filament connect -p                    # asks, input hidden
+        hermes filament connect -p < token.txt
+        printf %s "$TOKEN" | hermes filament connect -p
+
+    Omitting the token entirely does the same thing, so a script that forgets the
+    argument still works rather than failing obscurely.
+    """
+    token = (token or "").strip()
+    source = token_source(token, from_stdin)
+    if source == "conflict":
+        print_warning(
+            "-p reads the token from stdin, so do not also pass it as an "
+            "argument. Drop one of the two."
+        )
+        return 2
+    if source == "stdin":
+        token = _read_token_without_argv()
+    if not token:
+        print_warning("A token is required. Copy it from Filament's connect flow.")
+        return 2
+
+    resolved = (
+        url or get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents"
+    ).strip().rstrip("/")
+
+    print_header("Filament (FCM)")
+    _enable_plugin()
+
+    # Validate before writing anything, so a bad token leaves a working
+    # configuration intact.
+    ready, principal_id = _wait_for_finalization(token, resolved)
+    if not ready:
+        return 1
+
+    _persist(token, resolved, principal_id)
+    print_success("Connected. Configuration saved.")
+
+    if restart:
+        _restart_gateway()
+    else:
+        print_info("Restart the gateway to load it: hermes gateway restart")
+    return 0
 
 
 def _restart_gateway() -> None:
