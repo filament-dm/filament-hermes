@@ -87,6 +87,9 @@ def _make_sync(tmp_path, api, **kwargs):
         "wake_store": reactive.WakePolicyStore(tmp_path / "wake_policy.json"),
         "instructions_store": reactive.InstructionsStore(tmp_path / "instructions.md"),
         "feature_store": reactive.FeatureFlagStore(tmp_path / "feature_flags.json"),
+        "channel_instructions_store": reactive.ChannelInstructionsStore(
+            tmp_path / "channel_instructions.json"
+        ),
     }
     kwargs.setdefault("ttl_seconds", 0.0)
     return server_config.ServerConfigSync(api, **stores, **kwargs), stores
@@ -191,6 +194,24 @@ def test_same_revision_is_not_rewritten(tmp_path):
     del mtime
 
 
+def test_apply_writes_channel_instructions_file(tmp_path):
+    guidance = {"!room:x": "Answer in French.", "!team:x": "Be terse."}
+    api = FakeAPI(
+        get_results=[
+            (200, {"config": {"channel_instructions": guidance}, "revision": 2})
+        ]
+    )
+    sync, stores = _make_sync(tmp_path, api)
+    asyncio.run(sync.sync())
+    # Lands exactly as the store's own writer serializes it, and resolves
+    # per-channel exactly as if written locally.
+    assert (tmp_path / "channel_instructions.json").read_text() == json.dumps(
+        guidance, indent=2
+    )
+    assert stores["channel_instructions_store"].get("!room:x") == "Answer in French."
+    assert stores["channel_instructions_store"].get("!other:x") == ""
+
+
 # ── Seed: create the server document from the local files ────────────
 
 
@@ -216,6 +237,19 @@ def test_seed_puts_local_files_with_base_revision_zero(tmp_path):
         "capability_policy": local_policy,
         "instructions": "be nice",
     }
+    assert sync.revision == 1
+
+
+def test_seed_includes_channel_instructions(tmp_path):
+    guidance = {"!room:x": "Answer in French."}
+    (tmp_path / "channel_instructions.json").write_text(json.dumps(guidance, indent=2))
+    api = FakeAPI(
+        get_results=[(200, {"config": None, "revision": 0})],
+        put_results=[(200, {"agent_user_id": "@a:x", "revision": 1})],
+    )
+    sync, _ = _make_sync(tmp_path, api)
+    asyncio.run(sync.sync())
+    assert api.put_bodies[0]["config"] == {"channel_instructions": guidance}
     assert sync.revision == 1
 
 
@@ -339,6 +373,28 @@ def test_write_back_retries_once_on_revision_conflict(tmp_path):
         "instructions": "mine",
     }
     assert sync.revision == 5
+
+
+def test_write_back_channel_instructions_section(tmp_path):
+    # No set_* tool writes this section, but the write-back path is generic by
+    # section name and must handle it like any other JSON section.
+    guidance = {"!room:x": "Answer in French."}
+    (tmp_path / "channel_instructions.json").write_text(json.dumps(guidance, indent=2))
+    api = FakeAPI(
+        get_results=[(200, {"config": {"instructions": "old"}, "revision": 3})],
+        put_results=[(200, {"revision": 4})],
+    )
+    sync, _ = _make_sync(tmp_path, api)
+    asyncio.run(sync.write_back("channel_instructions"))
+
+    assert len(api.put_bodies) == 1
+    body = api.put_bodies[0]
+    assert body["base_revision"] == 3
+    assert body["config"] == {
+        "instructions": "old",
+        "channel_instructions": guidance,
+    }
+    assert sync.revision == 4
 
 
 def test_failed_write_back_retries_before_the_next_fetch_applies(tmp_path):

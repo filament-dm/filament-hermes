@@ -485,6 +485,54 @@ def test_flag_off_turn_stays_ungated():
         assert reactive.capability_hint(None) == ""
 
 
+def test_channel_instructions_missing_file_reads_empty():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelInstructionsStore(Path(d) / "channel_instructions.json")
+        # No file → no guidance for any channel, never an exception.
+        assert store.read() == {}
+        assert store.get("!room:example.org") == ""
+        assert store.get(None) == ""
+
+
+def test_channel_instructions_roundtrip_and_per_channel_lookup():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "channel_instructions.json"
+        store = reactive.ChannelInstructionsStore(path)
+        store.write({"!a:x": "Answer in French.", "!b:x": "Be terse."})
+        # Written atomically as JSON; a fresh store reads the same mapping.
+        store2 = reactive.ChannelInstructionsStore(path)
+        assert store2.get("!a:x") == "Answer in French."
+        assert store2.get("!b:x") == "Be terse."
+        assert store2.get("!other:x") == ""
+        # No temp-file droppings from the atomic write.
+        assert [p.name for p in Path(d).iterdir()] == ["channel_instructions.json"]
+
+
+def test_channel_instructions_malformed_file_fails_closed():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "channel_instructions.json"
+        store = reactive.ChannelInstructionsStore(path)
+        # Not JSON at all → empty, no raise.
+        path.write_text("{not json")
+        assert store.get("!a:x") == ""
+        # JSON but not an object → empty.
+        path.write_text('["!a:x"]')
+        assert store.read() == {}
+        # An object with a non-string value → that channel reads as absent.
+        path.write_text('{"!a:x": 42, "!b:x": "real guidance"}')
+        assert store.get("!a:x") == ""
+        assert store.get("!b:x") == "real guidance"
+
+
+def test_guidance_block_empty_and_verbatim():
+    # Empty guidance → no block at all (no empty header in the envelope).
+    assert reactive.guidance_block("") == ""
+    block = reactive.guidance_block("Answer in French.\nKeep replies short.")
+    assert block.startswith("[YOUR GUIDANCE FOR THIS CHANNEL]\n")
+    # The principal's text rides verbatim — no reformatting, no interpolation.
+    assert block.endswith("Answer in French.\nKeep replies short.")
+
+
 def _run() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
