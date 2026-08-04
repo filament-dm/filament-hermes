@@ -46,7 +46,7 @@ from .reactive import (
     current_capabilities,
     current_zone,
 )
-from .server_config import ServerConfigSync
+from .server_config import ServerConfigSync, derive_tool_health
 from .setup_cli import _enable_plugin, _run_interactive_setup
 
 logger = logging.getLogger("gateway.filament_fcm")
@@ -222,7 +222,7 @@ def register(ctx: Any) -> None:
     # (write-back after a local edit), so the remembered document revision and
     # the once-only failure warnings are process-wide. No network calls here.
     server_sync = ServerConfigSync(
-        api, inventory_provider=lambda: _tool_inventory(tool_descriptions)
+        api, inventory_provider=lambda: _tool_inventory(tool_descriptions, api)
     )
 
     ctx.register_platform(
@@ -377,16 +377,29 @@ def register(ctx: Any) -> None:
     _register_capability_gate(ctx)
 
 
-def _tool_inventory(descriptions: dict[str, str]) -> list[dict]:
+def _tool_inventory(
+    descriptions: dict[str, str], api: "FilamentAPI | None" = None
+) -> list[dict]:
     """The registered-tool inventory to report to the server.
 
     Enumerates every tool name the process has registered via the same
     registry read ``get_capabilities`` uses — Filament tools and any other
     plugin's alike. Origin is "filament" for this plugin's own toolset, the
     toolset name otherwise; descriptions ride along where this plugin knows
-    them (the registry itself stores only names per toolset). If the registry
-    is unreadable, fall back to the tools this plugin registered itself.
+    them (the registry itself stores only names per toolset). Connector-backed
+    tools also carry ``health`` (see ``derive_tool_health``): the Filament
+    toolset from this plugin's own session state, MCP toolsets from Hermes'
+    per-server status. If the registry is unreadable, fall back to the tools
+    this plugin registered itself.
     """
+    filament_connected: bool | None = None
+    if api is not None:
+        try:
+            filament_connected = bool(api.is_connected)
+        except Exception:
+            filament_connected = None
+    statuses = _mcp_server_statuses()
+
     try:
         from tools.registry import registry  # noqa: PLC0415
 
@@ -398,6 +411,9 @@ def _tool_inventory(descriptions: dict[str, str]) -> list[dict]:
                 desc = descriptions.get(name)
                 if desc:
                     entry["description"] = desc
+                health = derive_tool_health(str(ts), statuses, filament_connected)
+                if health is not None:
+                    entry["health"] = health
                 entries.append(entry)
         return entries
     except Exception:
@@ -405,12 +421,35 @@ def _tool_inventory(descriptions: dict[str, str]) -> list[dict]:
             "filament-fcm: tool registry unavailable — reporting own tools only",
             exc_info=True,
         )
-        return [
-            {"name": name, "description": desc, "origin": "filament"}
-            if desc
-            else {"name": name, "origin": "filament"}
-            for name, desc in sorted(descriptions.items())
-        ]
+        fallback_health = derive_tool_health("filament", {}, filament_connected)
+        entries = []
+        for name, desc in sorted(descriptions.items()):
+            entry = {"name": name, "origin": "filament"}
+            if desc:
+                entry["description"] = desc
+            if fallback_health is not None:
+                entry["health"] = fallback_health
+            entries.append(entry)
+        return entries
+
+
+def _mcp_server_statuses() -> dict[str, Any]:
+    """Per-server MCP connection status keyed by server name; ``{}`` if none.
+
+    ``get_mcp_status`` is Hermes-core banner plumbing — treat it as optional.
+    A Hermes without it (or with no MCP servers configured) just produces
+    health-less entries for foreign toolsets.
+    """
+    try:
+        from tools.mcp_tool import get_mcp_status  # noqa: PLC0415
+
+        return {
+            str(row.get("name")): row
+            for row in get_mcp_status()
+            if isinstance(row, dict) and row.get("name")
+        }
+    except Exception:
+        return {}
 
 
 def _register_capability_gate(ctx: Any) -> None:

@@ -525,3 +525,74 @@ def test_filament_api_config_and_tools_requests():
     assert seen[0]["body"] is None
     assert seen[1]["body"] == {"config": {}, "base_revision": 0}
     assert seen[2]["body"] == {"tools": [{"name": "x"}]}
+
+
+# ── Tool health derivation ───────────────────────────────────────────
+
+
+def test_health_filament_toolset_follows_session_state():
+    assert (
+        server_config.derive_tool_health("filament", {}, True)
+        == server_config.TOOL_HEALTH_OK
+    )
+    assert (
+        server_config.derive_tool_health("filament", {}, False)
+        == server_config.TOOL_HEALTH_DISCONNECTED
+    )
+    # No API handle → no signal, not "healthy".
+    assert server_config.derive_tool_health("filament", {}, None) is None
+
+
+def test_health_mcp_toolset_maps_server_status():
+    statuses = {
+        "linear": {"name": "linear", "connected": True, "status": "connected"},
+        "gh": {"name": "gh", "connected": False, "status": "failed", "error": "boom"},
+    }
+    assert (
+        server_config.derive_tool_health("mcp-linear", statuses, None)
+        == server_config.TOOL_HEALTH_OK
+    )
+    assert (
+        server_config.derive_tool_health("mcp-gh", statuses, None)
+        == server_config.TOOL_HEALTH_DISCONNECTED
+    )
+
+
+def test_health_mcp_auth_flavored_error_reads_as_needs_reauth():
+    for error in (
+        "HTTP 401 Unauthorized",
+        "OAuth token expired",
+        "server requires re-authentication",
+        "invalid_grant",
+    ):
+        statuses = {
+            "cal": {
+                "name": "cal",
+                "connected": False,
+                "status": "failed",
+                "error": error,
+            }
+        }
+        assert (
+            server_config.derive_tool_health("mcp-cal", statuses, None)
+            == server_config.TOOL_HEALTH_NEEDS_REAUTH
+        ), error
+
+
+def test_health_mcp_disabled_and_connecting_read_as_disconnected():
+    for status in ("disabled", "connecting", "configured"):
+        statuses = {"s": {"name": "s", "connected": False, "status": status}}
+        assert (
+            server_config.derive_tool_health("mcp-s", statuses, None)
+            == server_config.TOOL_HEALTH_DISCONNECTED
+        ), status
+
+
+def test_health_unknown_server_and_inprocess_toolsets_have_no_signal():
+    # Server missing from the status map (older Hermes, race with registration).
+    assert server_config.derive_tool_health("mcp-ghost", {}, None) is None
+    # Malformed status row.
+    assert server_config.derive_tool_health("mcp-bad", {"bad": "nope"}, None) is None
+    # In-process toolsets (builtins, other plugins' local tools) carry no health.
+    assert server_config.derive_tool_health("memory", {}, True) is None
+    assert server_config.derive_tool_health("hermes", {}, False) is None

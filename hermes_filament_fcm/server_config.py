@@ -70,6 +70,54 @@ SYNC_TTL_SECONDS = 5.0
 # (piggybacked on the adapter's heartbeat timer) is plenty.
 TOOLS_REPORT_INTERVAL_SECONDS = 3600.0
 
+# Health values a reported tool entry can carry (the app's tool-health axis).
+# Derived from live connector state at report time, never stored locally.
+TOOL_HEALTH_OK = "ok"
+TOOL_HEALTH_NEEDS_REAUTH = "needs_reauth"
+TOOL_HEALTH_DISCONNECTED = "disconnected"
+
+# Lower-cased substrings of a server's connect error that mean the fix is
+# re-authentication (expired/rejected OAuth), not a retry or a restart.
+_AUTH_ERROR_MARKERS = (
+    "401",
+    "unauthorized",
+    "authentication",
+    "oauth",
+    "reauth",
+    "invalid_grant",
+    "token",
+)
+
+
+def derive_tool_health(
+    toolset: str,
+    mcp_statuses: dict[str, Any],
+    filament_connected: "bool | None",
+) -> "str | None":
+    """Health of a toolset's tools, or ``None`` when there is no signal.
+
+    Only connector-backed toolsets carry a signal: the plugin's own
+    ``filament`` toolset (rides the shared MCP session) and Hermes MCP
+    servers (registered as toolset ``mcp-<server>``, matched by server name
+    against ``get_mcp_status()`` rows). In-process toolsets return ``None``
+    — absence of a signal, not good health.
+    """
+    if toolset == "filament":
+        if filament_connected is None:
+            return None
+        return TOOL_HEALTH_OK if filament_connected else TOOL_HEALTH_DISCONNECTED
+    if toolset.startswith("mcp-"):
+        status = mcp_statuses.get(toolset[len("mcp-") :])
+        if not isinstance(status, dict):
+            return None
+        if status.get("connected"):
+            return TOOL_HEALTH_OK
+        error = str(status.get("error") or "").lower()
+        if any(marker in error for marker in _AUTH_ERROR_MARKERS):
+            return TOOL_HEALTH_NEEDS_REAUTH
+        return TOOL_HEALTH_DISCONNECTED
+    return None
+
 
 def server_config_disabled() -> bool:
     """True if the ``FILAMENT_SERVER_CONFIG=off`` escape hatch is set.
