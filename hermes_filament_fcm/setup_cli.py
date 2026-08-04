@@ -16,6 +16,7 @@ Usage:
 
 import asyncio
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -58,14 +59,132 @@ def _find_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
+# The plugin id: the install directory under $HERMES_HOME/plugins, the entry in
+# plugins.enabled, and the argument to `hermes plugins update`. LEGACY_ID is what
+# it was called before, which an older install still has enabled.
+PLUGIN_ID = "filament"
+LEGACY_PLUGIN_ID = "filament-fcm"
+
+
+def migrate_enabled(enabled: list) -> list:
+    """Return *enabled* with the legacy id replaced by the current one.
+
+    Order is preserved so an unrelated plugin's position never moves, and the id
+    is not duplicated if both are somehow listed.
+    """
+    out = []
+    for item in enabled:
+        replaced = PLUGIN_ID if item == LEGACY_PLUGIN_ID else item
+        if replaced not in out:
+            out.append(replaced)
+    if PLUGIN_ID not in out:
+        out.append(PLUGIN_ID)
+    return out
+
+
+def legacy_dir_is_ours(path: Path) -> bool:
+    """True if *path* is a directory holding a copy of this plugin.
+
+    The gate on deleting anything. It must be a real directory (not a symlink,
+    which rmtree refuses anyway) containing our package, so a directory that
+    merely happens to sit at the legacy path is left alone.
+    """
+    if path.is_symlink() or not path.is_dir():
+        return False
+    return (path / "hermes_filament_fcm").is_dir()
+
+
+def running_from(path: Path) -> bool:
+    """True if this module is being executed out of *path*."""
+    try:
+        Path(__file__).resolve().relative_to(path.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def retire_legacy_plugin_dir() -> bool:
+    """Move an install off the legacy plugin id. True if anything changed.
+
+    Renaming the id installs the plugin at a new path, which leaves the old
+    directory in place — still enabled, and still registering the same platform.
+    Loaded second, it *overwrites* the new plugin's platform entry, so the
+    gateway runs the old adapter with the new plugin's tools. Rewriting
+    plugins.enabled stops it loading, but the directory stays behind and re-arms
+    if anything enables that id again, so deal with the tree too.
+
+    Which way depends on whether a current install exists:
+
+    * none — the legacy tree IS the install, which is what `hermes plugins
+      update` on the old id leaves behind. Renaming it preserves the git remote
+      (so future updates work) and, on POSIX, is safe even when this very code is
+      running out of it: the rename keeps the inode, so already-imported modules
+      stay valid.
+    * one already there — the legacy tree is a leftover, so remove it. Unless we
+      are running out of it, in which case leave it for the next run, which will
+      execute from the new path.
+
+    Only ever the plugin tree. The state directory (~/.hermes/filament-fcm/) is a
+    separate path and keeps its name — see plugin.yaml.
+    """
+    plugins = _find_hermes_home() / "plugins"
+    legacy, current = plugins / LEGACY_PLUGIN_ID, plugins / PLUGIN_ID
+    if not legacy_dir_is_ours(legacy):
+        return False
+
+    if not current.exists():
+        try:
+            shutil.move(str(legacy), str(current))
+        except OSError as exc:
+            print_warning(
+                f"Could not move {legacy} to {current} ({exc}). Re-run the "
+                f"connect command from the Filament app to reinstall."
+            )
+            return False
+        print_info(f"Moved the plugin from {LEGACY_PLUGIN_ID} to {PLUGIN_ID}")
+        return True
+
+    if running_from(legacy):
+        print_info(
+            f"Leaving the old {LEGACY_PLUGIN_ID} directory in place for now — "
+            f"this command is running out of it. It is disabled, and the next "
+            f"run removes it."
+        )
+        return False
+
+    try:
+        shutil.rmtree(legacy)
+    except OSError as exc:
+        print_warning(
+            f"Could not remove the old plugin directory {legacy} ({exc}). "
+            f"Remove it by hand, or it may shadow this install."
+        )
+        return False
+    print_info(f"Retired the old {LEGACY_PLUGIN_ID} plugin directory")
+    return True
+
+
+def migrate_legacy_install() -> None:
+    """Enable the current plugin id, then move the tree off the legacy one.
+
+    Config first. Either order closes the window where both ids are enabled,
+    because the gateway only reads config when it starts — but only this order
+    is safe if the second step never happens. Once config names the current id
+    the installed plugin loads; a tree left behind is disabled and inert, whereas
+    a tree removed before config is rewritten leaves nothing loadable at all.
+    """
+    _enable_plugin()
+    retire_legacy_plugin_dir()
+
+
 def _enable_plugin() -> None:
-    """Add 'filament-fcm' to plugins.enabled in config.yaml."""
+    """Enable the plugin in config.yaml, migrating off the legacy id."""
     config_path = _find_hermes_home() / "config.yaml"
 
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("plugins:\n  enabled:\n  - filament-fcm\n")
-        print_info(f"Created {config_path} with filament-fcm enabled")
+        config_path.write_text(f"plugins:\n  enabled:\n  - {PLUGIN_ID}\n")
+        print_info(f"Created {config_path} with {PLUGIN_ID} enabled")
         return
 
     with open(config_path) as f:
@@ -75,17 +194,20 @@ def _enable_plugin() -> None:
     enabled = plugins.get("enabled")
     if not isinstance(enabled, list):
         enabled = []
-    if "filament-fcm" in enabled:
-        print_info("Plugin filament-fcm is already enabled")
+
+    migrated = migrate_enabled(enabled)
+    if migrated == enabled:
+        print_info(f"Plugin {PLUGIN_ID} is already enabled")
         return
 
-    enabled.append("filament-fcm")
-    plugins["enabled"] = enabled
-
+    plugins["enabled"] = migrated
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
 
-    print_info(f"Enabled filament-fcm in {config_path}")
+    if LEGACY_PLUGIN_ID in enabled:
+        print_info(f"Renamed {LEGACY_PLUGIN_ID} to {PLUGIN_ID} in {config_path}")
+    else:
+        print_info(f"Enabled {PLUGIN_ID} in {config_path}")
 
 
 # JSON-RPC codes from the agents MCP. -32002: token valid but the account
@@ -377,10 +499,14 @@ def _persist(token: str, url: str, principal_id: str | None) -> None:
         elif len(users) > 1:
             print_info(f"Kept {len(users) - 1} additional control-plane user(s)")
     else:
-        remove_env_value("FILAMENT_CONTROL_USERS")
+        # Left as it was, deliberately. get_self can succeed and still omit
+        # owner metadata, so this is not an auth failure — and clearing the
+        # allowlist would revoke the owner and every teammate on what the user
+        # sees as a successful connect.
         print_warning(
-            "Could not determine the principal (owner) from the token. Run "
-            "`hermes pairing approve` once, or set FILAMENT_CONTROL_USERS."
+            "Could not determine the principal (owner) from the token, so "
+            "FILAMENT_CONTROL_USERS was left unchanged. Run `hermes pairing "
+            "approve` once, or set it manually."
         )
 
 
@@ -462,14 +588,15 @@ def connect(
     ).strip().rstrip("/")
 
     print_header("Filament (FCM)")
-    _enable_plugin()
 
-    # Validate before writing anything, so a bad token leaves a working
-    # configuration intact.
+    # Validate before touching anything. A rejected or abandoned token must
+    # leave the existing configuration working — and the migration below
+    # relocates a directory, which is not something to do on a guess.
     ready, principal_id = _wait_for_finalization(token, resolved)
     if not ready:
         return 1
 
+    migrate_legacy_install()
     _persist(token, resolved, principal_id)
     print_success("Connected. Configuration saved.")
 
@@ -544,7 +671,7 @@ def main() -> None:
     print()
     print_header("filament-fcm-setup")
 
-    _enable_plugin()
+    migrate_legacy_install()
     print()
     ready = _run_interactive_setup()
     print()

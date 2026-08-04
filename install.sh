@@ -21,7 +21,7 @@
 #
 # This plugin installs as a Hermes *directory plugin*: its Python dependencies
 # go into the Hermes venv, and the plugin code is git-cloned into
-# $HERMES_HOME/plugins/filament-fcm so `hermes plugins list/update/enable` work.
+# $HERMES_HOME/plugins/filament so `hermes plugins list/update/enable` work.
 # `hermes plugins update` refreshes the code only; a dependency bump (rare)
 # means re-running this command, which the plugin's dep-check will prompt for.
 set -euo pipefail
@@ -220,19 +220,23 @@ else
 fi
 
 # --- Install the plugin (as a Hermes directory plugin) -----------------------
-# Clone the plugin into $HERMES_HOME/plugins/filament-fcm, where Hermes
-# discovers it via its plugin.yaml + __init__.py. A real clone (not a copy)
-# leaves a git remote, so `hermes plugins update filament-fcm` can `git pull`
-# later — the whole point of installing this way.
+# Clone the plugin into $HERMES_HOME/plugins/$PLUGIN_ID, where Hermes discovers
+# it via its plugin.yaml + __init__.py. A real clone (not a copy) leaves a git
+# remote, so `hermes plugins update $PLUGIN_ID` can `git pull` later — the whole
+# point of installing this way.
 #
 # Clone into a temp dir first and only swap it into place once complete, so a
 # failed clone/checkout never leaves the machine with the old plugin removed and
 # nothing to replace it.
 GIT="$(command -v git 2>/dev/null || true)"
 [ -n "$GIT" ] || err "git not found — needed to install the plugin."
-PLUGIN_DIR="$HERMES_HOME/plugins/filament-fcm"
+# Keep in sync with `name` in plugin.yaml and PLUGIN_ID in setup_cli.py.
+PLUGIN_ID=filament
+LEGACY_PLUGIN_ID=filament-fcm
+PLUGIN_DIR="$HERMES_HOME/plugins/$PLUGIN_ID"
+LEGACY_PLUGIN_DIR="$HERMES_HOME/plugins/$LEGACY_PLUGIN_ID"
 mkdir -p "$HERMES_HOME/plugins"
-CLONE_TMP="$(mktemp -d "$HERMES_HOME/plugins/.filament-fcm.XXXXXX")" \
+CLONE_TMP="$(mktemp -d "$HERMES_HOME/plugins/.$PLUGIN_ID.XXXXXX")" \
   || err "could not create a temp dir under $HERMES_HOME/plugins."
 cleanup_clone_tmp() { rm -rf "$CLONE_TMP" 2>/dev/null || true; }
 trap cleanup_clone_tmp EXIT
@@ -333,6 +337,19 @@ if [ -d "$PLUGIN_DIR" ]; then
 fi
 mv "$CLONE_TMP" "$PLUGIN_DIR" || err "could not move the plugin into $PLUGIN_DIR."
 trap - EXIT
+
+# An install made under the old plugin id is retired by the setup step below,
+# not here. It rewrites plugins.enabled onto the new id and then removes the old
+# directory, in that order — so if setup never gets that far, config still names
+# the old id and the old directory is still there to serve it. Removing the
+# directory here instead would leave a failed setup with nothing loadable: new
+# tree installed but disabled, old tree gone.
+#
+# That removal also clears the stale entry point an older install left behind:
+# this script used to generate $LEGACY_PLUGIN_DIR/__init__.py, leaving it
+# untracked, and `hermes plugins update` is `git pull --ff-only`, which refuses to
+# overwrite an untracked file now that the file is committed. Nobody has to delete
+# it by hand.
 
 "$UV" pip uninstall hermes-filament-fcm >/dev/null 2>&1 || true
 if [ -n "$LAZY_TARGET" ] && [ -d "$LAZY_TARGET" ]; then

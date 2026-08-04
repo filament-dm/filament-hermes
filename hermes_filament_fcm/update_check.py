@@ -51,7 +51,7 @@ def build_reminder(latest: str, current: str) -> str:
         f"📦 A new version of the Filament↔Hermes plugin is available: "
         f"v{latest} (this agent runs v{current}). To update, run on the "
         f"machine hosting this agent:\n"
-        f"```\nhermes plugins update filament-fcm && hermes gateway restart\n```\n"
+        f"```\nhermes plugins update filament && hermes gateway restart\n```\n"
         f"That pulls the plugin's vendored dependencies along with its code, so "
         f"it is the whole update."
     )

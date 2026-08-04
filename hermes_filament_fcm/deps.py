@@ -51,8 +51,13 @@ OPTIONAL = {"structlog": ">=25.5.0,<26"}
 # plugin tree, vendor/ included, which is the fix when the tree is incomplete.
 # When the problem is instead an out-of-range ambient copy shadowing the
 # vendored one, uninstalling that copy is what hands the vendored tree back.
+#
+# The plugin id is spelled out rather than imported: this module is deliberately
+# stdlib-only (see the docstring) and setup_cli, which owns PLUGIN_ID, pulls in
+# Hermes and PyYAML. Keep it in step with `name` in plugin.yaml — a
+# no-stale-command test guards the pair.
 REFRESH_HINT = (
-    "run `hermes plugins update filament-fcm` (this pulls the plugin's "
+    "run `hermes plugins update filament` (this pulls the plugin's "
     "vendored dependencies too) and restart the gateway; if a separately "
     "pip-installed copy of the dependency is shadowing the vendored one, "
     "uninstall it"

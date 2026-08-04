@@ -47,7 +47,7 @@ from .reactive import (
     current_capabilities,
     current_zone,
 )
-from .setup_cli import _enable_plugin, _run_interactive_setup
+from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -182,7 +182,7 @@ def interactive_setup() -> None:
 
     Delegates to ``setup_cli`` which owns the shared implementation.
     """
-    _enable_plugin()
+    migrate_legacy_install()
     _run_interactive_setup()
 
 
@@ -212,13 +212,18 @@ def register(ctx: Any) -> None:
     # established later in adapter.connect().
     api = FilamentAPI(mcp_url, mcp_token)
 
+    # The PLATFORM keeps the name it has always had. It is the key for
+    # platform_toolsets, `hermes gateway status` and the gateway's own per-
+    # platform state, so renaming it would strand all three on an existing
+    # install for no gain. Only the PLUGIN id changed (to `filament`, see
+    # plugin.yaml); plugin_name below is that id.
     ctx.register_platform(
         name="filament-fcm",
         label="Filament (FCM)",
         adapter_factory=lambda cfg: FCMFilamentAdapter(cfg, filament_api=api),
         check_fn=check_requirements,
         setup_fn=interactive_setup,
-        plugin_name="filament-fcm",
+        plugin_name=PLUGIN_ID,
         required_env=[
             "FILAMENT_MCP_TOKEN",
         ],

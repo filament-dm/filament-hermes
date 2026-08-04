@@ -46,5 +46,5 @@ images the venv the gateway imports from is not writable by the gateway anyway.
 To update:
 
 ```
-hermes plugins update filament-fcm && hermes gateway restart
+hermes plugins update filament && hermes gateway restart
 ```

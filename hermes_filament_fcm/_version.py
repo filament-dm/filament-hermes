@@ -10,7 +10,7 @@ Version resolution order (``plugin_version``):
 
 1. The ``pyproject.toml`` shipped alongside this code (the plugin's own
    directory). This is the source of truth for a **directory install**
-   (git-cloned into ~/.hermes/plugins/filament-fcm): ``hermes plugins update``
+   (git-cloned into ~/.hermes/plugins/filament): ``hermes plugins update``
    git-pulls that tree, so reading the version from it means the reported
    version tracks the code that is actually running — unlike
    ``importlib.metadata``, which would report a stale/absent pip dist-info.
