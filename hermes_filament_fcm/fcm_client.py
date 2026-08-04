@@ -28,12 +28,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, ClassVar
 
 # NOTE: firebase-messaging is imported lazily (inside checkin_or_register),
-# not at module top level. This plugin is installed as a directory plugin
-# whose Python dependencies are installed separately (see install.sh); the
-# runtime dep-check in ``__init__._dep_problem`` turns a missing/outdated
-# firebase-messaging into an actionable message BEFORE we reach this import,
-# instead of a raw ImportError at plugin load. Keep firebase out of the
-# import path that ``register()`` triggers.
+# not at module top level. It resolves from the plugin's vendored tree or from
+# an ambient copy (see the root ``__init__.py``); the runtime dep-check in
+# ``deps.dep_problem`` turns a missing/outdated firebase-messaging into an
+# actionable message BEFORE we reach this import, instead of a raw ImportError
+# at plugin load. Keep firebase out of the import path that ``register()``
+# triggers.
 from .credentials import CredentialStore, ReceivedPersistentIds
 from .observability import fingerprint, get_logger, new_id
 

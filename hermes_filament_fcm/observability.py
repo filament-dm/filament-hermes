@@ -1,13 +1,13 @@
 """Structured logging helpers for the Filament Hermes plugin.
 
-``structlog`` is a real dependency (see pyproject / install.sh), but it is
-imported **defensively** here: this module is pulled in at plugin-load time (the
-adapter and fcm_client create a module-level logger), so a hard ``import
-structlog`` would make the whole plugin fail to load if the dependency is ever
-missing — e.g. after a code-only ``hermes plugins update`` that pulled new code
-before the deps were refreshed. Instead we fall back to a small stdlib-logging
-shim so the gateway keeps running with (plainer) logs; ``deps.py`` nudges the
-principal to refresh dependencies to restore full structured logging.
+``structlog`` is a real dependency (declared in pyproject, shipped in the
+plugin's vendor/ tree), but it is imported **defensively** here: this module is
+pulled in at plugin-load time (the adapter and fcm_client create a module-level
+logger), so a hard ``import structlog`` would make the whole plugin fail to load
+if the dependency is ever missing — an incomplete plugin tree, or a checkout run
+without its environment. Instead we fall back to a small stdlib-logging shim so
+the gateway keeps running with (plainer) logs; ``deps.py`` nudges the principal
+with what to fix to restore full structured logging.
 """
 
 from __future__ import annotations

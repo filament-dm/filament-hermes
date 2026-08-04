@@ -1,16 +1,23 @@
 """Runtime dependency check (stdlib-only, unit-testable).
 
 This plugin is installed as a *directory plugin* (git-cloned into
-``~/.hermes/plugins/``); its Python dependencies are installed separately by
-``install.sh`` and are NOT re-installed by ``hermes plugins update`` (which only
-git-pulls the plugin code). Most releases are code-only, so that's fine — but a
-release that bumps a dependency needs the dep refreshed out of band.
+``~/.hermes/plugins/``) and carries its Python dependencies in its own
+``vendor/`` tree, which the root ``__init__.py`` puts on ``sys.path``. So
+``hermes plugins update`` — a git pull of the plugin tree — refreshes code and
+dependencies together, and there is no separate dependency step to forget.
 
-``dep_problem()`` makes that legible: it verifies ``firebase-messaging`` is
-importable and within the required version range, and returns a human-readable
-remediation string when it isn't (or ``None`` when all is well). The plugin
-wires this into ``check_requirements`` so a stale/missing dep surfaces as an
-actionable message instead of a raw ``ImportError`` at gateway start.
+What can still go wrong is an environment mismatch: an ambient copy of a
+dependency outranks the vendored one (deliberately — see the root
+``__init__.py``), and it may be older than this release needs. The vendored tree
+can also be missing outright, from a partial clone or a hand-assembled plugin
+directory.
+
+``dep_problem()`` makes either case legible: it verifies ``firebase-messaging``
+is importable and within the required version range, and returns a
+human-readable remediation string when it isn't (or ``None`` when all is well).
+The plugin wires this into ``check_requirements`` so a stale/missing dep
+surfaces as an actionable message instead of a raw ``ImportError`` at gateway
+start.
 
 Importing ``firebase_messaging`` here also pulls its compiled stack
 (aiohttp / cryptography / protobuf), so a single guarded import covers the
@@ -40,11 +47,15 @@ REQUIRED = {"firebase-messaging": ">=0.4.5,<1"}
 # plain stdlib logging when it's absent).
 OPTIONAL = {"structlog": ">=25.5.0,<26"}
 
-# How the operator refreshes deps when a release bumps them (rare). install.sh
-# is idempotent and re-installs the current deps.
+# How the operator gets back to a good state. `plugins update` re-pulls the
+# plugin tree, vendor/ included, which is the fix when the tree is incomplete.
+# When the problem is instead an out-of-range ambient copy shadowing the
+# vendored one, uninstalling that copy is what hands the vendored tree back.
 REFRESH_HINT = (
-    "re-run the Filament install command from the app (it refreshes "
-    "dependencies), then restart the gateway"
+    "run `hermes plugins update filament-fcm` (this pulls the plugin's "
+    "vendored dependencies too) and restart the gateway; if a separately "
+    "pip-installed copy of the dependency is shadowing the vendored one, "
+    "uninstall it"
 )
 
 

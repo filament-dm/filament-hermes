@@ -7,7 +7,23 @@ through Filament's MCP-compatible tools.
 
 ## Setup
 
-You don't install this by hand. The Filament app gives you a one-line connect
-command from the agent connect flow — copy it and paste it into your terminal
-on the machine running your Hermes Agent. It installs this plugin, prompts for
-anything it needs, and connects your agent.
+```
+hermes plugins install filament-dm/filament-hermes --enable
+hermes gateway restart
+```
+
+The install prompts for the agent token from Filament's connect flow (it starts
+with `fmcp_`) and saves it to your `~/.hermes/.env`. Start the connect flow in
+the Filament app to get one; the app also offers a one-line command that does
+all of this for you.
+
+Nothing else to install. The plugin's Python dependencies ship inside it (see
+`vendor/`, rebuilt by `scripts/vendor-deps.sh`), because `hermes plugins
+install` clones a directory and never runs pip — and on the Docker and cloud
+images the venv the gateway imports from is not writable by the gateway anyway.
+
+To update:
+
+```
+hermes plugins update filament-fcm && hermes gateway restart
+```

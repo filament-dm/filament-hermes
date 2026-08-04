@@ -5,6 +5,9 @@ description = "Hermes gateway adapter for Filament"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
+# Also the source of truth for what scripts/vendor-deps.sh puts in vendor/, and
+# what deps.py checks at runtime. httpx is a Hermes core dependency, so it is
+# declared but not vendored; the other two are (see the root __init__.py).
 dependencies = [
     "firebase-messaging>=0.4.5,<1",
     "httpx>=0.24",
@@ -22,12 +25,13 @@ filament-fcm-setup = "hermes_filament_fcm.setup_cli:main"
 
 # NOTE: no ``[project.entry-points."hermes_agent.plugins"]`` here.
 # This plugin installs as a *directory plugin* (git-cloned into
-# ~/.hermes/plugins/filament-fcm by install.sh), discovered via its root
-# plugin.yaml + __init__.py — NOT as a pip entry-point plugin. Registering an
-# entry point too would shadow the directory copy (entry points win the
-# loader's dedup), so `hermes plugins update` would git-pull code that never
-# runs. Keep this out. The package's own dependencies are still declared above
-# so install.sh can install them; the package itself is not installed.
+# ~/.hermes/plugins/filament-fcm by `hermes plugins install`), discovered via
+# its root plugin.yaml + __init__.py — NOT as a pip entry-point plugin.
+# Registering an entry point too would shadow the directory copy (entry points
+# win the loader's dedup), so `hermes plugins update` would git-pull code that
+# never runs. Keep this out. The dependencies above are still declared for the
+# benefit of the vendoring script and the runtime dep check; the package itself
+# is not pip-installed.
 
 [build-system]
 requires = ["hatchling"]
@@ -35,6 +39,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_filament_fcm"]
+
+[tool.ruff]
+# vendor/ is third-party code unpacked from PyPI wheels, byte-for-byte. Linting
+# it reports 292 findings about other people's code, and "fixing" any of them
+# would make the tree diverge from the wheel scripts/vendor-deps.sh rebuilds.
+extend-exclude = ["vendor"]
 
 [tool.ruff.lint]
 select = [
