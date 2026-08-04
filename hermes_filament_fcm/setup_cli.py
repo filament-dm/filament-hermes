@@ -215,6 +215,11 @@ def _enable_plugin() -> None:
 # flow). Anything else (e.g. -32001) means the token isn't usable.
 _RESERVED_CODE = -32002
 
+# How long to keep trying an endpoint that never answers before giving up.
+# Generous, because a laptop waking from sleep or a VPN reconnecting can take
+# tens of seconds and neither means the URL is wrong.
+UNREACHABLE_BUDGET_S = 60.0
+
 
 def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     """Block until the agent is finalized in the Filament app.
@@ -230,9 +235,26 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
 
     While the agent is reserved, ``get_self`` returns -32002; we show a
     one-time nudge and keep polling, so the flow connects automatically
-    once the user finishes naming the agent.  Transient errors (transport
-    failures, HTTP 500, non-dict error responses) are retried — only a
-    well-formed JSON-RPC auth rejection (-32001) aborts.
+    once the user finishes naming the agent.
+
+    That reserved wait is deliberately **unbounded**, and it is the reason this
+    loop looks so patient. It is paced by a human: the documented flow is to run
+    connect and *then* go and name the agent in the app (see after-install.md), so
+    minutes are normal and a timeout here would break the feature.
+
+    Being unreachable is different, and is **bounded** at
+    ``UNREACHABLE_BUDGET_S``. A mistyped URL, a dead host or a TLS failure will
+    not resolve itself no matter how long we wait, and an indefinite hang is the
+    worst possible report of it — the user cannot tell it apart from the patient
+    case above. Any reply at all resets that budget, because a reply proves the
+    endpoint is right, so a network blip during a long legitimate wait cannot
+    trip it.
+
+    An endpoint that answers but errs — HTTP 500, a non-dict error, an unknown
+    JSON-RPC code — is still retried forever. Reachability says the URL is
+    correct, so the sane assumption is a server that will recover. Only a
+    well-formed auth rejection (-32001) means the token itself is bad, and that
+    aborts immediately.
     """
     # Only this specific error code means the token itself is bad and
     # retrying won't help. Everything else is transient or reserved.
@@ -241,13 +263,35 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     async def _poll() -> tuple[bool, str | None]:
         api = FilamentAPI(url, token)
         nudged = False
+        # When the endpoint cannot be reached AT ALL, give up after this long.
+        # Waiting out the reserved window is unbounded on purpose (see the
+        # docstring); waiting on an endpoint that never answers is not, because a
+        # typo, a dead host or a TLS failure will not fix itself and an indefinite
+        # hang tells the user nothing. Reset on any reply, so a blip partway
+        # through a legitimate long wait cannot eat the budget and abort it.
+        unreachable_since: float | None = None
         try:
             while True:
                 try:
                     resp = await api.get_self()
-                except Exception:
-                    await asyncio.sleep(3)  # transient transport error — retry
+                except Exception as exc:
+                    now = time.monotonic()
+                    if unreachable_since is None:
+                        unreachable_since = now
+                    elif now - unreachable_since >= UNREACHABLE_BUDGET_S:
+                        detail = str(exc).strip()
+                        print_warning(
+                            f"Could not reach {url} for "
+                            f"{UNREACHABLE_BUDGET_S:.0f}s "
+                            f"({type(exc).__name__}"
+                            f"{': ' + detail if detail else ''}). Check the "
+                            f"endpoint, then re-run with --url."
+                        )
+                        return False, None
+                    await asyncio.sleep(3)
                     continue
+                # It answered, so the endpoint is real — whatever it said.
+                unreachable_since = None
                 err = (resp or {}).get("error")
                 if err is None:
                     # Finalized. Pull the principal (owner) out of the
