@@ -53,7 +53,9 @@ def build_reminder(latest: str, current: str) -> str:
         f"machine hosting this agent:\n"
         f"```\nhermes plugins update filament && hermes gateway restart\n```\n"
         f"That pulls the plugin's vendored dependencies along with its code, so "
-        f"it is the whole update."
+        f"it is the whole update. If it reports any problem, re-run the connect "
+        f"command from the Filament app instead — it replaces the plugin outright "
+        f"rather than updating it in place, so it recovers from any state."
     )
 
 
