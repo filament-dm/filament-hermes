@@ -112,6 +112,20 @@ class _AlwaysWakePolicy:
     def reply_style(self, room_id):
         return "thread"
 
+    def thread_wake(self, room_id):
+        return "engaged"
+
+
+class _NoEngagedThreads:
+    """An engagement store with nothing engaged — keeps the ENG-724 thread
+    follow-up path out of these tests."""
+
+    def is_engaged(self, room_id, thread_root_id):
+        return False
+
+    def record(self, room_id, thread_root_id):
+        pass
+
 
 class _NoopServerConfig:
     """Server-config sync stub: the turn path awaits sync() before reading the
@@ -126,6 +140,8 @@ def _make_adapter():
     a._user_id = _AGENT
     a._cc_room_id = None
     a._wake_policy = _AlwaysWakePolicy()
+    a._engaged_threads = _NoEngagedThreads()
+    a._sender_is_agent_cache = {}
     a._filament_api = None
     a._server_config = _NoopServerConfig()
     a._is_new_event = lambda event_id: True

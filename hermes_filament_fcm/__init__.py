@@ -521,6 +521,9 @@ def _wake_policy_error(policy: dict) -> str | None:
         rs = scope.get("reply_style")
         if rs is not None and rs not in ("thread", "channel"):
             return f"reply_style{where} must be 'thread' or 'channel'."
+        tw = scope.get("thread_wake")
+        if tw is not None and tw not in ("engaged", "off"):
+            return f"thread_wake{where} must be 'engaged' or 'off'."
         te = scope.get("trigger_emojis")
         if te is not None and not (
             isinstance(te, list) and all(isinstance(e, str) for e in te)
@@ -827,8 +830,11 @@ def _register_reactive_tools(
         "reaction), reactive_wake ('mention' | 'all' | 'off'), reply_style "
         "('thread' to thread each reply off the triggering message, the "
         "default | 'channel' to post replies on the main timeline like the "
-        "backchannel), and optional per_channel overrides keyed by room id. "
-        "Backchannel/owner only.",
+        "backchannel), thread_wake ('engaged', the default — a non-agent's "
+        "reply in a thread you were already @-mentioned in counts as a "
+        "mention, so people don't have to re-tag you every turn | 'off' for "
+        "mention-only even there), and optional per_channel overrides keyed "
+        "by room id. Backchannel/owner only.",
         {
             "type": "object",
             "properties": {"policy": {"type": "object"}},

@@ -366,6 +366,27 @@ class FilamentAPI:
                 return err
         return None
 
+    # _post reports transport-shaped failures as a plain string; anything else
+    # reaching result_error came back as a JSON-RPC rejection from the server.
+    _RETRYABLE_ERRORS = frozenset({"invalid response", "HTTP 408", "HTTP 429"})
+
+    @classmethod
+    def is_retryable_error(cls, err: str | None) -> bool:
+        """Whether a ``result_error`` message is worth retrying.
+
+        Only transport-shaped failures are: ``_post`` turns a non-200 into
+        ``"HTTP <code>"`` and an unparseable body into ``"invalid response"``.
+        A server *rejection* arrives as a JSON-RPC error dict instead (the
+        knock 403 → -32602 case); retrying that just repeats a decision the
+        server already made, and buries the real reason in noise. Coupled to
+        ``_post``'s strings by design — both live in this module.
+        """
+        if not err:
+            return False
+        if err in cls._RETRYABLE_ERRORS:
+            return True
+        return err.startswith("HTTP 5")
+
     async def accept_vouch(self, loop_id: str) -> dict[str, Any]:
         """Accept a vouch: knock on the loop so a loop admin can approve the agent."""
         return await self.call_tool("accept_vouch", {"loop_id": loop_id})

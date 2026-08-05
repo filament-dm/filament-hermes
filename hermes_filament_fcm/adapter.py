@@ -57,6 +57,7 @@ from .reactive import (
     FEATURE_ADVANCED_TOOL_CONTROLS,
     CapabilityPolicyStore,
     ChannelInstructionsStore,
+    EngagedThreadStore,
     FeatureFlagStore,
     InstructionsStore,
     WakePolicyStore,
@@ -65,7 +66,9 @@ from .reactive import (
     current_capabilities,
     current_zone,
     guidance_block,
+    is_agent_mention,
     is_system_sender,
+    sender_is_agent_in_thread,
 )
 from .server_config import ServerConfigSync
 from .update_check import UpdateChecker, update_check_disabled
@@ -85,6 +88,12 @@ _PROCESSING_REACTIONS = ("👀",)
 # ENG-429: the JSON-RPC error code agents_mcp returns while an agent is reserved
 # but not finalized (connect token valid, account not created yet).
 _NOT_FINALIZED_CODE = -32002
+
+# accept_vouch retry budget. A vouch that fails to be accepted leaves the loop
+# admin with nothing to approve, so a blip is worth riding out; the waits are
+# linear (2s, 4s) to stay well inside a connect attempt.
+_VOUCH_ACCEPT_ATTEMPTS = 3
+_VOUCH_ACCEPT_BACKOFF_S = 2.0
 
 
 def _is_not_finalized(result: dict | None) -> bool:
@@ -216,6 +225,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # with the set_* tool handlers so write-backs and per-wake applies
         # agree on the remembered revision.
         self._server_config = server_sync or ServerConfigSync(filament_api)
+        # Threads the agent was @-mentioned in — the "already engaged" half of
+        # the engaged-thread wake rule (ENG-724). Recorded on admitted mention
+        # wakes; read fresh per event like the wake policy.
+        self._engaged_threads = EngagedThreadStore()
+        # sender → is-agent, learned from get_thread sender flags. Agent status
+        # is a property of the user and effectively immutable, so cache it for
+        # the process lifetime to keep the engaged-thread gate to one API call
+        # per unknown sender.
+        self._sender_is_agent_cache: dict[str, bool] = {}
 
         self.max_message_length = _MAX_MESSAGE_LENGTH
 
@@ -239,6 +257,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # Agent identity (populated during Stage 1 via get_self MCP tool).
         self._user_id: str | None = None
+
+        # Loops whose vouch is mid-accept. The startup sweep and a live
+        # knock_invite_received push can name the same loop at once (the sweep
+        # now runs with the listener already up), and a duplicate accept_vouch
+        # would knock twice and log a spurious rejection. See _accept_vouch.
+        self._vouch_accepts_in_flight: set[str] = set()
 
         # First-contact greeting state (populated during Stage 1). The server
         # decides whether a hello is due — it appends a one-shot greet
@@ -499,6 +523,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 slog.error("filament_fcm.connect.stage_failed", stage="start_listener")
                 return False
 
+            # Offline catch-up for vouches, after Stage 4 on purpose. Run before
+            # the listener was up and a vouch landing in between was missed by
+            # both paths — no push to receive, mailbox already read — leaving the
+            # admin nothing to approve until the next restart. _accept_vouch
+            # dedupes the overlap this ordering creates instead.
+            await self._accept_pending_vouches()
+
             self._mark_connected()
 
             with bound_context(call_origin="startup"):
@@ -745,10 +776,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # it's been invited to while it was offline.
             await self._accept_pending_invites()
 
-            # Accept any pending vouches so a loop admin can approve the agent
-            # into loops it was vouched for while offline.
-            await self._accept_pending_vouches()
-
             return True
         except Exception:
             logger.exception("filament-fcm: [Stage 1] MCP initialization failed")
@@ -792,15 +819,107 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 "filament-fcm: failed to list pending invites", exc_info=True
             )
 
-    async def _accept_pending_vouches(self) -> None:
-        """Accept all pending vouches via MCP tools.
+    async def _accept_vouch(
+        self, loop_id: str, label: str | None = None, inviter: str | None = None
+    ) -> bool:
+        """Accept one vouch, retrying transient failures. True if it knocked.
 
-        A member vouching the agent into a loop lands a pending vouch in the
-        agent's knock-invite mailbox — not an ``m.room.member`` invite, so
-        ``_accept_pending_invites`` never sees it. Accepting it (``accept_vouch``)
-        knocks on the loop, turning the vouch into a member proposal a loop admin
-        then approves; without this the vouch is invisible to the admin and can
-        never be approved. Failures are logged but do not block startup.
+        Both entry points funnel through here: the startup sweep and the live
+        ``knock_invite_received`` push. Without a retry a single blip left the
+        vouch unaccepted, so no member proposal existed and the loop admin had
+        nothing to approve — indistinguishable to them from never being vouched,
+        and only recoverable by restarting the gateway.
+
+        A server rejection is *not* retried (see
+        ``FilamentAPI.is_retryable_error``); it is a decision, not a blip.
+        """
+        if not self._filament_api:
+            logger.warning("filament-fcm: vouch for %s but API not ready", loop_id)
+            return False
+        name = label or loop_id
+        if loop_id in self._vouch_accepts_in_flight:
+            logger.debug("filament-fcm: vouch for %s already being accepted", name)
+            return False
+        self._vouch_accepts_in_flight.add(loop_id)
+        try:
+            for attempt in range(1, _VOUCH_ACCEPT_ATTEMPTS + 1):
+                last = attempt == _VOUCH_ACCEPT_ATTEMPTS
+                try:
+                    result = await self._filament_api.accept_vouch(loop_id)
+                    err = self._filament_api.result_error(result)
+                    if not err:
+                        logger.info(
+                            "filament-fcm: accepted vouch into %s%s "
+                            "(pending loop-admin approval)",
+                            name,
+                            f" from {inviter}" if inviter else "",
+                        )
+                        return True
+                    if not self._filament_api.is_retryable_error(err) or last:
+                        logger.warning(
+                            "filament-fcm: accept_vouch for %s REJECTED by "
+                            "server after %d attempt(s): %s",
+                            name,
+                            attempt,
+                            err,
+                        )
+                        slog.warning(
+                            "filament_fcm.vouch.accept_failed",
+                            loop_id=loop_id,
+                            attempts=attempt,
+                            error=err,
+                        )
+                        return False
+                    logger.warning(
+                        "filament-fcm: accept_vouch for %s failed transiently "
+                        "(attempt %d/%d): %s",
+                        name,
+                        attempt,
+                        _VOUCH_ACCEPT_ATTEMPTS,
+                        err,
+                    )
+                except Exception:
+                    if last:
+                        logger.warning(
+                            "filament-fcm: accept_vouch for %s failed after "
+                            "%d attempt(s)",
+                            name,
+                            attempt,
+                            exc_info=True,
+                        )
+                        slog.warning(
+                            "filament_fcm.vouch.accept_failed",
+                            loop_id=loop_id,
+                            attempts=attempt,
+                            error="exception",
+                        )
+                        return False
+                    logger.warning(
+                        "filament-fcm: accept_vouch for %s raised "
+                        "(attempt %d/%d), retrying",
+                        name,
+                        attempt,
+                        _VOUCH_ACCEPT_ATTEMPTS,
+                        exc_info=True,
+                    )
+                await asyncio.sleep(_VOUCH_ACCEPT_BACKOFF_S * attempt)
+            return False
+        finally:
+            self._vouch_accepts_in_flight.discard(loop_id)
+
+    async def _accept_pending_vouches(self) -> None:
+        """Accept every pending vouch in the agent's knock-invite mailbox.
+
+        A member vouching the agent into a loop lands a pending vouch in that
+        mailbox — not an ``m.room.member`` invite, so ``_accept_pending_invites``
+        never sees it. Accepting it (``accept_vouch``) knocks on the loop, turning
+        the vouch into a member proposal a loop admin then approves; without this
+        the vouch is invisible to the admin and can never be approved.
+
+        This is the offline catch-up path: a vouch that arrived while the agent
+        was down has no push to replay, and the mailbox is the only record of it.
+        Runs after the listener is live so a vouch landing mid-startup is caught
+        by one path or the other. Failures are logged but never block startup.
         """
         if not self._filament_api:
             return
@@ -817,28 +936,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 loop_id = vouch.get("loop_id") if isinstance(vouch, dict) else vouch
                 if not loop_id:
                     continue
-                try:
-                    result = await self._filament_api.accept_vouch(loop_id)
-                    err = self._filament_api.result_error(result)
-                    if err:
-                        logger.warning(
-                            "filament-fcm: accept_vouch for %s REJECTED by "
-                            "server: %s",
-                            loop_id,
-                            err,
-                        )
-                        continue
-                    logger.info(
-                        "filament-fcm: accepted vouch into %s "
-                        "(pending loop-admin approval)",
-                        loop_id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "filament-fcm: failed to accept vouch into %s",
-                        loop_id,
-                        exc_info=True,
-                    )
+                await self._accept_vouch(loop_id)
         except Exception:
             logger.warning("filament-fcm: failed to list vouches", exc_info=True)
 
@@ -1257,31 +1355,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
 
         async def _accept() -> None:
-            if not self._filament_api:
-                logger.warning("filament-fcm: vouch received but API not ready")
-                return
-            try:
-                result = await self._filament_api.accept_vouch(vouch.loop_id)
-                err = self._filament_api.result_error(result)
-                if err:
-                    logger.warning(
-                        "filament-fcm: accept_vouch for %s REJECTED by "
-                        "server: %s",
-                        vouch.loop_name or vouch.loop_id,
-                        err,
-                    )
-                    return
-                logger.info(
-                    "filament-fcm: accepted vouch into %s from %s "
-                    "(pending loop-admin approval)",
-                    vouch.loop_name or vouch.loop_id,
-                    vouch.inviter,
-                )
-            except Exception:
-                logger.exception(
-                    "filament-fcm: failed to accept vouch into %s",
-                    vouch.loop_id,
-                )
+            await self._accept_vouch(
+                vouch.loop_id,
+                label=vouch.loop_name or vouch.loop_id,
+                inviter=vouch.inviter,
+            )
 
         self._schedule_async(_accept(), "vouch accept")
 
@@ -1419,19 +1497,37 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return
 
         # Reactive plane: wake only if the policy admits this message. A mention
-        # is the server's flag (is_mention_of_recipient / @everyone) first, with
-        # a body text-match as a fallback.
-        mentioned = (
-            msg.is_mention
-            or msg.is_everyone_mention
-            or self._mentions_me(msg.body or "")
+        # is the server's flag (is_mention_of_recipient) first, with a body
+        # text-match as a fallback. @everyone/@here is NOT a mention (see
+        # is_agent_mention): one broadcast must not wake every agent at once.
+        mentioned = is_agent_mention(
+            msg.is_mention,
+            msg.is_everyone_mention,
+            self._mentions_me(msg.body or ""),
         )
-        if not self._wake_policy.should_wake_message(msg.room_id, mentioned):
+        # ENG-724: a NON-AGENT's reply in a thread the agent was already
+        # mentioned in counts as a mention, so a human back-and-forth doesn't
+        # need a re-tag every turn. Order matters for cost and safety: the
+        # local engagement record and the policy knob are checked before the
+        # one API call that classifies the sender, and the sender check fails
+        # closed to "agent" — agents never wake each other without an explicit
+        # @-mention (the storm that reverted filament-hermes#15).
+        thread_follow_up = (
+            not mentioned
+            and self._engaged_threads.is_engaged(msg.room_id, msg.thread_id)
+            and self._wake_policy.thread_wake(msg.room_id) == "engaged"
+            and await self._sender_is_agent(msg) is False
+        )
+        if not self._wake_policy.should_wake_message(
+            msg.room_id, mentioned or thread_follow_up
+        ):
             logger.info(
                 "filament-fcm: skipping message in %s (wake policy: not woken; "
-                "mention=%s)",
+                "mention=%s, everyone=%s, thread_follow_up=%s)",
                 msg.room_name,
                 mentioned,
+                msg.is_everyone_mention,
+                thread_follow_up,
             )
             slog.info(
                 "filament_fcm.turn.skipped",
@@ -1440,6 +1536,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 mentioned=mentioned,
             )
             return
+
+        # Remember the thread this admitted wake engages: the mention's own
+        # thread root, or — for a top-level mention — its event id, which IS
+        # the thread root once replies thread off it. A follow-up wake
+        # re-records to refresh the thread's eviction slot.
+        if mentioned or thread_follow_up:
+            self._engaged_threads.record(
+                msg.room_id, msg.thread_id or msg.event_id
+            )
 
         # The push never includes attachments (ENG-603): describe any media on
         # the event so the agent knows it exists. Only for admitted wakes, so
@@ -1507,6 +1612,44 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             "set" if crumb else "none",
         )
         return crumb
+
+    async def _sender_is_agent(self, msg: PushMessage) -> bool | None:
+        """Whether the message's sender is an agent (bot) — the storm-guard
+        input for engaged-thread wakes (ENG-724).
+
+        The push payload carries no such flag, so read it from the thread via
+        ``get_thread``, whose messages each carry the server-computed
+        ``is_from_agent``. One call per unknown sender: the answer is cached
+        for the process lifetime (agent status is a property of the user).
+        Returns ``None`` when unclassifiable (API failure, sender not found in
+        the thread) — the caller treats that as "agent" and stays asleep,
+        because waking on an unknown sender is what re-opens the agent storm.
+        """
+        if msg.sender in self._sender_is_agent_cache:
+            return self._sender_is_agent_cache[msg.sender]
+        if not self._filament_api or not msg.thread_id:
+            return None
+        try:
+            raw = await self._filament_api.get_thread(msg.thread_id)
+            parsed = FilamentAPI.parse_tool_result(raw)
+        except Exception:
+            logger.warning(
+                "filament-fcm: get_thread failed classifying sender %s in %s",
+                msg.sender,
+                msg.room_id,
+                exc_info=True,
+            )
+            return None
+        verdict = sender_is_agent_in_thread(parsed, msg.event_id, msg.sender)
+        if verdict is not None:
+            self._sender_is_agent_cache[msg.sender] = verdict
+        logger.info(
+            "filament-fcm: sender %s classified is_agent=%s (thread %s)",
+            msg.sender,
+            verdict,
+            msg.thread_id,
+        )
+        return verdict
 
     async def _handle_control_message(self, msg: PushMessage) -> None:
         """Backchannel (control plane): the principal commands the agent

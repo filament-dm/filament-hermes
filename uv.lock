@@ -911,7 +911,7 @@ wheels = [
 
 [[package]]
 name = "hermes-filament-fcm"
-version = "0.6.0"
+version = "0.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "firebase-messaging" },

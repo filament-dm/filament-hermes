@@ -531,6 +531,114 @@ def test_guidance_block_empty_and_verbatim():
     assert block.startswith("[YOUR GUIDANCE FOR THIS CHANNEL]\n")
     # The principal's text rides verbatim — no reformatting, no interpolation.
     assert block.endswith("Answer in French.\nKeep replies short.")
+# ── Engaged-thread wake (ENG-724) ───────────────────────────────────
+
+
+def test_thread_wake_defaults_engaged_with_overrides():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        # Default on: follow-ups in mentioned threads count as mentions.
+        assert wp.thread_wake("!room") == "engaged"
+        wp.write(
+            {
+                "thread_wake": "off",
+                "per_channel": {"!chatty": {"thread_wake": "engaged"}},
+            }
+        )
+        assert wp.thread_wake("!room") == "off"
+        assert wp.thread_wake("!chatty") == "engaged"
+        # An unrecognized value fails safe to the default.
+        wp.write({"thread_wake": "banana"})
+        assert wp.thread_wake("!room") == "engaged"
+
+
+def test_engaged_thread_store_roundtrip():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.EngagedThreadStore(Path(d) / "threads.json")
+        assert store.is_engaged("!room", "$root") is False
+        store.record("!room", "$root")
+        assert store.is_engaged("!room", "$root") is True
+        # Same root in a different room is a different thread.
+        assert store.is_engaged("!other", "$root") is False
+        # A fresh instance reads the same file (survives restarts).
+        again = reactive.EngagedThreadStore(Path(d) / "threads.json")
+        assert again.is_engaged("!room", "$root") is True
+        # None/empty roots (top-level messages) never count as engaged.
+        assert store.is_engaged("!room", None) is False
+        assert store.is_engaged("!room", "") is False
+
+
+def test_engaged_thread_store_evicts_oldest():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.EngagedThreadStore(Path(d) / "threads.json")
+        store._MAX_ENTRIES = 3
+        for i in range(4):
+            store.record("!room", f"$t{i}")
+        # Oldest evicted, newest three kept.
+        assert store.is_engaged("!room", "$t0") is False
+        assert all(store.is_engaged("!room", f"$t{i}") for i in (1, 2, 3))
+        # Re-recording refreshes a thread's slot, so an active conversation
+        # outlives newer one-off mentions.
+        store.record("!room", "$t1")
+        store.record("!room", "$t4")
+        assert store.is_engaged("!room", "$t1") is True
+        assert store.is_engaged("!room", "$t2") is False
+
+
+def test_engaged_thread_store_fails_closed_on_corrupt_file():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "threads.json"
+        path.write_text("{not json", encoding="utf-8")
+        store = reactive.EngagedThreadStore(path)
+        # Unreadable state must mean "no engaged threads", never a crash.
+        assert store.is_engaged("!room", "$root") is False
+        # And recording over it recovers.
+        store.record("!room", "$root")
+        assert store.is_engaged("!room", "$root") is True
+
+
+def test_sender_is_agent_in_thread_prefers_event_match():
+    thread = {
+        "root": {"event_id": "$root", "sender": "@human:x", "is_from_agent": False},
+        "replies": [
+            {"event_id": "$r1", "sender": "@bot:x", "is_from_agent": True},
+            {"event_id": "$r2", "sender": "@human:x", "is_from_agent": False},
+        ],
+    }
+    assert reactive.sender_is_agent_in_thread(thread, "$r1", "@bot:x") is True
+    assert reactive.sender_is_agent_in_thread(thread, "$r2", "@human:x") is False
+
+
+def test_sender_is_agent_in_thread_falls_back_to_sender():
+    # The triggering event may not be in the get_thread window yet (persistence
+    # race, >200-reply thread) — an earlier message by the same sender decides.
+    thread = {
+        "root": {"event_id": "$root", "sender": "@human:x", "is_from_agent": False},
+        "replies": [{"event_id": "$r1", "sender": "@bot:x", "is_from_agent": True}],
+    }
+    assert reactive.sender_is_agent_in_thread(thread, "$missing", "@bot:x") is True
+    assert reactive.sender_is_agent_in_thread(thread, "$missing", "@human:x") is False
+
+
+def test_sender_is_agent_in_thread_unknown_is_none():
+    thread = {
+        "root": {"event_id": "$root", "sender": "@human:x", "is_from_agent": False},
+        "replies": [],
+    }
+    # A sender never seen in the thread is unclassifiable — the adapter treats
+    # None as "agent" (fail closed, no wake).
+    assert reactive.sender_is_agent_in_thread(thread, "$new", "@stranger:x") is None
+    # Malformed payloads are unclassifiable too, never a crash.
+    assert reactive.sender_is_agent_in_thread(None, "$e", "@s:x") is None
+    assert reactive.sender_is_agent_in_thread({"error": "nope"}, "$e", "@s:x") is None
+    assert (
+        reactive.sender_is_agent_in_thread(
+            {"root": {"event_id": "$e", "sender": "@s:x", "is_from_agent": "yes"}},
+            "$e",
+            "@s:x",
+        )
+        is None
+    )
 
 
 def _run() -> None:

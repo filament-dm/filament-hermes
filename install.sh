@@ -153,12 +153,37 @@ if [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = "1" ] || [ "$VENV" = /opt/hermes/.ven
   SEALED=1
 fi
 
+# A writable site-packages is not enough: a venv can be writable at the top
+# while individual package directories inside it are not. Agent37's
+# agent37-hermes image is built that way — ~22 packages ship their
+# __pycache__ as root:root 0755 inside a tree the runtime user owns
+# otherwise. Upgrading such a package means *removing* its old __pycache__,
+# which fails EACCES and takes the whole install down. Probe one glob level
+# for a __pycache__ we can't write, and treat that venv as sealed too.
+# POSIX-only ([ -w ] rather than find -writable) so this holds on macOS.
+if [ "$SEALED" = 0 ] && [ -n "$SITE" ]; then
+  for _pycache in "$SITE"/*/__pycache__; do
+    [ -d "$_pycache" ] || continue
+    if [ ! -w "$_pycache" ]; then
+      info "Hermes venv at $VENV has unwritable package dirs (e.g. $_pycache)."
+      SEALED=1
+      break
+    fi
+  done
+fi
+
 # The image sets HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages; default
 # to that under a stripped environment. The supervised gateway activates the
 # dir from its own (image) environment, so packages installed there are seen.
 LAZY_TARGET="${HERMES_LAZY_INSTALL_TARGET:-}"
 if [ -z "$LAZY_TARGET" ] && [ "$VENV" = /opt/hermes/.venv ] && [ -d /opt/data ]; then
   LAZY_TARGET=/opt/data/lazy-packages
+fi
+# Images that seal their venv without advertising a lazy target (agent37's,
+# via the probe above) leave us to pick one. $HERMES_HOME is the durable,
+# user-owned tree the gateway already reads its config and .env from.
+if [ -z "$LAZY_TARGET" ] && [ "$SEALED" = 1 ]; then
+  LAZY_TARGET="$HERMES_HOME/lazy-packages"
 fi
 TARGET_ARGS=()
 PYPATH_PREFIX=""
@@ -167,6 +192,27 @@ if [ "$SEALED" = 1 ] && [ -n "$LAZY_TARGET" ]; then
   info "Hermes venv at $VENV is sealed — installing dependencies into $LAZY_TARGET ..."
   TARGET_ARGS=(--target "$LAZY_TARGET")
   PYPATH_PREFIX="$LAZY_TARGET"
+  # PYPATH_PREFIX only reaches the setup wizard we run below (via PYTHONPATH).
+  # The *gateway* starts from its own environment, so unless the image
+  # activates the dir itself — which the ones setting HERMES_LAZY_INSTALL_TARGET
+  # do, and the ones we guessed a target for do not — it starts without our
+  # dependencies and loads no messaging platform. A .pth in site-packages
+  # covers that: it needs site-packages writable, which is exactly the case
+  # this branch now also serves (writable venv, unwritable packages).
+  #
+  # An "import"-prefixed .pth line is executed, so this *prepends* — plain
+  # path lines are appended, which would let a stale copy of a dependency
+  # already in the venv win over the version we just installed.
+  if [ -w "$SITE" ]; then
+    if printf 'import sys; sys.path.insert(0, %s)\n' "\"$LAZY_TARGET\"" \
+        > "$SITE/zzz-filament-fcm-lazy-packages.pth" 2>/dev/null; then
+      info "Put $LAZY_TARGET on the gateway's import path."
+    else
+      warn "could not write $SITE/zzz-filament-fcm-lazy-packages.pth — the \
+gateway may not see the dependencies; set HERMES_LAZY_INSTALL_TARGET to a dir \
+it already activates."
+    fi
+  fi
 elif [ "$SEALED" = 1 ]; then
   err "Hermes venv at $VENV is sealed (read-only or lazy installs disabled) and HERMES_LAZY_INSTALL_TARGET is not set — nowhere to install."
 else
