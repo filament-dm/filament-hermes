@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -151,13 +152,23 @@ def capability_hint(allowed: "frozenset[str] | None") -> str:
     Advisory (soft) — it complements, never replaces, the hard ``pre_tool_call``
     gate. ``None`` (ungated control/other turns) → empty string (no hint, full
     access). A frozenset → a bracketed, trusted framing block listing exactly
-    the permitted tools; an empty set says "none" (a pure-observe turn). The
-    text is derived from the principal's policy (trusted), not from event data,
-    so it carries no injection risk. Stdlib-only for unit testing.
+    the permitted tools; a set with nothing beyond ``BASELINE_TOOLS`` (a
+    channel granted no capabilities — ``resolve`` keeps the baseline in every
+    result) says so plainly: orient, but take no channel action. The text is
+    derived from the principal's policy (trusted), not from event data, so it
+    carries no injection risk. Stdlib-only for unit testing.
     """
     if allowed is None:
         return ""
     names = ", ".join(sorted(allowed)) if allowed else "(none)"
+    if allowed and allowed <= BASELINE_TOOLS:
+        return (
+            "[TOOLS AVAILABLE TO YOU IN THIS CHANNEL — your principal's policy "
+            "grants this channel no capabilities beyond your baseline "
+            f"self-context tools: {names}. You may orient yourself with those, "
+            "but every other tool is disabled here and will be refused, so do "
+            "not attempt it (and don't claim you used it).]"
+        )
     return (
         "[TOOLS AVAILABLE TO YOU IN THIS CHANNEL — you may use ONLY these tools "
         "here. Every other tool is disabled by your principal's policy for this "
@@ -627,18 +638,51 @@ class EngagedThreadStore:
 # Built-in capability bundles: friendly names → the Filament tool names each
 # grants. The principal grants *bundles* (not raw tool names) per channel
 # from the backchannel; a data turn's allowed tool set is its resolved grant
-# list expanded to tool names. Rings referenced below are the
-# capability rings from docs/agent-boundaries.md §3.
+# list expanded to tool names. Each grantable bundle below is one row in the
+# Filament app's capability UI — a bundle is a user-facing unit of consent,
+# not an implementation grouping. Rings referenced below are the capability
+# rings from docs/agent-boundaries.md §3.
 #
 # Only Filament's own tools are named here — the plugin can't know the tool
 # names a *separate* plugin (a calendar/web MCP server) registers. Those are
-# granted via CUSTOM bundles the principal defines in the policy JSON, composed
-# with the help of get_capabilities (which lists every registered tool name).
+# granted via CUSTOM bundles the principal defines in the policy JSON
+# (composed with the help of get_capabilities, which lists every registered
+# tool name), or via the reserved ``mcp:<server>`` auto-bundles that expand
+# to a whole MCP server's live tools (see ``MCP_BUNDLE_PREFIX``).
 BUILTIN_BUNDLES: dict[str, list[str]] = {
-    # Read channel context and reply in-channel. The safe default for a data
-    # turn: enough to be a useful participant, nothing privileged. Excludes
-    # set_profile (Ring 0), accept_invite/accept_vouch (Ring 1 membership), and
-    # message_principal (see "escalate").
+    # Read channel context: history, threads, search, mentions — and the
+    # attachments participants send. download_media belongs with reading: an
+    # ungated agent can fetch media, so a channel granted "read" must be able
+    # to as well, or granting the row would regress attachment handling.
+    "read_history": [
+        "get_recent_messages",
+        "get_thread",
+        "search_messages",
+        "list_mentions",
+        "download_media",
+    ],
+    # Write into the channel: post, reply in threads, add/remove reactions.
+    "post": [
+        "post_message",
+        "reply_in_thread",
+        "react",
+        "unreact",
+    ],
+    # Look up who people are.
+    "directory": [
+        "get_user_profile",
+        "search_user_profiles",
+    ],
+    # Reach the principal — the one channel-independent escalation path. Kept
+    # separate so the principal can grant "read + post" without also letting a
+    # channel ping them, or vice-versa. Excluded everywhere else: set_profile
+    # (Ring 0) and accept_invite/accept_vouch (Ring 1 membership) are in no
+    # builtin bundle at all.
+    "escalate": ["message_principal"],
+    # DEPRECATED aliases. Server-held policy documents reference these names
+    # and must keep expanding to exactly these tool sets, so each keeps its
+    # member list VERBATIM — deliberately not @includes of the rows above,
+    # which may evolve independently. Don't use them in new policy.
     "messaging": [
         "get_self",
         "get_recent_messages",
@@ -652,17 +696,8 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
         "mark_read",
         "post_message",
         "reply_in_thread",
-        # Handle attachments a channel participant sends. Without this, enabling
-        # the feature would regress the default: an ungated agent can fetch
-        # media, so the fail-closed default profile must be able to as well.
         "download_media",
     ],
-    # Reach the principal — the one channel-independent escalation path. Kept
-    # separate so the principal can grant "read + reply" without also letting a
-    # channel ping them, or vice-versa.
-    "escalate": ["message_principal"],
-    # Observe and summarize, never write. For channels where the agent should
-    # answer questions from context but not post autonomously.
     "readonly": [
         "get_self",
         "get_recent_messages",
@@ -673,10 +708,59 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
     ],
 }
 
+# Reserved auto-bundle prefix: a grant (or @include) of ``mcp:<server>``
+# expands at resolution time to the live tool names of Hermes toolset
+# ``mcp-<server>`` — see ``CapabilityPolicyStore.expand_bundle``. Because the
+# expansion is live, a custom bundle may never be *named* with this prefix
+# (the set_capabilities validator rejects it), while grant lists may
+# reference ``mcp:<server>`` freely.
+MCP_BUNDLE_PREFIX = "mcp:"
+
+# Baseline turn hygiene: tools every gated data turn keeps regardless of the
+# channel's grant — self-identity (get_self), the principal-backchannel
+# lookup (get_backchannel), and read-state (mark_read). ``resolve`` unions
+# this into every result, so a gated turn never loses its identity/self-
+# context, even in a channel narrowed to an empty grant. Any server-side
+# mirror of this resolution MUST apply the same union, or a server-resolved
+# set and a locally-resolved set would disagree.
+BASELINE_TOOLS: frozenset[str] = frozenset({"get_self", "mark_read", "get_backchannel"})
+
 # Fail-closed default profile for a data channel with no explicit policy
-# entry: read the channel, reply in it, and escalate to the principal — but no
-# membership actions, no profile edits, and no non-Filament tools.
-DEFAULT_CAPABILITIES: list[str] = ["messaging", "escalate"]
+# entry: read the channel, post in it, look people up, and escalate to the
+# principal — but no membership actions, no profile edits, and no
+# non-Filament tools. Together with BASELINE_TOOLS this expands to the same
+# effective tool set as the deprecated ["messaging", "escalate"] default.
+DEFAULT_CAPABILITIES: list[str] = ["read_history", "post", "directory", "escalate"]
+
+
+def _expand_mcp_bundle(
+    name: str, toolset_tools: "Callable[[str], list[str]] | None"
+) -> frozenset[str]:
+    """Expand the reserved ``mcp:<server>`` auto-bundle to the live tool names
+    of Hermes toolset ``mcp-<server>``, via the injected ``toolset_tools``
+    lookup. Fail closed, never raise: no lookup (a non-Hermes context), an
+    empty/unknown server, or a lookup error all expand to nothing — logged
+    like an unknown bundle, so a granted-but-unavailable server is visible
+    per resolve instead of silently widening or crashing the turn."""
+    server = name[len(MCP_BUNDLE_PREFIX) :]
+    tools: list[str] = []
+    if toolset_tools is not None and server:
+        try:
+            tools = [str(t) for t in (toolset_tools(f"mcp-{server}") or []) if t]
+        except Exception:
+            logger.warning(
+                "filament-fcm: auto-bundle %r lookup failed (granting nothing)",
+                name,
+                exc_info=True,
+            )
+            return frozenset()
+    if not tools:
+        logger.warning(
+            "filament-fcm: auto-bundle %r matched no live tools (granting nothing)",
+            name,
+        )
+        return frozenset()
+    return frozenset(tools)
 
 
 class CapabilityPolicyStore:
@@ -687,19 +771,23 @@ class CapabilityPolicyStore:
     and the next turn uses the new value — no restart. Shape::
 
         {
-          "default_capabilities": ["messaging", "escalate"],
+          "default_capabilities": ["read_history", "post", "directory",
+                                   "escalate"],
           "bundles": {                          # custom / override definitions
             "calendar": ["list_events", "get_event"],
-            "messaging_plus": ["@messaging", "search_user_profiles"]
+            "reader_plus": ["@read_history", "search_user_profiles"]
           },
-          "per_channel": {"<room_id>":  ["messaging", "calendar"]},
-          "per_user":    {"<sender_id>": ["messaging", "calendar"]}
+          "per_channel": {"<room_id>":  ["read_history", "mcp:linear"]},
+          "per_user":    {"<sender_id>": ["read_history", "calendar"]}
         }
 
     A bundle value is a list of entries; each entry is a tool name or
     ``"@other_bundle"`` to include another bundle (built-in or custom). Custom
     bundles override built-ins of the same name, which is how the principal
-    tweaks a starter bundle ("modified bundles").
+    tweaks a starter bundle ("modified bundles"). A grant (or @include) may
+    also name the reserved ``mcp:<server>`` auto-bundle, which expands to the
+    live tools of Hermes toolset ``mcp-<server>`` via the ``toolset_tools``
+    lookup the caller injects (nothing without one — fail closed).
 
     Resolution is channel-scoped and fail-closed: a data turn's allowed tools
     are the channel's ``per_channel`` entry if one is present, else
@@ -708,7 +796,8 @@ class CapabilityPolicyStore:
     listed channel resolves to exactly its own grant list, so a channel can be
     narrowed below the default (down to an empty grant) as well as widened.
     An unlisted channel gets exactly ``default_capabilities`` (a minimal
-    profile), never full access.
+    profile), never full access. ``BASELINE_TOOLS`` is then unioned into
+    every resolved set — turn hygiene no grant vocabulary can remove.
 
     ``per_user`` is deferred: it stays in the document schema and
     ``set_capabilities`` still accepts and stores it, but ``resolve`` ignores
@@ -778,17 +867,27 @@ class CapabilityPolicyStore:
         policy: dict | None = None,
         _defs: dict[str, list[str]] | None = None,
         _seen: "frozenset[str] | None" = None,
+        *,
+        toolset_tools: "Callable[[str], list[str]] | None" = None,
     ) -> frozenset[str]:
         """Expand one bundle name to its concrete set of tool names, resolving
         ``@include`` references recursively. Unknown names and cycles expand to
         nothing (logged), never raise — a typo in the policy must fail closed,
         not crash the turn.
 
+        A ``mcp:<server>`` name is the reserved external auto-bundle: it
+        expands to the live tool names of Hermes toolset ``mcp-<server>`` via
+        the injected ``toolset_tools`` lookup (a plain callable so this module
+        stays stdlib-only), and to nothing when there is no lookup or the
+        server is unknown — fail closed, like an unknown bundle.
+
         Cycles are detected by tracking the bundle names on the *current path*
         (``_seen``), so a genuinely deep-but-acyclic chain expands fully (no
         arbitrary depth cap that would silently drop its terminal tools) while a
         self- or mutually-recursive chain terminates the moment a name repeats.
         A ``list`` entry that isn't a ``list`` is ignored (malformed policy)."""
+        if name.startswith(MCP_BUNDLE_PREFIX):
+            return _expand_mcp_bundle(name, toolset_tools)
         defs = _defs if _defs is not None else self.bundles(policy)
         seen = _seen if _seen is not None else frozenset()
         if name in seen:
@@ -808,32 +907,56 @@ class CapabilityPolicyStore:
         tools: set[str] = set()
         for entry in entries:
             if isinstance(entry, str) and entry.startswith("@"):
-                tools |= self.expand_bundle(entry[1:], policy, defs, seen)
+                tools |= self.expand_bundle(
+                    entry[1:], policy, defs, seen, toolset_tools=toolset_tools
+                )
             elif entry:
                 tools.add(str(entry))
         return frozenset(tools)
 
     def expand_capabilities(
-        self, names: list[str], policy: dict | None = None
+        self,
+        names: list[str],
+        policy: dict | None = None,
+        *,
+        toolset_tools: "Callable[[str], list[str]] | None" = None,
     ) -> frozenset[str]:
         """Union-expand a list of capability/bundle names to tool names."""
         defs = self.bundles(policy)
         tools: set[str] = set()
         for name in names or []:
-            tools |= self.expand_bundle(str(name), policy, defs)
+            tools |= self.expand_bundle(
+                str(name), policy, defs, toolset_tools=toolset_tools
+            )
         return frozenset(tools)
 
-    def resolve(self, room_id: str | None, sender: str | None) -> frozenset[str]:
+    def resolve(
+        self,
+        room_id: str | None,
+        sender: str | None,
+        *,
+        toolset_tools: "Callable[[str], list[str]] | None" = None,
+    ) -> frozenset[str]:
         """The allowed tool set for a data turn in ``room_id``: the channel's
         ``per_channel`` grant list if one is present, else
-        ``default_capabilities``, expanded to tool names.
+        ``default_capabilities``, expanded to tool names, unioned with
+        ``BASELINE_TOOLS``.
 
         The channel entry REPLACES the default (override, not union) — the
         invariant is that a listed channel resolves to exactly its own grant
         list, so a channel can be narrowed below the default (an explicit
-        empty list grants nothing) as well as widened. Fail-closed: an
-        unlisted channel gets the minimal default, never full access, and a
+        empty list grants only the baseline) as well as widened. Fail-closed:
+        an unlisted channel gets the minimal default, never full access, and a
         malformed (non-list) entry is treated as absent.
+
+        ``BASELINE_TOOLS`` rides on every result — turn hygiene: however
+        narrow the grant, a gated turn keeps its identity/self-context tools.
+        The union happens AFTER expansion, so no grant vocabulary (a custom
+        bundle shadowing a builtin, an empty channel entry) can remove it.
+
+        ``toolset_tools`` is the injected live-toolset lookup for the
+        ``mcp:<server>`` auto-bundles; ``None`` (the default, and any
+        non-Hermes caller) expands those grants to nothing.
 
         ``sender`` is accepted so call sites don't churn, but resolution is
         channel-scoped only: ``per_user`` grants are still stored in the
@@ -859,7 +982,10 @@ class CapabilityPolicyStore:
                 # channel to nothing.
                 granted = channel_grant
                 source = "channel"
-        allowed = self.expand_capabilities(granted, policy)
+        allowed = (
+            self.expand_capabilities(granted, policy, toolset_tools=toolset_tools)
+            | BASELINE_TOOLS
+        )
         logger.info(
             "filament-fcm: capabilities room=%s sender=%s source=%s grants=%s "
             "→ %d tool(s)",
