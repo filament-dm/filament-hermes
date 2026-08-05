@@ -38,6 +38,7 @@ from .reactive import (
     BUILTIN_BUNDLES,
     FEATURE_ADVANCED_TOOL_CONTROLS,
     KNOWN_FEATURES,
+    MCP_BUNDLE_PREFIX,
     CapabilityPolicyStore,
     FeatureFlagStore,
     InstructionsStore,
@@ -562,6 +563,15 @@ def _capability_policy_error(policy: dict) -> str | None:
     if not isinstance(bundles, dict):
         return "bundles must be an object mapping bundle name → list of tool names."
     for name, entries in bundles.items():
+        if str(name).startswith(MCP_BUNDLE_PREFIX):
+            # The prefix is reserved for the automatic per-server bundles
+            # ('mcp:<server>' grants that MCP server's live tools at resolve
+            # time) — a custom definition would shadow that expansion.
+            return (
+                f"bundles[{name}]: the {MCP_BUNDLE_PREFIX!r} prefix is reserved "
+                "for automatic MCP-server bundles and cannot name a custom "
+                "bundle. Grant 'mcp:<server>' directly instead."
+            )
         if not _str_list(entries):
             return f"bundles[{name}] must be a list of tool-name / '@bundle' strings."
 
@@ -572,6 +582,11 @@ def _capability_policy_error(policy: dict) -> str | None:
         if not _str_list(names):
             return f"{where} must be a list of capability/bundle names."
         for n in names:
+            if n.startswith(MCP_BUNDLE_PREFIX):
+                # Auto-bundle reference — resolved against the live registry
+                # at turn time (an unavailable server just grants nothing),
+                # so there is no name list to validate it against here.
+                continue
             if n not in known:
                 return (
                     f"{where} references unknown capability {n!r}. "
@@ -594,10 +609,15 @@ def _capability_policy_error(policy: dict) -> str | None:
             if err:
                 return err
 
-    # References inside a custom bundle's own @includes must resolve too.
+    # References inside a custom bundle's own @includes must resolve too
+    # ('@mcp:<server>' passes — it resolves against the live registry).
     for name in bundles:
         for entry in bundles[name]:
-            if entry.startswith("@") and entry[1:] not in known:
+            if (
+                entry.startswith("@")
+                and not entry[1:].startswith(MCP_BUNDLE_PREFIX)
+                and entry[1:] not in known
+            ):
                 return f"bundles[{name}] includes unknown bundle {entry!r}."
     return None
 
@@ -861,13 +881,17 @@ def _register_reactive_tools(
         "principal edits this CONVERSATIONALLY: read get_capabilities, apply "
         "their request, and save the full result here. 'policy' is an object "
         "with: default_capabilities (bundles granted to any unlisted "
-        "channel — fail-closed baseline), bundles (custom name → list of "
-        "tool names, where '@name' includes another bundle), per_channel and "
-        "per_user (id → list of granted bundle names). A channel's per_channel "
-        "entry REPLACES default_capabilities for that channel (override, not "
-        "union — it can narrow a channel below the default, even to nothing). "
-        "per_user may be stored but is currently IGNORED by resolution: grants "
-        "are channel-scoped only. Backchannel/owner only.",
+        "channel — fail-closed default), bundles (custom name → list of "
+        "tool names, where '@name' includes another bundle; names starting "
+        "'mcp:' are reserved), per_channel and per_user (id → list of granted "
+        "bundle names). Grantable builtin bundles: read_history, post, "
+        "directory, escalate; a grant of 'mcp:<server>' gives that MCP "
+        "server's live tools. A channel's per_channel entry REPLACES "
+        "default_capabilities for that channel (override, not union — it can "
+        "narrow a channel below the default, down to the always-kept baseline "
+        "self-context tools). per_user may be stored but is currently IGNORED "
+        "by resolution: grants are channel-scoped only. Backchannel/owner "
+        "only.",
         {
             "type": "object",
             "properties": {"policy": {"type": "object"}},

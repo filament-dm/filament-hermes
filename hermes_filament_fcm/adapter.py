@@ -102,6 +102,24 @@ def _is_not_finalized(result: dict | None) -> bool:
     return isinstance(err, dict) and err.get("code") == _NOT_FINALIZED_CODE
 
 
+def _registry_toolset_tools(toolset: str) -> list[str]:
+    """Live tool names of a registered Hermes toolset — the lookup
+    ``CapabilityPolicyStore.resolve`` uses to expand ``mcp:<server>``
+    auto-bundle grants. Defensive like ``_mcp_server_statuses`` in
+    ``__init__``: a Hermes without a readable registry, or an unknown
+    toolset, yields ``[]`` so the auto-bundle fails closed (grants nothing)
+    instead of the wake crashing."""
+    try:
+        from tools.registry import registry  # noqa: PLC0415
+
+        return [str(n) for n in registry.get_tool_names_for_toolset(toolset)]
+    except Exception:
+        logger.debug(
+            "filament-fcm: toolset lookup failed for %r", toolset, exc_info=True
+        )
+        return []
+
+
 def _sanitize_meta(value: str, limit: int = 80) -> str:
     """Flatten untrusted metadata (sender display name, room name) for safe
     inline use in the wake-up envelope's framing text.
@@ -1873,7 +1891,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # advanced tool controls feature is OFF (the default), the turn stays
         # ungated (None) with no hint — identical to a pre-feature install.
         if self._feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
-            allowed = self._capability_store.resolve(channel, sender)
+            allowed = self._capability_store.resolve(
+                channel, sender, toolset_tools=_registry_toolset_tools
+            )
             tool_hint = capability_hint(allowed)
         else:
             allowed = None

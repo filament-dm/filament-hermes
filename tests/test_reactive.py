@@ -285,8 +285,8 @@ def test_custom_bundle_overrides_builtin():
 def test_resolve_fail_closed_default_for_unlisted():
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
-        # No file at all → the built-in fail-closed default (messaging+escalate),
-        # never full access.
+        # No file at all → the built-in fail-closed default (the grantable
+        # rows: read_history+post+directory+escalate), never full access.
         allowed = store.resolve("!room:x", "@stranger:x")
         assert "post_message" in allowed  # can reply
         assert "message_principal" in allowed  # can escalate
@@ -334,8 +334,9 @@ def test_resolve_empty_channel_entry_narrows_to_nothing():
             }
         )
         # A present-but-empty entry is a deliberate override to nothing (a
-        # silent-observer channel), not a fall-through to the default.
-        assert store.resolve("!silent:x", "@u:x") == frozenset()
+        # silent-observer channel), not a fall-through to the default — only
+        # the always-kept baseline self-context tools remain.
+        assert store.resolve("!silent:x", "@u:x") == reactive.BASELINE_TOOLS
         # The default is untouched elsewhere.
         assert "post_message" in store.resolve("!other:x", "@u:x")
 
@@ -380,19 +381,177 @@ def test_resolve_unknown_bundle_in_channel_entry_grants_nothing():
             }
         )
         # The entry overrides the default, and its unknown bundle expands to
-        # nothing — fail closed, never a fall-back to the wider default.
-        assert store.resolve("!room:x", "@u:x") == frozenset()
+        # nothing — fail closed, never a fall-back to the wider default. Only
+        # the baseline rides along.
+        assert store.resolve("!room:x", "@u:x") == reactive.BASELINE_TOOLS
 
 
 def test_resolve_empty_default_is_silent_observer():
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
         store.write({"default_capabilities": []})
-        # Principal chose a pure observer posture: no tools at all for unlisted
-        # turns. capability_denies then blocks every call.
+        # Principal chose a pure observer posture: nothing beyond the baseline
+        # self-context tools for unlisted turns. capability_denies then blocks
+        # every channel-action call.
         allowed = store.resolve("!room:x", "@x:x")
-        assert allowed == frozenset()
+        assert allowed == reactive.BASELINE_TOOLS
         assert reactive.capability_denies(allowed, "get_thread") is True
+        assert reactive.capability_denies(allowed, "post_message") is True
+
+
+# ── Bundle recut: rows, aliases, baseline, auto-bundles ──────────────
+
+
+def test_builtin_rows_expand_to_exact_sets():
+    # Each grantable builtin bundle is one row in the Filament app's
+    # capability UI — its membership is a user-facing contract, pinned
+    # literally so a drive-by edit can't silently change what a row grants.
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    assert store.expand_bundle("read_history") == frozenset(
+        {
+            "get_recent_messages",
+            "get_thread",
+            "search_messages",
+            "list_mentions",
+            "download_media",
+        }
+    )
+    assert store.expand_bundle("post") == frozenset(
+        {"post_message", "reply_in_thread", "react", "unreact"}
+    )
+    assert store.expand_bundle("directory") == frozenset(
+        {"get_user_profile", "search_user_profiles"}
+    )
+    assert store.expand_bundle("escalate") == frozenset({"message_principal"})
+
+
+def test_deprecated_aliases_expand_to_exact_original_sets():
+    # Server-held policy documents still grant these names, so the literal
+    # sets below — their original member lists — must never drift, and must
+    # never be redefined via @includes of the row bundles.
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    assert store.expand_bundle("messaging") == frozenset(
+        {
+            "get_self",
+            "get_recent_messages",
+            "get_thread",
+            "get_user_profile",
+            "search_messages",
+            "search_user_profiles",
+            "list_mentions",
+            "react",
+            "unreact",
+            "mark_read",
+            "post_message",
+            "reply_in_thread",
+            "download_media",
+        }
+    )
+    assert store.expand_bundle("readonly") == frozenset(
+        {
+            "get_self",
+            "get_recent_messages",
+            "get_thread",
+            "get_user_profile",
+            "search_messages",
+            "list_mentions",
+        }
+    )
+
+
+def test_new_default_matches_old_messaging_escalate_default():
+    # The no-behavior-change proof for the bundle recut: the new default rows
+    # plus baseline grant exactly what ["messaging", "escalate"] plus baseline
+    # granted (download_media moved from messaging into read_history, so the
+    # unions must come out identical).
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    new = store.expand_capabilities(list(reactive.DEFAULT_CAPABILITIES))
+    old = store.expand_capabilities(["messaging", "escalate"])
+    assert new | reactive.BASELINE_TOOLS == old | reactive.BASELINE_TOOLS
+
+
+def test_resolve_always_includes_baseline():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        # Defaults (no file at all): the baseline rides along.
+        assert store.resolve("!room:x", "@u:x") >= reactive.BASELINE_TOOLS
+        store.write(
+            {
+                "default_capabilities": ["escalate"],
+                "per_channel": {"!narrow:x": [], "!granted:x": ["post"]},
+            }
+        )
+        # An explicit channel grant: the baseline is unioned in, not replaced.
+        granted = store.resolve("!granted:x", "@u:x")
+        assert granted >= reactive.BASELINE_TOOLS
+        assert "post_message" in granted
+        # A channel narrowed to an empty grant keeps exactly the baseline —
+        # a gated turn never loses its identity/self-context tools.
+        assert store.resolve("!narrow:x", "@u:x") == reactive.BASELINE_TOOLS
+        # And so does a narrowed global default.
+        assert store.resolve("!other:x", "@u:x") >= reactive.BASELINE_TOOLS
+
+
+def test_capability_hint_baseline_only():
+    # A channel granted nothing still resolves to the baseline; the hint must
+    # say plainly that the agent can orient itself but take no channel action,
+    # while still naming exactly the permitted tools (hint == gate).
+    h = reactive.capability_hint(reactive.BASELINE_TOOLS)
+    assert "no capabilities beyond" in h
+    assert "get_backchannel, get_self, mark_read" in h
+    assert "will be refused" in h
+
+
+def test_mcp_auto_bundle_expands_via_injected_lookup():
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    seen: list[str] = []
+
+    def lookup(toolset):
+        seen.append(toolset)
+        return ["create_issue", "list_issues"] if toolset == "mcp-linear" else []
+
+    assert store.expand_bundle("mcp:linear", toolset_tools=lookup) == frozenset(
+        {"create_issue", "list_issues"}
+    )
+    # The grant spelling maps onto Hermes toolset naming: mcp:<server> asks
+    # the lookup for toolset "mcp-<server>".
+    assert seen == ["mcp-linear"]
+    # @include composes an auto-bundle into a custom bundle too.
+    policy = {"bundles": {"pm": ["@mcp:linear", "post_message"]}}
+    pm = store.expand_bundle("pm", policy, toolset_tools=lookup)
+    assert "create_issue" in pm and "post_message" in pm
+
+
+def test_mcp_auto_bundle_fails_closed():
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    # No lookup injected (a non-Hermes caller) → nothing.
+    assert store.expand_bundle("mcp:linear") == frozenset()
+    # Unknown server (lookup finds no such toolset) → nothing.
+    assert store.expand_bundle("mcp:nope", toolset_tools=lambda ts: []) == frozenset()
+
+    # A lookup that raises → nothing, never a crash into the turn.
+    def boom(toolset):
+        raise RuntimeError("registry unavailable")
+
+    assert store.expand_bundle("mcp:linear", toolset_tools=boom) == frozenset()
+
+
+def test_resolve_expands_mcp_grants_alongside_bundles():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write({"per_channel": {"!room:x": ["post", "mcp:linear"]}})
+
+        def lookup(toolset):
+            return ["create_issue"] if toolset == "mcp-linear" else []
+
+        allowed = store.resolve("!room:x", "@u:x", toolset_tools=lookup)
+        assert "create_issue" in allowed and "post_message" in allowed
+        # Without a lookup the auto-bundle contributes nothing — the rest of
+        # the grant (and the baseline) still stands.
+        without = store.resolve("!room:x", "@u:x")
+        assert "create_issue" not in without
+        assert "post_message" in without
+        assert without >= reactive.BASELINE_TOOLS
 
 
 # ── Feature flags ────────────────────────────────────────────────────
@@ -427,7 +586,10 @@ def test_feature_flag_set_preserves_other_flags():
 def test_messaging_bundle_includes_download_media():
     # The fail-closed default must be able to fetch attachments, or enabling the
     # feature would regress media handling vs an ungated (flag-off) agent.
+    # read_history carries it for the current default rows; the deprecated
+    # messaging alias keeps it for old server-held documents.
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    assert "download_media" in store.expand_bundle("read_history")
     assert "download_media" in store.expand_bundle("messaging")
 
 
@@ -444,7 +606,7 @@ def test_resolve_survives_malformed_policy():
             }
         )
         allowed = store.resolve("!room:x", "@u:x")  # must not raise
-        assert allowed == frozenset()
+        assert allowed == reactive.BASELINE_TOOLS
         # A malformed (non-list) channel entry reads as absent — the default
         # still applies rather than the turn crashing or the entry "winning".
         store.write(
