@@ -1714,12 +1714,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         directly — no wake policy, no standing-instructions framing, full
         command authority."""
         body = self._strip_mention(msg.body) if msg.body else msg.body
-        # Slash commands are for the plugin, not the model: intercept before
-        # any LLM dispatch. A slash message must never reach inference — even
+        # /fil-* commands are for the plugin, not the model: intercept before
+        # any LLM dispatch. A /fil- message must never reach inference — even
         # an unparseable one is answered deterministically with help text.
-        # Control-plane only by construction (this method is only reached for
-        # the backchannel), which is what makes the writes below legitimate.
-        if body and body.strip().startswith("/"):
+        # ONLY the /fil- namespace is ours (case-insensitive prefix): any
+        # other leading-/ message belongs to some other software's slash
+        # namespace and falls through to the normal LLM control path below —
+        # we must not swallow it. Control-plane only by construction (this
+        # method is only reached for the backchannel), which is what makes
+        # the writes below legitimate.
+        if body and slash.is_fil_command(body):
             await self._handle_slash_command(msg, body.strip())
             return
         # The push never includes attachments (ENG-603): describe any media on
@@ -1869,6 +1873,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 channel_instructions=self._channel_instructions.read(),
                 feature_flags=self._feature_flags.read(),
                 channels=channels,
+            )
+        elif isinstance(result, slash.ToolsStatus):
+            text = slash.render_tools_status(
+                room_id=result.room_id,
+                channel_name=result.channel_name,
+                capability_policy=capability_policy,
+                feature_flags=self._feature_flags.read(),
+                mcp_servers=mcp_servers,
+                other_sources=_other_tool_sources(),
+            )
+        elif isinstance(result, slash.GuidanceShow):
+            text = slash.render_guidance_show(
+                room_id=result.room_id,
+                channel_name=result.channel_name,
+                channel_instructions=self._channel_instructions.read(),
             )
         elif isinstance(result, slash.ToolsCommand):
             mutation = slash.apply_tools(

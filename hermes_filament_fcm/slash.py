@@ -1,11 +1,19 @@
 """Deterministic slash-command layer for the principal's backchannel.
 
-A backchannel message whose stripped body starts with ``/`` is a command for
-the *plugin*, not the model: the adapter intercepts it before any LLM dispatch
-and answers from this module alone. A slash message must never reach
+The commands live in the ``/fil-`` namespace (``/fil-help``, ``/fil-tools``,
+…). A backchannel message whose stripped body starts with ``/fil-``
+(case-insensitive prefix, see ``is_fil_command``) is a command for the
+*plugin*, not the model: the adapter intercepts it before any LLM dispatch
+and answers from this module alone. A ``/fil-`` message must never reach
 inference — when parsing fails, the reply is help text or a clarifying
 question, not a model turn. That makes the command surface exact, auditable,
-and free of prompt-shaped surprises.
+and free of prompt-shaped surprises. Any *other* leading-``/`` message is not
+ours: other slash namespaces belong to other software, so the adapter lets
+those fall through to the normal control-plane LLM path.
+
+Replies are markdown (Filament renders it): command names and examples in
+backticks, section headings bold, lists as ``-`` bullets, resolved names in
+confirmation echoes bold. Formatting, not padding — replies stay compact.
 
 Parsing is token classification, not positional grammar: after the command
 word, each remaining token is matched against closed vocabularies — a channel
@@ -59,6 +67,10 @@ ROW_DESCRIPTIONS: dict[str, str] = {
     "escalate": "reach your principal (message_principal)",
 }
 
+# The command namespace. Only bodies carrying this prefix are ours; other
+# slash namespaces belong to other software and must not be swallowed.
+PREFIX = "/fil-"
+
 GRANT_WORDS: tuple[str, ...] = ("enable", "on", "grant", "allow")
 REVOKE_WORDS: tuple[str, ...] = ("disable", "off", "revoke", "block", "deny")
 WAKE_MODES: tuple[str, ...] = ("mention", "all", "off")
@@ -80,15 +92,27 @@ FUZZY_CUTOFF = 0.75
 AMBIGUITY_MARGIN = 0.08
 
 USAGE: dict[str, str] = {
-    "config": "/config show",
-    "tools": "/tools <channel> <tool-or-bundle> <on|off> "
-    "(e.g. /tools #welcome linear off)",
-    "wake": "/wake <channel> <mention|all|off> (e.g. /wake #general all)",
-    "guidance": "/guidance <channel> <text…|clear> "
-    "(e.g. /guidance #welcome Be brief.)",
-    "feature": "/feature <name> <on|off> "
-    "(e.g. /feature advanced_tool_controls on)",
+    "config": "`/fil-config show`",
+    "tools": "`/fil-tools <channel> <tool-or-bundle> <on|off>` "
+    "(e.g. `/fil-tools #welcome linear off`), or `/fil-tools <channel>` "
+    "for that channel's current tool status",
+    "wake": "`/fil-wake <channel> <mention|all|off>` "
+    "(e.g. `/fil-wake #general all`)",
+    "guidance": "`/fil-guidance <channel> <text…|clear>` "
+    "(e.g. `/fil-guidance #welcome Be brief.`), or "
+    "`/fil-guidance <channel>` to show the current guidance",
+    "feature": "`/fil-feature <name> <on|off>` "
+    "(e.g. `/fil-feature advanced_tool_controls on`)",
 }
+
+
+def is_fil_command(body: str | None) -> bool:
+    """True when a message body enters the deterministic slash layer: its
+    stripped form starts with the ``/fil-`` namespace prefix
+    (case-insensitive). Any other leading-``/`` message belongs to some other
+    software's slash namespace and must fall through to the normal LLM path —
+    the adapter's intercept boundary is exactly this predicate."""
+    return (body or "").strip().lower().startswith(PREFIX)
 
 
 def _sanitize(value: str, limit: int = 80) -> str:
@@ -128,6 +152,15 @@ class ToolsCommand:
 
 
 @dataclass(frozen=True)
+class ToolsStatus:
+    """``/fil-tools <channel>`` with no target/verb — the adapter answers
+    with the channel's current tool status (``render_tools_status``)."""
+
+    room_id: str
+    channel_name: str  # sanitized; "" when the channel is unnamed
+
+
+@dataclass(frozen=True)
 class WakeCommand:
     room_id: str
     channel_name: str
@@ -139,6 +172,15 @@ class GuidanceCommand:
     room_id: str
     channel_name: str
     text: str | None  # None → clear
+
+
+@dataclass(frozen=True)
+class GuidanceShow:
+    """``/fil-guidance <channel>`` with no text — the adapter answers with
+    the current guidance (``render_guidance_show``)."""
+
+    room_id: str
+    channel_name: str
 
 
 @dataclass(frozen=True)
@@ -334,12 +376,15 @@ def _fill_slots(
     expects: str,
     labels: Mapping[str, str],
     required: Sequence[str],
+    complete: Sequence[Sequence[str]] = (),
 ):
     """Order-free classification: assign each non-filler token to an open
     slot. Returns ``(slots, None)`` on success — including a possibly
     *incomplete* ``slots`` dict, which the caller turns into help (nothing
     resolved) or a "still need …" reply — or ``(None, result)`` when a token
-    was ambiguous or unplaceable."""
+    was ambiguous or unplaceable. A slot set exactly matching one of
+    ``complete`` is also a success even though ``required`` slots are
+    missing (e.g. a bare channel means "show status", not a mutation)."""
     slots: dict[str, _Entry] = {}
     for text, _start, _end in tokens:
         if text.lower() in FILLER_WORDS:
@@ -358,6 +403,8 @@ def _fill_slots(
         slots[entry.slot] = entry
     if not slots:
         return slots, HelpRequest(command)
+    if any(set(slots) == set(combo) for combo in complete):
+        return slots, None
     missing = [s for s in required if s not in slots]
     if missing:
         got = ", ".join(
@@ -382,7 +429,7 @@ def parse(
     bundles: Iterable[str] = (),
     features: Mapping[str, str] | None = None,
 ):
-    """Parse one backchannel slash message into a structured result.
+    """Parse one backchannel ``/fil-`` message into a structured result.
 
     ``channels`` is the server-attributed ``[(room_id, name), …]`` list (from
     ``list_channels``); ``mcp_servers`` the known MCP server names (sequence,
@@ -393,9 +440,11 @@ def parse(
     """
     features = dict(features or {})
     text = (body or "").strip()
-    match = re.match(r"/(\S*)", text)
+    match = re.match(re.escape(PREFIX) + r"(\S*)", text, re.IGNORECASE)
     if not match:
-        return Unparsed(command=None, problem="That isn't a slash command.")
+        return Unparsed(
+            command=None, problem=f"That isn't a {PREFIX} command."
+        )
     word = match.group(1)
     rest = text[match.end() :]
     if not word:
@@ -406,10 +455,11 @@ def parse(
             return Ambiguous(
                 command=None,
                 token=_sanitize(word),
-                candidates=tuple(f"/{c}" for c in candidates),
+                candidates=tuple(f"{PREFIX}{c}" for c in candidates),
             )
         return Unparsed(
-            command=None, problem=f'Unknown command "/{_sanitize(word)}".'
+            command=None,
+            problem=f'Unknown command "{PREFIX}{_sanitize(word)}".',
         )
     if command == "help":
         return HelpRequest(None)
@@ -435,7 +485,8 @@ def _parse_config(tokens: Sequence[tuple[str, int, int]]):
         return ShowConfig()
     return Unparsed(
         command="config",
-        problem=f'"/config {_sanitize(tokens[0][0])}" isn\'t something I know.',
+        problem=f'"{PREFIX}config {_sanitize(tokens[0][0])}" '
+        "isn't something I know.",
     )
 
 
@@ -457,10 +508,15 @@ def _parse_tools(
         "a channel, a tool bundle, or on/off",
         {"channel": "channel", "target": "bundle", "verb": "on/off"},
         ("channel", "target", "verb"),
+        # A bare channel is a complete question, not a truncated mutation:
+        # "/fil-tools #welcome" asks what's enabled there.
+        complete=(("channel",),),
     )
     if result is not None or slots is None:
         return result
     room_id, channel_name = slots["channel"].canonical
+    if "target" not in slots:
+        return ToolsStatus(room_id=room_id, channel_name=channel_name)
     return ToolsCommand(
         room_id=room_id,
         channel_name=channel_name,
@@ -521,10 +577,8 @@ def _parse_guidance(
     # like "help" or "off" in it mean nothing special.
     text = rest[end:].strip()
     if not text:
-        return Unparsed(
-            command="guidance",
-            problem="Give me the guidance text (or 'clear' to remove it).",
-        )
+        # A bare channel is a question: show the current guidance there.
+        return GuidanceShow(room_id=room_id, channel_name=channel_name)
     if text.lower() == "clear":
         return GuidanceCommand(
             room_id=room_id, channel_name=channel_name, text=None
@@ -602,36 +656,38 @@ def _channels_line(channels: Sequence[tuple[str, str]], limit: int = 12) -> str:
         if clean:
             names.append(f"#{clean}")
     if not names:
-        return "Channels: (none known yet)"
+        return "**Channels:** (none known yet)"
     shown = ", ".join(names[:limit])
     extra = len(names) - limit
     if extra > 0:
         shown += f" (+{extra} more)"
-    return f"Channels: {shown}"
+    return f"**Channels:** {shown}"
 
 
 def help_index() -> str:
     return "\n".join(
         [
-            "Commands:",
-            "/config show — summary of my current configuration",
-            "/tools <channel> <tool> <on|off> — grant/revoke tool bundles "
-            "per channel (e.g. /tools #welcome linear off)",
-            "/wake <channel> <mention|all|off> — when that channel wakes me "
-            "(e.g. /wake #general all)",
-            "/guidance <channel> <text|clear> — my standing guidance there "
-            "(e.g. /guidance #welcome Be brief.)",
-            "/feature <name> <on|off> — toggle a feature "
-            "(e.g. /feature advanced_tool_controls on)",
-            'Say "/<command> help" for details (e.g. /tools help).',
+            "**Commands:**",
+            "- `/fil-config show` — summary of my current configuration",
+            "- `/fil-tools <channel> <tool> <on|off>` — grant/revoke tool "
+            "bundles per channel (e.g. `/fil-tools #welcome linear off`)",
+            "- `/fil-tools <channel>` — what's enabled in that channel "
+            "right now",
+            "- `/fil-wake <channel> <mention|all|off>` — when that channel "
+            "wakes me (e.g. `/fil-wake #general all`)",
+            "- `/fil-guidance <channel> <text|clear>` — my standing guidance "
+            "there (e.g. `/fil-guidance #welcome Be brief.`)",
+            "- `/fil-feature <name> <on|off>` — toggle a feature "
+            "(e.g. `/fil-feature advanced_tool_controls on`)",
+            "Say `/fil-<command> help` for details (e.g. `/fil-tools help`).",
         ]
     )
 
 
 def help_config() -> str:
     return (
-        "/config show — a summary of the current configuration: per-channel "
-        "tool grants, wake modes, guidance, and feature flags."
+        "`/fil-config show` — a summary of the current configuration: "
+        "per-channel tool grants, wake modes, guidance, and feature flags."
     )
 
 
@@ -642,27 +698,29 @@ def help_tools(
 ) -> str:
     example = _example_channel(channels)
     lines = [
-        "/tools <channel> <tool-or-bundle> <on|off> — control which tools I "
-        "may use in a shared channel (token order doesn't matter).",
+        "`/fil-tools <channel> <tool-or-bundle> <on|off>` — control which "
+        "tools I may use in a shared channel (token order doesn't matter).",
+        f"`/fil-tools {example}` — show what's currently enabled there.",
         "",
-        "Built-in bundles:",
+        "**Built-in bundles:**",
     ]
     lines += [
-        f"  {name} — {ROW_DESCRIPTIONS[name]}" for name in ROWS
+        f"- **{name}** — {ROW_DESCRIPTIONS[name]}" for name in ROWS
     ]
     lines.append("")
     names = _mcp_names(mcp_servers)
     if names:
         lines.append(
-            "Connected MCP servers (grant with or without the mcp: prefix):"
+            "**Connected MCP servers** (grant with or without the `mcp:` "
+            "prefix):"
         )
         counts = mcp_servers if isinstance(mcp_servers, Mapping) else {}
         for server in sorted(names):
             count = counts.get(server)
             suffix = f" ({count} tools)" if isinstance(count, int) else ""
-            lines.append(f"  {MCP_PREFIX}{server}{suffix}")
+            lines.append(f"- `{MCP_PREFIX}{server}`{suffix}")
     else:
-        lines.append("Connected MCP servers: none")
+        lines.append("**Connected MCP servers:** none")
     clean_sources = [_sanitize(str(s)) for s in other_sources if str(s)]
     if clean_sources:
         lines.append(
@@ -671,12 +729,12 @@ def help_tools(
         )
     lines += [
         "",
-        "Examples:",
-        f"  /tools {example} linear off — spelling close enough works; "
-        "I'll confirm what I understood",
-        f"  /tools {example} read_history on",
-        f"  /tools {example} post revoke — verbs: on/off, enable/disable, "
-        "grant/revoke, allow/deny",
+        "**Examples:**",
+        f"- `/fil-tools {example} linear off` — spelling close enough "
+        "works; I'll confirm what I understood",
+        f"- `/fil-tools {example} read_history on`",
+        f"- `/fil-tools {example} post revoke` — verbs: on/off, "
+        "enable/disable, grant/revoke, allow/deny",
         _channels_line(channels),
     ]
     return "\n".join(lines)
@@ -686,13 +744,13 @@ def help_wake(channels: Sequence[tuple[str, str]] = ()) -> str:
     example = _example_channel(channels)
     return "\n".join(
         [
-            "/wake <channel> <mention|all|off> — when a shared channel "
-            "wakes me:",
-            "  mention — only @-mentions (and engaged threads) wake me "
+            "`/fil-wake <channel> <mention|all|off>` — when a shared "
+            "channel wakes me:",
+            "- **mention** — only @-mentions (and engaged threads) wake me "
             "(the default)",
-            "  all — every message wakes me",
-            "  off — messages there never wake me",
-            f"Example: /wake {example} all",
+            "- **all** — every message wakes me",
+            "- **off** — messages there never wake me",
+            f"Example: `/fil-wake {example} all`",
             _channels_line(channels),
         ]
     )
@@ -702,28 +760,31 @@ def help_guidance(channels: Sequence[tuple[str, str]] = ()) -> str:
     example = _example_channel(channels)
     return "\n".join(
         [
-            "/guidance <channel> <text…> — set my standing guidance for one "
-            "channel (it frames every wake there). Everything after the "
-            "channel is kept verbatim.",
-            f"/guidance {example} clear — remove it.",
-            f"Example: /guidance {example} Keep replies short; escalate "
-            "billing questions to me.",
+            "`/fil-guidance <channel> <text…>` — set my standing guidance "
+            "for one channel (it frames every wake there). Everything after "
+            "the channel is kept verbatim.",
+            f"- `/fil-guidance {example}` — show the current guidance",
+            f"- `/fil-guidance {example} clear` — remove it",
+            f"Example: `/fil-guidance {example} Keep replies short; "
+            "escalate billing questions to me.`",
             _channels_line(channels),
         ]
     )
 
 
 def help_feature(features: Mapping[str, str] | None = None) -> str:
-    lines = ["/feature <name> <on|off> — toggle a runtime feature."]
+    lines = ["`/fil-feature <name> <on|off>` — toggle a runtime feature."]
     features = dict(features or {})
     if features:
-        lines.append("Known features:")
+        lines.append("**Known features:**")
         for name in sorted(features):
             # First sentence only — the full description lives in
             # get_features.
             summary = str(features[name]).split(". ")[0].rstrip(".")
-            lines.append(f"  {name} — {summary}.")
-    lines.append(f"Example: /feature {FEATURE_ADVANCED_TOOL_CONTROLS} on")
+            lines.append(f"- **{name}** — {summary}.")
+    lines.append(
+        f"Example: `/fil-feature {FEATURE_ADVANCED_TOOL_CONTROLS} on`"
+    )
     return "\n".join(lines)
 
 
@@ -808,7 +869,7 @@ def apply_tools(
         if command.target in grants:
             return Mutation(
                 changed=False,
-                reply=f"{friendly} is already enabled in {label} "
+                reply=f"**{friendly}** is already enabled in **{label}** "
                 f"(tools: {listed}).",
             )
         grants.append(command.target)
@@ -817,7 +878,7 @@ def apply_tools(
         if command.target not in grants:
             return Mutation(
                 changed=False,
-                reply=f"{friendly} isn't enabled in {label} "
+                reply=f"**{friendly}** isn't enabled in **{label}** "
                 f"(tools: {listed}).",
             )
         grants = [g for g in grants if g != command.target]
@@ -836,7 +897,7 @@ def apply_tools(
     )
     return Mutation(
         changed=True,
-        reply=f"✓ {verbed} {friendly} in {label} (tools now: {now})"
+        reply=f"✓ {verbed} **{friendly}** in **{label}** (tools now: {now})"
         f"{flag_note}",
         capability_policy=policy,
         feature_flags=new_flags,
@@ -862,15 +923,15 @@ def apply_wake(command: WakeCommand, wake_policy: dict) -> Mutation:
     if entry.get("reactive_wake") == command.mode:
         return Mutation(
             changed=False,
-            reply=f"Wake mode for {label} is already "
-            f"'{command.mode}' — {gloss}.",
+            reply=f"Wake mode for **{label}** is already "
+            f"**{command.mode}** — {gloss}.",
         )
     entry["reactive_wake"] = command.mode
     per[command.room_id] = entry
     policy["per_channel"] = per
     return Mutation(
         changed=True,
-        reply=f"✓ Wake mode for {label}: {command.mode} — {gloss}.",
+        reply=f"✓ Wake mode for **{label}**: **{command.mode}** — {gloss}.",
         wake_policy=policy,
         sections=("wake_policy",),
     )
@@ -884,12 +945,12 @@ def apply_guidance(
     if command.text is None:
         if command.room_id not in mapping:
             return Mutation(
-                changed=False, reply=f"No guidance is set for {label}."
+                changed=False, reply=f"No guidance is set for **{label}**."
             )
         del mapping[command.room_id]
         return Mutation(
             changed=True,
-            reply=f"✓ Cleared guidance for {label}.",
+            reply=f"✓ Cleared guidance for **{label}**.",
             channel_instructions=mapping,
             sections=("channel_instructions",),
         )
@@ -899,7 +960,7 @@ def apply_guidance(
     shown = command.text if len(command.text) <= 120 else command.text[:117] + "…"
     return Mutation(
         changed=True,
-        reply=f"✓ Guidance for {label} set ({len(command.text)} chars): "
+        reply=f"✓ Guidance for **{label}** set ({len(command.text)} chars): "
         f"{shown}",
         channel_instructions=mapping,
         sections=("channel_instructions",),
@@ -911,13 +972,13 @@ def apply_feature(command: FeatureCommand, feature_flags: dict) -> Mutation:
     if bool(feature_flags.get(command.feature, False)) == command.enabled:
         return Mutation(
             changed=False,
-            reply=f"Feature {command.feature} is already {state}.",
+            reply=f"Feature **{command.feature}** is already **{state}**.",
         )
     flags = dict(feature_flags)
     flags[command.feature] = command.enabled
     return Mutation(
         changed=True,
-        reply=f"✓ Feature {command.feature}: {state}",
+        reply=f"✓ Feature **{command.feature}**: **{state}**",
         feature_flags=flags,
         sections=("feature_flags",),
     )
@@ -944,14 +1005,16 @@ def render_config_show(
         clean = names.get(str(room_id), "")
         return f"#{clean}" if clean else str(room_id)
 
-    lines = ["Current configuration:", ""]
+    lines = ["**Current configuration:**", ""]
     atc = bool(feature_flags.get(FEATURE_ADVANCED_TOOL_CONTROLS, False))
-    lines.append(f"Tools (advanced_tool_controls: {'on' if atc else 'off'}):")
+    lines.append(
+        f"**Tools** (advanced_tool_controls: {'on' if atc else 'off'}):"
+    )
     default = capability_policy.get("default_capabilities")
     default_names = (
         [str(g) for g in default] if isinstance(default, list) else list(ROWS)
     )
-    lines.append(f"  default: {', '.join(default_names) or 'none'}")
+    lines.append(f"- default: {', '.join(default_names) or 'none'}")
     per = capability_policy.get("per_channel")
     if isinstance(per, dict):
         for room_id in sorted(per, key=label):
@@ -959,27 +1022,132 @@ def render_config_show(
             if isinstance(grants, list):
                 shown = ", ".join(str(g) for g in grants)
                 lines.append(
-                    f"  {label(room_id)}: {shown or 'none (baseline only)'}"
+                    f"- **{label(room_id)}**: "
+                    f"{shown or 'none (baseline only)'}"
                 )
-    lines += ["", "Wake:"]
-    lines.append(f"  default: {wake_policy.get('reactive_wake', 'mention')}")
+    lines += ["", "**Wake:**"]
+    lines.append(f"- default: {wake_policy.get('reactive_wake', 'mention')}")
     wake_per = wake_policy.get("per_channel")
     if isinstance(wake_per, dict):
         for room_id in sorted(wake_per, key=label):
             entry = wake_per[room_id]
             if isinstance(entry, dict) and "reactive_wake" in entry:
-                lines.append(f"  {label(room_id)}: {entry['reactive_wake']}")
-    lines += ["", "Guidance:"]
+                lines.append(
+                    f"- **{label(room_id)}**: {entry['reactive_wake']}"
+                )
+    lines += ["", "**Guidance:**"]
     any_guidance = False
     for room_id in sorted(channel_instructions or {}, key=label):
         text = channel_instructions[room_id]
         if isinstance(text, str) and text:
-            lines.append(f"  {label(room_id)}: set ({len(text)} chars)")
+            lines.append(f"- **{label(room_id)}**: set ({len(text)} chars)")
             any_guidance = True
     if not any_guidance:
-        lines.append("  none")
-    lines += ["", "Features:"]
+        lines.append("- none")
+    lines += ["", "**Features:**"]
     for name in sorted(set(feature_flags) | {FEATURE_ADVANCED_TOOL_CONTROLS}):
         state = "on" if feature_flags.get(name) else "off"
-        lines.append(f"  {name}: {state}")
+        lines.append(f"- {name}: {state}")
+    return "\n".join(lines)
+
+
+# ── Channel status rendering ─────────────────────────────────────────
+
+
+def render_tools_status(
+    *,
+    room_id: str,
+    channel_name: str,
+    capability_policy: dict,
+    feature_flags: dict,
+    mcp_servers: object = (),
+    other_sources: Sequence[str] = (),
+) -> str:
+    """The ``/fil-tools <channel>`` status reply: what's enabled in that
+    channel right now, whether that grant is the default or a channel
+    override, what's off, and how to change it. Read-only — same resolution
+    the mutation path starts from (per-channel override replaces the default
+    list; absent both, the built-in rows)."""
+    label = _channel_label(room_id, channel_name)
+    raw_per = capability_policy.get("per_channel")
+    per = raw_per if isinstance(raw_per, dict) else {}
+    entry = per.get(room_id)
+    if isinstance(entry, list):
+        grants = [str(g) for g in entry]
+        origin = "channel override"
+    else:
+        default = capability_policy.get("default_capabilities")
+        grants = (
+            [str(g) for g in default]
+            if isinstance(default, list)
+            else list(ROWS)
+        )
+        origin = "default grant — no channel override"
+    servers = _mcp_names(mcp_servers)
+    counts = mcp_servers if isinstance(mcp_servers, Mapping) else {}
+    lines = [f"**{label}** tools ({origin}):"]
+    for grant in grants:
+        if grant in ROW_DESCRIPTIONS:
+            lines.append(f"- **{grant}** — {ROW_DESCRIPTIONS[grant]}")
+        elif grant.startswith(MCP_PREFIX):
+            server = grant[len(MCP_PREFIX) :]
+            count = counts.get(server)
+            suffix = f" ({count} tools)" if isinstance(count, int) else ""
+            note = "" if server in servers else " — not currently connected"
+            lines.append(f"- **{grant}** — MCP server{suffix}{note}")
+        elif grant in DEPRECATED_ALIASES:
+            lines.append(f"- **{grant}** — deprecated alias bundle")
+        else:
+            lines.append(f"- **{grant}** — custom bundle")
+    if not grants:
+        lines.append("- none (baseline only)")
+    off = [row for row in ROWS if row not in grants] + [
+        f"{MCP_PREFIX}{server}"
+        for server in sorted(servers)
+        if f"{MCP_PREFIX}{server}" not in grants
+    ]
+    lines.append(f"**Off:** {', '.join(off) if off else 'nothing'}")
+    clean_sources = [_sanitize(str(s)) for s in other_sources if str(s)]
+    if clean_sources:
+        lines.append(
+            "Other tool sources (not per-channel switchable yet): "
+            + ", ".join(sorted(clean_sources))
+        )
+    if not feature_flags.get(FEATURE_ADVANCED_TOOL_CONTROLS):
+        lines.append(
+            "Note: `advanced_tool_controls` is off, so this isn't enforced "
+            "yet — any `/fil-tools` change turns it on."
+        )
+    example_target = sorted(servers)[0] if servers else "post"
+    lines += [
+        "",
+        "**Examples:**",
+        f"- `/fil-tools {label} {example_target} off`",
+        f"- `/fil-tools {label} read_history on`",
+        "Typos are fine — I'll confirm what I understood.",
+    ]
+    return "\n".join(lines)
+
+
+def render_guidance_show(
+    *,
+    room_id: str,
+    channel_name: str,
+    channel_instructions: dict,
+) -> str:
+    """The ``/fil-guidance <channel>`` status reply: the current guidance
+    verbatim (blockquoted — it's the principal's own text), plus how to set
+    or clear it."""
+    label = _channel_label(room_id, channel_name)
+    text = (channel_instructions or {}).get(room_id)
+    if isinstance(text, str) and text:
+        lines = [f"**{label}** guidance ({len(text)} chars):"]
+        lines += [f"> {line}" for line in text.splitlines()]
+    else:
+        lines = [f"No guidance is set for **{label}**."]
+    lines += [
+        "",
+        f"Set it with `/fil-guidance {label} <text…>`; clear it with "
+        f"`/fil-guidance {label} clear`.",
+    ]
     return "\n".join(lines)

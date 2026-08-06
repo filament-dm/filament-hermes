@@ -1,8 +1,11 @@
 """Adapter-level wiring for the backchannel slash-command layer.
 
-The product invariant pinned here lives in ``_handle_control_message``: a
-control message whose body starts with ``/`` is executed deterministically —
-it must NEVER be dispatched to the LLM, in success or failure. The pure
+The product invariant pinned here lives in ``_handle_control_message``, in
+both directions: a control message whose stripped body starts with ``/fil-``
+(case-insensitive) is executed deterministically — it must NEVER be
+dispatched to the LLM, in success or failure — while any *other* leading-``/``
+message belongs to some other software's slash namespace and must fall
+through to the normal LLM control path untouched. The pure
 parsing/compilation is covered in ``test_slash.py``; these tests exercise the
 adapter seam around it: live channel resolution via ``list_channels``, the
 store writes, the section write-backs, and the confirmation reply.
@@ -199,12 +202,12 @@ def _control_msg(body):
 
 def test_slash_message_never_reaches_the_llm(tmp_path, monkeypatch):
     a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
-    asyncio.run(a._handle_control_message(_control_msg("/tools #welcome post off")))
+    asyncio.run(a._handle_control_message(_control_msg("/fil-tools #welcome post off")))
     assert dispatched == []  # no LLM turn, ever
     assert len(api.posted) == 1
     room, reply = api.posted[0]
     assert room == _CC_ROOM
-    assert reply.startswith("✓ Disabled post in #welcome")
+    assert reply.startswith("✓ Disabled **post** in **#welcome**")
     # The mutation landed in the real store files (read-fresh-per-event).
     policy = json.loads((tmp_path / "capability_policy.json").read_text())
     assert policy["per_channel"][_WELCOME] == [
@@ -221,17 +224,17 @@ def test_slash_message_never_reaches_the_llm(tmp_path, monkeypatch):
 
 def test_unparseable_slash_message_replies_help_not_model(tmp_path, monkeypatch):
     a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
-    asyncio.run(a._handle_control_message(_control_msg("/frobnicate the widgets")))
+    asyncio.run(a._handle_control_message(_control_msg("/fil-frobnicate the widgets")))
     assert dispatched == []  # parse failure is help text, not a model turn
     assert len(api.posted) == 1
-    assert "/tools" in api.posted[0][1]  # the command index
+    assert "/fil-tools" in api.posted[0][1]  # the command index
     assert sync.written_back == []  # nothing written
 
 
 def test_guidance_slash_writes_channel_instructions(tmp_path, monkeypatch):
     a, _api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
     asyncio.run(
-        a._handle_control_message(_control_msg("/guidance #welcome Be  brief."))
+        a._handle_control_message(_control_msg("/fil-guidance #welcome Be  brief."))
     )
     assert dispatched == []
     saved = json.loads((tmp_path / "channel_instructions.json").read_text())
@@ -246,10 +249,37 @@ def test_space_rooms_are_not_slash_channels(tmp_path, monkeypatch):
     assert all(room_id != "!loop:fil" for room_id, _name in channels)
 
 
+def test_tools_status_slash_replies_without_writes(tmp_path, monkeypatch):
+    # "/fil-tools <channel>" with no target/verb is a read-only status query:
+    # a deterministic reply, no LLM turn, no store writes, no write-backs.
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(a._handle_control_message(_control_msg("/fil-tools #welcome")))
+    assert dispatched == []
+    assert len(api.posted) == 1
+    reply = api.posted[0][1]
+    assert "**#welcome**" in reply
+    assert "**read_history**" in reply  # granted rows, bold names
+    assert "`/fil-tools #welcome" in reply  # usage examples
+    assert sync.written_back == []
+    assert not (tmp_path / "capability_policy.json").exists()
+
+
 def test_non_slash_control_message_still_dispatches(tmp_path, monkeypatch):
     a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
     asyncio.run(a._handle_control_message(_control_msg("hello there")))
     assert len(dispatched) == 1  # the normal LLM control path is untouched
+
+
+def test_non_fil_slash_message_falls_through_to_llm(tmp_path, monkeypatch):
+    # The other direction of the intercept boundary: leading-/ messages
+    # outside the /fil- namespace belong to other software's slash commands
+    # and must NOT be swallowed — they take the normal LLM control path.
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    for body in ("/tools #welcome post off", "/help", "/filament status"):
+        asyncio.run(a._handle_control_message(_control_msg(body)))
+    assert len(dispatched) == 3  # every one reached the LLM path
+    assert api.posted == []  # no deterministic reply
+    assert sync.written_back == []  # and no config writes
 
 
 if __name__ == "__main__":
