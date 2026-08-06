@@ -183,6 +183,18 @@ def test_tools_channel_only_is_a_status_query():
         ), token
 
 
+def test_tools_list_is_the_catalog_query():
+    assert parse("/fil-tools list") == slash.ToolsList()
+    # Fuzzy like any other token.
+    assert parse("/fil-tools lst") == slash.ToolsList()
+
+
+def test_tools_list_mixed_with_other_tokens_is_unparsed():
+    result = parse("/fil-tools list #welcome post off")
+    assert isinstance(result, slash.Unparsed)
+    assert "`/fil-tools list`" in result.problem
+
+
 def test_tools_verb_without_target_still_asks():
     # Channel + verb but no target stays an error — only the bare-channel
     # form is the status query.
@@ -394,8 +406,24 @@ def test_help_index_lists_all_commands_and_help_hint():
     assert "\n- `/fil-config show`" in text
 
 
-def test_help_tools_shows_rows_mcp_servers_and_examples():
-    text = slash.help_tools(CHANNELS, {"linear": 62, "gcal": None}, ["cli"])
+def test_help_tools_is_compact_pointers_only():
+    # The bare /fil-tools (and /fil-tools help) reply: purpose + pointers,
+    # not the catalog — that moved entirely under /fil-tools list.
+    text = slash.help_tools(CHANNELS)
+    assert len(text.splitlines()) == 5
+    assert "- `/fil-tools list`" in text
+    assert "- `/fil-tools <channel>`" in text
+    assert "- `/fil-tools <channel> <tool> <on|off>`" in text
+    assert "`/fil-tools #welcome linear off`" in text  # real-channel example
+    assert "Typos are fine" in text
+    for row in slash.ROWS:  # no catalog content
+        assert slash.ROW_DESCRIPTIONS[row] not in text
+
+
+def test_render_tools_list_shows_full_catalog():
+    text = slash.render_tools_list(
+        CHANNELS, {"linear": 62, "gcal": None}, ["cli"]
+    )
     for row in slash.ROWS:
         # Bold row name bullets with the one-line copy.
         assert f"- **{row}** — {slash.ROW_DESCRIPTIONS[row]}" in text
@@ -404,16 +432,25 @@ def test_help_tools_shows_rows_mcp_servers_and_examples():
     assert "not per-channel switchable yet" in text
     assert "cli" in text
     assert "**Built-in bundles:**" in text
-    # Examples use a real channel, are backticked, and advertise the fuzzy
-    # tolerance; the status form is advertised too.
+    # The change example uses a real channel and is backticked.
     assert "`/fil-tools #welcome linear off`" in text
-    assert "`/fil-tools #welcome`" in text
-    assert "spelling close enough" in text
 
 
-def test_help_tools_without_mcp_servers():
-    text = slash.help_tools(CHANNELS, {}, [])
-    assert "none" in text
+def test_render_tools_list_without_mcp_servers():
+    text = slash.render_tools_list(CHANNELS, {}, [])
+    assert "**Connected MCP servers:** none" in text
+
+
+def test_example_channel_placeholder_when_no_shared_channels():
+    # With no shared channels (e.g. backchannel-only agent), examples fall
+    # back to a generic placeholder, never nothing.
+    for text in (
+        slash.help_tools(()),
+        slash.render_tools_list(()),
+        slash.help_wake(()),
+        slash.help_guidance(()),
+    ):
+        assert "#your-channel" in text
 
 
 def test_help_wake_and_guidance_use_live_channel():
@@ -429,9 +466,11 @@ def test_help_feature_lists_known_features():
 
 def test_help_for_dispatches():
     assert slash.help_for(None) == slash.help_index()
-    assert slash.help_for("tools", channels=CHANNELS) == slash.help_tools(
-        CHANNELS, (), ()
-    )
+    # /fil-tools help is the same compact usage as bare /fil-tools — the
+    # catalog vocabularies feed only /fil-tools list.
+    assert slash.help_for(
+        "tools", channels=CHANNELS, mcp_servers={"linear": 3}
+    ) == slash.help_tools(CHANNELS)
     assert slash.help_for("config") == slash.help_config()
 
 
@@ -758,3 +797,36 @@ def test_render_guidance_show_when_unset():
     )
     assert "No guidance is set for **#welcome**." in text
     assert "`/fil-guidance #welcome <text…>`" in text
+
+
+# ── Backchannel exclusion ────────────────────────────────────────────
+# The adapter passes the cc room separately, never in ``channels``:
+# per-channel controls are meaningless for the control plane and its name
+# must never surface as a help example.
+
+BACKCHANNEL = ("!cc:fil", "backchannel")
+
+
+def test_backchannel_targeting_gets_the_note():
+    for body in (
+        "/fil-tools #backchannel post off",
+        "/fil-tools !cc:fil post off",
+        "/fil-tools #backchannel",
+        "/fil-wake #backchannel all",
+    ):
+        result = parse(body, backchannel=BACKCHANNEL)
+        assert isinstance(result, slash.Unparsed), body
+        assert result.problem == slash.BACKCHANNEL_NOTE, body
+
+
+def test_guidance_targeting_backchannel_gets_the_note():
+    result = parse("/fil-guidance #backchannel be brief", backchannel=BACKCHANNEL)
+    assert isinstance(result, slash.Unparsed)
+    assert result.problem == slash.BACKCHANNEL_NOTE
+
+
+def test_unknown_channel_without_backchannel_match_keeps_generic_error():
+    result = parse("/fil-tools #nosuch post off", backchannel=BACKCHANNEL)
+    assert isinstance(result, slash.Unparsed)
+    assert "nosuch" in result.problem
+    assert result.problem != slash.BACKCHANNEL_NOTE

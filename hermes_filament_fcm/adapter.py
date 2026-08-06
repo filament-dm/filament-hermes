@@ -1798,14 +1798,24 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
     # ── Slash commands (control plane, no LLM) ──────────────────────
 
-    async def _slash_channels(self) -> list[tuple[str, str]]:
-        """The agent's channels as ``(room_id, name)`` for slash-command
-        channel resolution — server-attributed data from ``list_channels``
-        (loops/spaces are filtered out; only channels can carry per-channel
-        config). Best-effort: ``[]`` on any failure, which makes every
-        channel token unresolvable and the reply an error, never a guess."""
+    async def _slash_channels(
+        self,
+    ) -> tuple[list[tuple[str, str]], tuple[str, str] | None]:
+        """The agent's *shared* channels as ``(room_id, name)`` for
+        slash-command channel resolution, plus the excluded backchannel —
+        server-attributed data from ``list_channels`` (loops/spaces are
+        filtered out; only channels can carry per-channel config). The cc
+        room is excluded from the vocabulary: per-channel controls are
+        meaningless for the control plane, and it must never surface as a
+        help example — it is returned separately so a command explicitly
+        targeting it gets the shared-channels-only note. Best-effort:
+        ``([], …)`` on any failure, which makes every channel token
+        unresolvable and the reply an error, never a guess."""
+        backchannel: tuple[str, str] | None = (
+            (self._cc_room_id, "") if self._cc_room_id else None
+        )
         if not self._filament_api:
-            return []
+            return [], backchannel
         try:
             with bound_context(call_origin="slash_command"):
                 raw = await self._filament_api.call_tool("list_channels", {})
@@ -1815,17 +1825,22 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 "filament-fcm: list_channels failed for slash command",
                 exc_info=True,
             )
-            return []
+            return [], backchannel
         rows = parsed.get("channels") if isinstance(parsed, dict) else None
         channels: list[tuple[str, str]] = []
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict) or row.get("type") == "m.space":
                 continue
             room_id = row.get("channel_id")
-            if isinstance(room_id, str) and room_id:
-                name = row.get("name")
-                channels.append((room_id, name if isinstance(name, str) else ""))
-        return channels
+            if not (isinstance(room_id, str) and room_id):
+                continue
+            name = row.get("name")
+            clean = name if isinstance(name, str) else ""
+            if self._cc_room_id and room_id == self._cc_room_id:
+                backchannel = (room_id, clean)
+                continue
+            channels.append((room_id, clean))
+        return channels, backchannel
 
     async def _handle_slash_command(self, msg: PushMessage, body: str) -> None:
         """Execute one backchannel slash command deterministically.
@@ -1841,7 +1856,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             event_id=msg.event_id,
             room_id=msg.room_id,
         )
-        channels = await self._slash_channels()
+        channels, backchannel = await self._slash_channels()
         mcp_servers = _mcp_server_inventory()
         capability_policy = self._capability_store.read()
         raw_bundles = capability_policy.get("bundles")
@@ -1856,6 +1871,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             mcp_servers=mcp_servers,
             bundles=bundles,
             features=KNOWN_FEATURES,
+            backchannel=backchannel,
         )
         sections: tuple[str, ...] = ()
         if isinstance(result, slash.HelpRequest):
@@ -1873,6 +1889,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 channel_instructions=self._channel_instructions.read(),
                 feature_flags=self._feature_flags.read(),
                 channels=channels,
+            )
+        elif isinstance(result, slash.ToolsList):
+            text = slash.render_tools_list(
+                channels=channels,
+                mcp_servers=mcp_servers,
+                other_sources=_other_tool_sources(),
             )
         elif isinstance(result, slash.ToolsStatus):
             text = slash.render_tools_status(

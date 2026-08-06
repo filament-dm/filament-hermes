@@ -84,6 +84,19 @@ COMMANDS: tuple[str, ...] = (
     "feature",
 )
 
+# The tools command also accepts a bare "list" (the full tool catalog);
+# it is matched exactly like any other token (exact + fuzzy).
+LIST_WORD = "list"
+
+# Per-channel controls are meaningless for the control plane, so the
+# backchannel is excluded from the channel vocabulary. A token that would
+# have resolved to it gets this note instead of the generic unknown-channel
+# error.
+BACKCHANNEL_NOTE = (
+    "The backchannel isn't a shared channel — these controls apply to "
+    "shared channels only."
+)
+
 FUZZY_CUTOFF = 0.75
 # Two candidates whose match scores are within this margin are a near-tie:
 # the parser reports both instead of picking one. A wrong silent pick would
@@ -158,6 +171,12 @@ class ToolsStatus:
 
     room_id: str
     channel_name: str  # sanitized; "" when the channel is unnamed
+
+
+@dataclass(frozen=True)
+class ToolsList:
+    """``/fil-tools list`` — the adapter answers with the full tool catalog
+    (``render_tools_list``)."""
 
 
 @dataclass(frozen=True)
@@ -377,6 +396,7 @@ def _fill_slots(
     labels: Mapping[str, str],
     required: Sequence[str],
     complete: Sequence[Sequence[str]] = (),
+    backchannel_entries: Sequence[_Entry] = (),
 ):
     """Order-free classification: assign each non-filler token to an open
     slot. Returns ``(slots, None)`` on success — including a possibly
@@ -384,7 +404,10 @@ def _fill_slots(
     resolved) or a "still need …" reply — or ``(None, result)`` when a token
     was ambiguous or unplaceable. A slot set exactly matching one of
     ``complete`` is also a success even though ``required`` slots are
-    missing (e.g. a bare channel means "show status", not a mutation)."""
+    missing (e.g. a bare channel means "show status", not a mutation).
+    ``backchannel_entries`` is the excluded backchannel's own vocabulary: an
+    unmatched token that would have resolved there answers with
+    ``BACKCHANNEL_NOTE`` instead of the generic unknown-token error."""
     slots: dict[str, _Entry] = {}
     for text, _start, _end in tokens:
         if text.lower() in FILLER_WORDS:
@@ -396,6 +419,12 @@ def _fill_slots(
                 command=command, token=_sanitize(text), candidates=candidates
             )
         if entry is None:
+            if backchannel_entries:
+                bc_entry, bc_candidates = _score(text, backchannel_entries)
+                if bc_entry is not None or bc_candidates:
+                    return None, Unparsed(
+                        command=command, problem=BACKCHANNEL_NOTE
+                    )
             return None, Unparsed(
                 command=command,
                 problem=f'I couldn\'t match "{_sanitize(text)}" to {expects}.',
@@ -428,15 +457,20 @@ def parse(
     mcp_servers: object = (),
     bundles: Iterable[str] = (),
     features: Mapping[str, str] | None = None,
+    backchannel: tuple[str, str] | None = None,
 ):
     """Parse one backchannel ``/fil-`` message into a structured result.
 
     ``channels`` is the server-attributed ``[(room_id, name), …]`` list (from
-    ``list_channels``); ``mcp_servers`` the known MCP server names (sequence,
-    or name→tool-count mapping); ``bundles`` any extra grantable bundle names
-    (the policy's custom bundles); ``features`` the known feature flags
-    (name → description). Returns one of the result dataclasses above —
-    never raises, never returns anything that should reach an LLM.
+    ``list_channels``, with the backchannel already excluded — per-channel
+    controls are meaningless for the control plane); ``mcp_servers`` the
+    known MCP server names (sequence, or name→tool-count mapping);
+    ``bundles`` any extra grantable bundle names (the policy's custom
+    bundles); ``features`` the known feature flags (name → description);
+    ``backchannel`` the excluded cc room's ``(room_id, name)``, used only to
+    answer a command that explicitly targets it with ``BACKCHANNEL_NOTE``.
+    Returns one of the result dataclasses above — never raises, never
+    returns anything that should reach an LLM.
     """
     features = dict(features or {})
     text = (body or "").strip()
@@ -466,14 +500,15 @@ def parse(
     tokens = _tokenize(rest)
     if tokens and tokens[0][0].lower() == "help":
         return HelpRequest(command)
+    bc_entries = _channel_entries([backchannel]) if backchannel else []
     if command == "config":
         return _parse_config(tokens)
     if command == "tools":
-        return _parse_tools(tokens, channels, mcp_servers, bundles)
+        return _parse_tools(tokens, channels, mcp_servers, bundles, bc_entries)
     if command == "wake":
-        return _parse_wake(tokens, channels)
+        return _parse_wake(tokens, channels, bc_entries)
     if command == "guidance":
-        return _parse_guidance(rest, tokens, channels)
+        return _parse_guidance(rest, tokens, channels, bc_entries)
     return _parse_feature(tokens, features)
 
 
@@ -495,25 +530,36 @@ def _parse_tools(
     channels: Sequence[tuple[str, str]],
     mcp_servers: object,
     bundles: Iterable[str],
+    backchannel_entries: Sequence[_Entry] = (),
 ):
     entries = (
         _channel_entries(channels)
         + _target_entries(mcp_servers, bundles)
         + _verb_entries()
+        + [_Entry("list", LIST_WORD, LIST_WORD, LIST_WORD)]
     )
     slots, result = _fill_slots(
         tokens,
         entries,
         "tools",
-        "a channel, a tool bundle, or on/off",
+        "a channel, a tool bundle, on/off, or list",
         {"channel": "channel", "target": "bundle", "verb": "on/off"},
         ("channel", "target", "verb"),
         # A bare channel is a complete question, not a truncated mutation:
-        # "/fil-tools #welcome" asks what's enabled there.
-        complete=(("channel",),),
+        # "/fil-tools #welcome" asks what's enabled there; a bare "list"
+        # asks for the full catalog.
+        complete=(("channel",), ("list",)),
+        backchannel_entries=backchannel_entries,
     )
     if result is not None or slots is None:
         return result
+    if set(slots) == {"list"}:
+        return ToolsList()
+    if "list" in slots:
+        return Unparsed(
+            command="tools",
+            problem='"list" stands alone — say `/fil-tools list`.',
+        )
     room_id, channel_name = slots["channel"].canonical
     if "target" not in slots:
         return ToolsStatus(room_id=room_id, channel_name=channel_name)
@@ -528,6 +574,7 @@ def _parse_tools(
 def _parse_wake(
     tokens: Sequence[tuple[str, int, int]],
     channels: Sequence[tuple[str, str]],
+    backchannel_entries: Sequence[_Entry] = (),
 ):
     entries = _channel_entries(channels) + [
         _Entry("mode", m, m, m) for m in WAKE_MODES
@@ -539,6 +586,7 @@ def _parse_wake(
         "a channel or a wake mode (mention/all/off)",
         {"channel": "channel", "mode": "wake mode"},
         ("channel", "mode"),
+        backchannel_entries=backchannel_entries,
     )
     if result is not None or slots is None:
         return result
@@ -554,6 +602,7 @@ def _parse_guidance(
     rest: str,
     tokens: Sequence[tuple[str, int, int]],
     channels: Sequence[tuple[str, str]],
+    backchannel_entries: Sequence[_Entry] = (),
 ):
     index = 0
     while index < len(tokens) and tokens[index][0].lower() in FILLER_WORDS:
@@ -567,6 +616,10 @@ def _parse_guidance(
             command="guidance", token=_sanitize(token), candidates=candidates
         )
     if entry is None:
+        if backchannel_entries:
+            bc_entry, bc_candidates = _score(token, backchannel_entries)
+            if bc_entry is not None or bc_candidates:
+                return Unparsed(command="guidance", problem=BACKCHANNEL_NOTE)
         return Unparsed(
             command="guidance",
             problem=f'I couldn\'t find a channel matching "{_sanitize(token)}".',
@@ -642,11 +695,14 @@ def render_reply(result) -> str:
 
 
 def _example_channel(channels: Sequence[tuple[str, str]]) -> str:
+    """A real shared channel for examples (the backchannel never appears —
+    the adapter excludes it from ``channels``); a generic placeholder when
+    no shared channel is known yet."""
     for _room_id, name in channels:
         clean = _sanitize(name or "")
         if clean:
             return f"#{clean}"
-    return "#general"
+    return "#your-channel"
 
 
 def _channels_line(channels: Sequence[tuple[str, str]], limit: int = 12) -> str:
@@ -691,16 +747,35 @@ def help_config() -> str:
     )
 
 
-def help_tools(
+def help_tools(channels: Sequence[tuple[str, str]] = ()) -> str:
+    """The compact `/fil-tools` usage (also the `/fil-tools help` reply):
+    one-line purpose plus pointers. The full catalog lives under
+    `/fil-tools list` (``render_tools_list``)."""
+    example = _example_channel(channels)
+    return "\n".join(
+        [
+            "`/fil-tools` — control which tools I may use per shared "
+            "channel.",
+            "- `/fil-tools list` — all tools & sources",
+            "- `/fil-tools <channel>` — what's enabled there",
+            "- `/fil-tools <channel> <tool> <on|off>` — change it "
+            f"(e.g. `/fil-tools {example} linear off`)",
+            "Typos are fine — I'll confirm what I understood.",
+        ]
+    )
+
+
+def render_tools_list(
     channels: Sequence[tuple[str, str]] = (),
     mcp_servers: object = (),
     other_sources: Sequence[str] = (),
 ) -> str:
+    """The `/fil-tools list` reply: the full tool catalog — built-in rows
+    with their one-liners, connected MCP servers with tool counts, and the
+    non-switchable sources."""
     example = _example_channel(channels)
     lines = [
-        "`/fil-tools <channel> <tool-or-bundle> <on|off>` — control which "
-        "tools I may use in a shared channel (token order doesn't matter).",
-        f"`/fil-tools {example}` — show what's currently enabled there.",
+        "**Tool catalog** — grantable per shared channel:",
         "",
         "**Built-in bundles:**",
     ]
@@ -729,12 +804,9 @@ def help_tools(
         )
     lines += [
         "",
-        "**Examples:**",
-        f"- `/fil-tools {example} linear off` — spelling close enough "
-        "works; I'll confirm what I understood",
-        f"- `/fil-tools {example} read_history on`",
-        f"- `/fil-tools {example} post revoke` — verbs: on/off, "
-        "enable/disable, grant/revoke, allow/deny",
+        f"Change with `/fil-tools <channel> <tool> <on|off>` (e.g. "
+        f"`/fil-tools {example} linear off` — verbs: on/off, "
+        "enable/disable, grant/revoke, allow/deny).",
         _channels_line(channels),
     ]
     return "\n".join(lines)
@@ -801,7 +873,9 @@ def help_for(
     if command == "config":
         return help_config()
     if command == "tools":
-        return help_tools(channels, mcp_servers, other_sources)
+        # Same compact usage as bare `/fil-tools`; the full catalog is
+        # `/fil-tools list` (mcp_servers/other_sources feed only that).
+        return help_tools(channels)
     if command == "wake":
         return help_wake(channels)
     if command == "guidance":

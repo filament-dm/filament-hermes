@@ -242,11 +242,42 @@ def test_guidance_slash_writes_channel_instructions(tmp_path, monkeypatch):
     assert sync.written_back == ["channel_instructions"]
 
 
-def test_space_rooms_are_not_slash_channels(tmp_path, monkeypatch):
+def test_space_rooms_and_backchannel_are_not_slash_channels(tmp_path, monkeypatch):
     a, _api, _sync, _dispatched = _make_adapter(tmp_path, monkeypatch)
-    channels = asyncio.run(a._slash_channels())
+    channels, backchannel = asyncio.run(a._slash_channels())
     assert (_WELCOME, "welcome") in channels
     assert all(room_id != "!loop:fil" for room_id, _name in channels)
+    # The cc room is excluded from the vocabulary (per-channel controls are
+    # meaningless for the control plane) and returned separately so the
+    # parser can answer explicit targeting with the shared-channels-only
+    # note. Consequence: it can never surface as a help example.
+    assert all(room_id != _CC_ROOM for room_id, _name in channels)
+    assert backchannel == (_CC_ROOM, "backchannel")
+
+
+def test_slash_command_targeting_backchannel_gets_note(tmp_path, monkeypatch):
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(
+        a._handle_control_message(_control_msg("/fil-tools #backchannel post off"))
+    )
+    assert dispatched == []
+    assert len(api.posted) == 1
+    assert "shared channels only" in api.posted[0][1]
+    assert sync.written_back == []  # no writes
+
+
+def test_slash_tools_list_replies_catalog(tmp_path, monkeypatch):
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(a._handle_control_message(_control_msg("/fil-tools list")))
+    assert dispatched == []
+    assert len(api.posted) == 1
+    reply = api.posted[0][1]
+    assert "**Built-in bundles:**" in reply
+    assert "**read_history**" in reply
+    # Examples come from the shared-channel list, backchannel excluded.
+    assert "#welcome" in reply
+    assert "#backchannel" not in reply
+    assert sync.written_back == []
 
 
 def test_tools_status_slash_replies_without_writes(tmp_path, monkeypatch):
