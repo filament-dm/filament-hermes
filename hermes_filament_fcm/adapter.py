@@ -144,20 +144,23 @@ def _mcp_server_inventory() -> dict[str, int]:
         return {}
 
 
-def _other_tool_sources() -> list[str]:
-    """Registered toolsets that are neither Filament's own nor an MCP server
-    — surfaced in ``/tools help`` as tool sources that exist but are not
-    per-channel switchable (no ``mcp:<server>`` auto-bundle names them)."""
+def _other_tool_sources() -> dict[str, int]:
+    """Registered toolsets that are neither Filament's own nor an MCP server,
+    as ``{name: live tool count}`` — surfaced by the slash layer as runtime
+    plugins on the agent's host: available in the backchannel, blocked in
+    shared channels while enforcement is on (no ``mcp:<server>`` auto-bundle
+    names them, so they are not per-channel switchable)."""
     try:
         from tools.registry import registry  # noqa: PLC0415
 
-        return sorted(
-            str(ts)
-            for ts in registry.get_registered_toolset_names()
-            if str(ts) != "filament" and not str(ts).startswith("mcp-")
-        )
+        out: dict[str, int] = {}
+        for ts in registry.get_registered_toolset_names():
+            name = str(ts)
+            if name != "filament" and not name.startswith("mcp-"):
+                out[name] = len(list(registry.get_tool_names_for_toolset(name)))
+        return out
     except Exception:
-        return []
+        return {}
 
 
 def _sanitize_meta(value: str, limit: int = 80) -> str:
@@ -1882,26 +1885,31 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 other_sources=_other_tool_sources(),
                 features=KNOWN_FEATURES,
             )
-        elif isinstance(result, slash.ShowConfig):
-            text = slash.render_config_show(
+        elif isinstance(result, slash.Redirect):
+            # A retired old-form invocation: reply-only pointer to the new
+            # /fil-config spelling.
+            text = result.reply
+        elif isinstance(result, slash.ChannelsOverview):
+            text = slash.render_config_list(
                 capability_policy=capability_policy,
                 wake_policy=self._wake_policy.read(),
                 channel_instructions=self._channel_instructions.read(),
-                feature_flags=self._feature_flags.read(),
                 channels=channels,
             )
-        elif isinstance(result, slash.ToolsList):
-            text = slash.render_tools_list(
-                channels=channels,
-                mcp_servers=mcp_servers,
-                other_sources=_other_tool_sources(),
-            )
-        elif isinstance(result, slash.ToolsStatus):
-            text = slash.render_tools_status(
+        elif isinstance(result, slash.ChannelShow):
+            text = slash.render_channel_show(
                 room_id=result.room_id,
                 channel_name=result.channel_name,
                 capability_policy=capability_policy,
                 feature_flags=self._feature_flags.read(),
+                wake_policy=self._wake_policy.read(),
+                channel_instructions=self._channel_instructions.read(),
+                mcp_servers=mcp_servers,
+                other_sources=_other_tool_sources(),
+            )
+        elif isinstance(result, slash.ToolsList):
+            text = slash.render_tools_list(
+                channels=channels,
                 mcp_servers=mcp_servers,
                 other_sources=_other_tool_sources(),
             )

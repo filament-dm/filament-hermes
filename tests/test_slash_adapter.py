@@ -202,7 +202,9 @@ def _control_msg(body):
 
 def test_slash_message_never_reaches_the_llm(tmp_path, monkeypatch):
     a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
-    asyncio.run(a._handle_control_message(_control_msg("/fil-tools #welcome post off")))
+    asyncio.run(
+        a._handle_control_message(_control_msg("/fil-config #welcome post off"))
+    )
     assert dispatched == []  # no LLM turn, ever
     assert len(api.posted) == 1
     room, reply = api.posted[0]
@@ -227,14 +229,16 @@ def test_unparseable_slash_message_replies_help_not_model(tmp_path, monkeypatch)
     asyncio.run(a._handle_control_message(_control_msg("/fil-frobnicate the widgets")))
     assert dispatched == []  # parse failure is help text, not a model turn
     assert len(api.posted) == 1
-    assert "/fil-tools" in api.posted[0][1]  # the command index
+    assert "/fil-config" in api.posted[0][1]  # the command index
     assert sync.written_back == []  # nothing written
 
 
 def test_guidance_slash_writes_channel_instructions(tmp_path, monkeypatch):
     a, _api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
     asyncio.run(
-        a._handle_control_message(_control_msg("/fil-guidance #welcome Be  brief."))
+        a._handle_control_message(
+            _control_msg("/fil-config #welcome guidance Be  brief.")
+        )
     )
     assert dispatched == []
     saved = json.loads((tmp_path / "channel_instructions.json").read_text())
@@ -258,7 +262,7 @@ def test_space_rooms_and_backchannel_are_not_slash_channels(tmp_path, monkeypatc
 def test_slash_command_targeting_backchannel_gets_note(tmp_path, monkeypatch):
     a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
     asyncio.run(
-        a._handle_control_message(_control_msg("/fil-tools #backchannel post off"))
+        a._handle_control_message(_control_msg("/fil-config #backchannel post off"))
     )
     assert dispatched == []
     assert len(api.posted) == 1
@@ -268,7 +272,7 @@ def test_slash_command_targeting_backchannel_gets_note(tmp_path, monkeypatch):
 
 def test_slash_tools_list_replies_catalog(tmp_path, monkeypatch):
     a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
-    asyncio.run(a._handle_control_message(_control_msg("/fil-tools list")))
+    asyncio.run(a._handle_control_message(_control_msg("/fil-config tools list")))
     assert dispatched == []
     assert len(api.posted) == 1
     reply = api.posted[0][1]
@@ -280,17 +284,46 @@ def test_slash_tools_list_replies_catalog(tmp_path, monkeypatch):
     assert sync.written_back == []
 
 
-def test_tools_status_slash_replies_without_writes(tmp_path, monkeypatch):
-    # "/fil-tools <channel>" with no target/verb is a read-only status query:
-    # a deterministic reply, no LLM turn, no store writes, no write-backs.
+def test_channel_show_slash_replies_without_writes(tmp_path, monkeypatch):
+    # "/fil-config <channel>" is a read-only full-config query: one
+    # deterministic reply, no LLM turn, no store writes, no write-backs.
     a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
-    asyncio.run(a._handle_control_message(_control_msg("/fil-tools #welcome")))
+    asyncio.run(a._handle_control_message(_control_msg("/fil-config #welcome")))
     assert dispatched == []
     assert len(api.posted) == 1
     reply = api.posted[0][1]
-    assert "**#welcome**" in reply
+    assert reply.startswith("**#welcome** configuration:")
     assert "**read_history**" in reply  # granted rows, bold names
-    assert "`/fil-tools #welcome" in reply  # usage examples
+    assert "**Wake:** mention (default)" in reply
+    assert "**Guidance:** none" in reply
+    assert "`/fil-config #welcome" in reply  # usage examples
+    assert sync.written_back == []
+    assert not (tmp_path / "capability_policy.json").exists()
+
+
+def test_config_list_slash_replies_overview_without_writes(tmp_path, monkeypatch):
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(a._handle_control_message(_control_msg("/fil-config list")))
+    assert dispatched == []
+    assert len(api.posted) == 1
+    reply = api.posted[0][1]
+    assert reply.startswith("**Channels:**")
+    assert "- **#welcome** — tools: default" in reply
+    assert "Details: `/fil-config #welcome show`" in reply
+    assert "#backchannel" not in reply  # excluded from the overview too
+    assert sync.written_back == []
+
+
+def test_old_form_slash_gets_redirect_not_mutation(tmp_path, monkeypatch):
+    # A retired top-level command answers with the one-line redirect —
+    # deterministic, no LLM turn, and crucially no writes.
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(a._handle_control_message(_control_msg("/fil-tools #welcome post off")))
+    assert dispatched == []
+    assert len(api.posted) == 1
+    reply = api.posted[0][1]
+    assert "moved under `/fil-config`" in reply
+    assert "`/fil-config #welcome post off`" in reply
     assert sync.written_back == []
     assert not (tmp_path / "capability_policy.json").exists()
 
