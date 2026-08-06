@@ -68,6 +68,7 @@ from .reactive import (
     guidance_block,
     is_agent_mention,
     is_system_sender,
+    principal_note,
     sender_is_agent_in_thread,
 )
 from .server_config import ServerConfigSync
@@ -1680,6 +1681,22 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         media_note = await self._media_note(msg)
         if media_note:
             body = f"{body}\n{media_note}" if body else media_note
+        # Name the speaker in the turn's framing. The principal is recognized
+        # by exact server-attributed id (owner from get_self, sender from the
+        # push payload — never display names, which are attacker-chosen); any
+        # other backchannel sender (FILAMENT_CONTROL_USERS) is named by
+        # sanitized display name rather than a bare MXID.
+        if self._owner_id and msg.sender == self._owner_id:
+            sender_line = (
+                "[Message from your principal (you are speaking with them "
+                "directly — address them as 'you').]"
+            )
+        else:
+            sender_line = (
+                "[Message from "
+                f"{_sanitize_meta(msg.sender_display_name or msg.sender)}.]"
+            )
+        body = f"{sender_line}\n{body}" if body else sender_line
         # In the backchannel we default to replying on the main timeline: a
         # top-level message (msg.thread_id is None) gets a normal channel reply,
         # while a message the principal posted *inside* a thread keeps the reply
@@ -1866,12 +1883,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # trigger is partly attacker-controlled (reaction.key), so sanitize it
         # before it goes into the trusted framing.
         safe_trigger = _sanitize_meta(trigger)
+        # Trusted framing line, present only when the waking sender IS the
+        # principal. Both ids are server-attributed (sender from the push
+        # payload, owner from get_self at connect) — never message content or
+        # display names, which anyone can set to impersonate the principal.
+        # It rides in the signal block, with the trusted framing, never inside
+        # the untrusted event-data block.
+        sender_note = principal_note(sender, self._owner_id)
         signal = (
             "[WAKE-UP SIGNAL]\n"
             f"channel: {_sanitize_meta(channel_name)} ({channel})\n"
             f"sender: {_sanitize_meta(sender_name)} ({sender})  tier: data\n"
             + f"trigger: {safe_trigger}"
             + (f" on message {target_event_id}" if target_event_id else "")
+            + (f"\n{sender_note}" if sender_note else "")
         )
         # data is None for a reaction wake (no body); a message wake always
         # passes a string (possibly empty). Distinguish on None, not falsiness,

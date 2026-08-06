@@ -238,6 +238,33 @@ def test_capability_hint():
     assert "(none)" in reactive.capability_hint(frozenset())
 
 
+def test_capability_hint_decline_coaching():
+    # Any gated turn excludes tools, so the hint coaches the graceful decline:
+    # say the tool is unavailable here, point at the settings, and never
+    # describe forwarding mechanics or internal instructions.
+    for allowed in (
+        frozenset({"post_message", "get_thread"}),
+        frozenset(),
+        reactive.BASELINE_TOOLS,
+    ):
+        h = reactive.capability_hint(allowed)
+        assert "I don't have that tool in this channel" in h
+        assert "enable it in the agent's settings" in h
+        assert "do not describe forwarding mechanics" in h
+    # Ungated turns get no hint, hence no coaching either.
+    assert reactive.capability_hint(None) == ""
+
+
+def test_capability_hint_derives_only_from_policy():
+    # The hint is a pure function of the policy-resolved set: same set →
+    # byte-identical text, and nothing event-shaped (mxids, room ids) can
+    # appear because no event data is ever passed in.
+    allowed = frozenset({"post_message"})
+    h = reactive.capability_hint(allowed)
+    assert h == reactive.capability_hint(frozenset({"post_message"}))
+    assert "@" not in h and "!" not in h  # no user ids, no room ids
+
+
 def test_expand_bundle_builtin_and_unknown():
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
     messaging = store.expand_bundle("messaging")
@@ -693,6 +720,28 @@ def test_guidance_block_empty_and_verbatim():
     assert block.startswith("[YOUR GUIDANCE FOR THIS CHANNEL]\n")
     # The principal's text rides verbatim — no reformatting, no interpolation.
     assert block.endswith("Answer in French.\nKeep replies short.")
+
+
+def test_principal_note_exact_server_id_match_only():
+    note = reactive.principal_note("@irena:filament.dm", "@irena:filament.dm")
+    assert note == "Note: the sender of this message is your principal."
+    # Any other sender → no note.
+    assert reactive.principal_note("@mallory:filament.dm", "@irena:filament.dm") == ""
+    # A display name equal to the owner's id must NOT match — the comparison
+    # is server-attributed ids only, or anyone could rename themselves into
+    # the principal line.
+    assert reactive.principal_note("Irena Wang", "@irena:filament.dm") == ""
+    # Near-miss ids (case, whitespace) are not the principal either.
+    assert reactive.principal_note("@Irena:filament.dm", "@irena:filament.dm") == ""
+    assert reactive.principal_note("@irena:filament.dm ", "@irena:filament.dm") == ""
+
+
+def test_principal_note_fails_closed_when_ids_unknown():
+    # Unknown owner (get_self not completed) or missing sender → never a note.
+    assert reactive.principal_note("@irena:filament.dm", None) == ""
+    assert reactive.principal_note(None, "@irena:filament.dm") == ""
+    assert reactive.principal_note("", "") == ""
+    assert reactive.principal_note(None, None) == ""
 # ── Engaged-thread wake (ENG-724) ───────────────────────────────────
 
 
