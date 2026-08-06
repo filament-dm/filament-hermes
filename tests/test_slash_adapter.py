@@ -167,8 +167,16 @@ class _FakeServerSync:
         self.written_back.append(section)
 
 
-def _make_adapter(tmp_path, monkeypatch):
+def _make_adapter(tmp_path, monkeypatch, slash_enabled=True):
     monkeypatch.setenv("FILAMENT_FCM_CREDENTIALS_DIR", str(tmp_path))
+    # The slash surface is gated behind the slash_commands feature flag
+    # (default OFF, read fresh per event). Most tests exercise the enabled
+    # surface, so the fixture pre-seeds the flag file; pass
+    # slash_enabled=False to pin the dark default.
+    if slash_enabled:
+        (tmp_path / "feature_flags.json").write_text(
+            json.dumps({"slash_commands": True})
+        )
     api = _FakeFilamentAPI()
     sync = _FakeServerSync()
     a = adapter.FCMFilamentAdapter(object(), filament_api=api, server_sync=sync)
@@ -332,6 +340,24 @@ def test_non_slash_control_message_still_dispatches(tmp_path, monkeypatch):
     a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
     asyncio.run(a._handle_control_message(_control_msg("hello there")))
     assert len(dispatched) == 1  # the normal LLM control path is untouched
+
+
+def test_slash_flag_off_falls_through_to_llm(tmp_path, monkeypatch):
+    # Default-OFF gate: with slash_commands disabled, a /fil- message takes
+    # the normal LLM control path exactly like non-fil slashes — no
+    # deterministic reply, no writes. (Opt-in is via set_feature /
+    # set_agent_config / the server config document; slash can't enable
+    # itself while off.)
+    a, api, sync, dispatched = _make_adapter(
+        tmp_path, monkeypatch, slash_enabled=False
+    )
+    asyncio.run(
+        a._handle_control_message(_control_msg("/fil-config #welcome post off"))
+    )
+    assert len(dispatched) == 1  # reached handle_message
+    assert api.posted == []
+    assert sync.written_back == []
+    assert not (tmp_path / "capability_policy.json").exists()
 
 
 def test_non_fil_slash_message_falls_through_to_llm(tmp_path, monkeypatch):

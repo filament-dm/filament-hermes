@@ -1053,6 +1053,11 @@ class CapabilityPolicyStore:
 # policy, so a toggle takes effect on the next turn with no restart.
 FEATURE_ADVANCED_TOOL_CONTROLS = "advanced_tool_controls"
 
+# The deterministic /fil-* slash-command surface on the backchannel. Off by
+# default like every flag: a /fil- message then falls through to normal LLM
+# dispatch exactly like any other leading-/ message.
+FEATURE_SLASH_COMMANDS = "slash_commands"
+
 # Human-facing descriptions for the flags the code actually checks. Keep in
 # sync with the checks; surfaced by get_features and the set_feature tool so the
 # principal (and the agent mapping their request) knows what can be toggled.
@@ -1063,6 +1068,13 @@ KNOWN_FEATURES: dict[str, str] = {
         "tunable from the backchannel with set_capabilities. Off by default; "
         "when off the agent behaves exactly as a fresh install (all tools "
         "available in shared channels, subject only to the standing framing)."
+    ),
+    FEATURE_SLASH_COMMANDS: (
+        "Deterministic /fil-* slash commands on the backchannel "
+        "(/fil-help, /fil-config): intercepted before any LLM dispatch. Off "
+        "by default; when off, /fil- messages go to the model like any other "
+        "text. Enable via set_feature or the server config document — the "
+        "slash surface can't enable itself while it is off."
     ),
 }
 

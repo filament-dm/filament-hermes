@@ -56,6 +56,7 @@ from .observability import (
 from .reactive import (
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
+    FEATURE_SLASH_COMMANDS,
     KNOWN_FEATURES,
     CapabilityPolicyStore,
     ChannelInstructionsStore,
@@ -1726,7 +1727,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # we must not swallow it. Control-plane only by construction (this
         # method is only reached for the backchannel), which is what makes
         # the writes below legitimate.
-        if body and slash.is_fil_command(body):
+        #
+        # The whole surface is gated behind the slash_commands feature flag
+        # (default OFF, read fresh per event like the capability gate): while
+        # off, /fil- messages fall through to normal LLM dispatch exactly
+        # like non-fil slashes. The opt-in is deliberately asymmetric: the
+        # flag is enabled via set_feature / set_agent_config / the server
+        # config document (a /fil- message can't reach this layer to enable
+        # it), while opt-out works from slash itself
+        # (/fil-config feature slash_commands off).
+        if (
+            body
+            and slash.is_fil_command(body)
+            and self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+        ):
             await self._handle_slash_command(msg, body.strip())
             return
         # The push never includes attachments (ENG-603): describe any media on
