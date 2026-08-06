@@ -798,6 +798,7 @@ def render_tools_list(
         lines.append("**Connected MCP servers:** none")
     clean_sources = [_sanitize(str(s)) for s in other_sources if str(s)]
     if clean_sources:
+        lines.append("")
         lines.append(
             "Other tool sources (not per-channel switchable yet): "
             + ", ".join(sorted(clean_sources))
@@ -807,6 +808,7 @@ def render_tools_list(
         f"Change with `/fil-tools <channel> <tool> <on|off>` (e.g. "
         f"`/fil-tools {example} linear off` — verbs: on/off, "
         "enable/disable, grant/revoke, allow/deny).",
+        "",
         _channels_line(channels),
     ]
     return "\n".join(lines)
@@ -1180,14 +1182,17 @@ def render_tools_status(
         for server in sorted(servers)
         if f"{MCP_PREFIX}{server}" not in grants
     ]
+    lines.append("")
     lines.append(f"**Off:** {', '.join(off) if off else 'nothing'}")
     clean_sources = [_sanitize(str(s)) for s in other_sources if str(s)]
     if clean_sources:
+        lines.append("")
         lines.append(
             "Other tool sources (not per-channel switchable yet): "
             + ", ".join(sorted(clean_sources))
         )
     if not feature_flags.get(FEATURE_ADVANCED_TOOL_CONTROLS):
+        lines.append("")
         lines.append(
             "Note: `advanced_tool_controls` is off, so this isn't enforced "
             "yet — any `/fil-tools` change turns it on."
