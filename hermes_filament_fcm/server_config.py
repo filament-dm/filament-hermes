@@ -372,10 +372,14 @@ class ServerConfigSync:
 
     async def _sync_locked(self, *, force: bool) -> None:
         # A failed write-back retries before fetch-and-apply, so the fetch
-        # can't clobber a local edit that never made it to the server.
-        for section in sorted(self._pending_write_back):
-            if await self._write_back_locked(section):
-                self._pending_write_back.discard(section)
+        # can't clobber a local edit that never made it to the server. One
+        # batch: pushing pending sections one at a time would let the first
+        # push's rebase overwrite the others' local edits.
+        if self._pending_write_back:
+            if await self._write_back_locked(
+                frozenset(self._pending_write_back)
+            ):
+                self._pending_write_back.clear()
 
         # TTL re-checked under the lock: a caller that waited out an in-flight
         # sync (or write-back) skips instead of repeating the round-trip.
@@ -500,31 +504,41 @@ class ServerConfigSync:
 
     # ── Write-back ──────────────────────────────────────────────────
 
-    async def write_back(self, section: str) -> None:
-        """Push one locally edited *section* to the server after a ``set_*``
-        tool succeeded, rebased on the current server document.
+    async def write_back(self, *sections: str) -> None:
+        """Push locally edited *sections* to the server after a mutation
+        succeeded, rebased on the current server document.
 
-        Fetch the document, replace only *section* with the local file's
+        Fetch the document, replace only *sections* with the local files'
         contents, and PUT with the fetched revision as ``base_revision`` — so
         a write-back can never clobber newer server-side changes to *other*
-        sections, and two concurrent ``set_*`` handlers compose instead of
+        sections, and two concurrent handlers compose instead of
         last-writer-wins (the loser's 409 retries on the winner's document).
         The fetched document's other sections are applied locally at the same
-        time, so the files never sit stale behind the remembered revision. A
-        failure keeps the local change and warns: the server copy stays stale
-        until a later write-back or the next process's seed cycle reconciles
-        it.
+        time, so the files never sit stale behind the remembered revision.
+
+        A mutation that edits several sections MUST pass them in one call:
+        pushed separately, the first push's rebase would overwrite the other
+        section's fresh local file with the server's stale copy before it
+        was ever sent. Any sections still pending from a failed push ride
+        along for the same reason. A failure keeps the local change and
+        warns: the server copy stays stale until a later write-back or the
+        next process's seed cycle reconciles it.
         """
         if self._disabled or self._config_unavailable:
             return
         async with self._lock:
-            if not await self._write_back_locked(section):
-                # Remember the section so the next sync retries the push
+            batch = frozenset(sections) | frozenset(self._pending_write_back)
+            if not batch:
+                return
+            if await self._write_back_locked(batch):
+                self._pending_write_back.clear()
+            else:
+                # Remember the sections so the next sync retries the push
                 # BEFORE applying the server document — otherwise the fetch
                 # would overwrite the local edit that never made it up.
-                self._pending_write_back.add(section)
+                self._pending_write_back |= batch
 
-    async def _write_back_locked(self, section: str) -> bool:
+    async def _write_back_locked(self, sections: frozenset[str]) -> bool:
         """The write-back body; caller holds the lock. True on success."""
         for _attempt in (1, 2):
                 try:
@@ -556,11 +570,12 @@ class ServerConfigSync:
                     base_revision = 0
 
                 base = dict(server_config) if isinstance(server_config, dict) else {}
-                local_value = self._read_section(section)
-                if local_value is None:
-                    base.pop(section, None)
-                else:
-                    base[section] = local_value
+                for section in sorted(sections):
+                    local_value = self._read_section(section)
+                    if local_value is None:
+                        base.pop(section, None)
+                    else:
+                        base[section] = local_value
 
                 try:
                     status, put_body = await self._api.put_config(
@@ -581,14 +596,14 @@ class ServerConfigSync:
                     applied = True
                     if isinstance(server_config, dict):
                         applied = self._write_sections(
-                            server_config, exclude=frozenset({section})
+                            server_config, exclude=sections
                         )
                     rev = put_body.get("revision")
                     if applied and isinstance(rev, int):
                         self._revision = rev
                     logger.info(
                         "filament-fcm: server config updated (%s, revision %s)",
-                        section,
+                        ", ".join(sorted(sections)),
                         rev,
                     )
                     return True

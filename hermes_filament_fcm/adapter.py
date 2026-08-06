@@ -34,6 +34,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+from . import slash
 from ._version import PLUGIN_VERSION
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -55,6 +56,8 @@ from .observability import (
 from .reactive import (
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
+    FEATURE_SLASH_COMMANDS,
+    KNOWN_FEATURES,
     CapabilityPolicyStore,
     ChannelInstructionsStore,
     EngagedThreadStore,
@@ -119,6 +122,46 @@ def _registry_toolset_tools(toolset: str) -> list[str]:
             "filament-fcm: toolset lookup failed for %r", toolset, exc_info=True
         )
         return []
+
+
+def _mcp_server_inventory() -> dict[str, int]:
+    """Connected MCP servers as ``{server_name: live tool count}``, read from
+    the same Hermes registry the ``mcp:<server>`` auto-bundles expand
+    against — so the slash layer's target vocabulary and the capability
+    resolution agree on which servers exist. Defensive: a Hermes without a
+    readable registry yields ``{}``."""
+    try:
+        from tools.registry import registry  # noqa: PLC0415
+
+        out: dict[str, int] = {}
+        for ts in registry.get_registered_toolset_names():
+            name = str(ts)
+            server = name[len("mcp-") :]
+            if name.startswith("mcp-") and server:
+                out[server] = len(list(registry.get_tool_names_for_toolset(name)))
+        return out
+    except Exception:
+        logger.debug("filament-fcm: mcp server inventory unavailable", exc_info=True)
+        return {}
+
+
+def _other_tool_sources() -> dict[str, int]:
+    """Registered toolsets that are neither Filament's own nor an MCP server,
+    as ``{name: live tool count}`` — surfaced by the slash layer as runtime
+    plugins on the agent's host: available in the backchannel, blocked in
+    shared channels while enforcement is on (no ``mcp:<server>`` auto-bundle
+    names them, so they are not per-channel switchable)."""
+    try:
+        from tools.registry import registry  # noqa: PLC0415
+
+        out: dict[str, int] = {}
+        for ts in registry.get_registered_toolset_names():
+            name = str(ts)
+            if name != "filament" and not name.startswith("mcp-"):
+                out[name] = len(list(registry.get_tool_names_for_toolset(name)))
+        return out
+    except Exception:
+        return {}
 
 
 def _sanitize_meta(value: str, limit: int = 80) -> str:
@@ -377,6 +420,32 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             flags=re.IGNORECASE,
         )
         return body.strip()
+
+    def _strip_lead_mention(self, body: str) -> str:
+        """Remove ONE leading @mention of the bot; interior occurrences stay.
+
+        The slash path needs this: command arguments (guidance text, most
+        likely) may legitimately contain the agent's MXID, and the
+        replace-everywhere form would silently rewrite them.
+
+        The lookahead requires a token boundary (whitespace, ``:``/``,``,
+        or end) after the mention: a mention is a standalone leading token,
+        never a prefix of one — ``agent/fil-config …`` must NOT become an
+        executable ``/fil-config``."""
+        if not body or not self._user_id:
+            return body or ""
+        localpart = self._user_id.split(":")[0].lstrip("@")
+        return re.sub(
+            r"^\s*(?:"
+            + re.escape(self._user_id)
+            + "|"
+            + re.escape(localpart)
+            + r")(?=[\s:,]|$)\s*[:,]?\s*",
+            "",
+            body,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
 
     async def _media_note(self, msg: PushMessage) -> str | None:
         """Describe *msg*'s attachments, or None if it has none (ENG-603).
@@ -1678,6 +1747,35 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """Backchannel (control plane): the principal commands the agent
         directly — no wake policy, no standing-instructions framing, full
         command authority."""
+        # The slash check runs on the lead-stripped body: only a *leading*
+        # mention is addressing; an MXID inside command arguments is data
+        # the deterministic parser must see untouched.
+        slash_body = self._strip_lead_mention(msg.body) if msg.body else ""
+        # /fil-* commands are for the plugin, not the model: intercept before
+        # any LLM dispatch. A /fil- message must never reach inference — even
+        # an unparseable one is answered deterministically with help text.
+        # ONLY the /fil- namespace is ours (case-insensitive prefix): any
+        # other leading-/ message belongs to some other software's slash
+        # namespace and falls through to the normal LLM control path below —
+        # we must not swallow it. Control-plane only by construction (this
+        # method is only reached for the backchannel), which is what makes
+        # the writes below legitimate.
+        #
+        # The whole surface is gated behind the slash_commands feature flag
+        # (default OFF, read fresh per event like the capability gate): while
+        # off, /fil- messages fall through to normal LLM dispatch exactly
+        # like non-fil slashes. The opt-in is deliberately asymmetric: the
+        # flag is enabled via set_feature / set_agent_config / the server
+        # config document (a /fil- message can't reach this layer to enable
+        # it), while opt-out works from slash itself
+        # (/fil-config feature slash_commands off).
+        if (
+            slash_body
+            and slash.is_fil_command(slash_body)
+            and self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+        ):
+            await self._handle_slash_command(msg, slash_body)
+            return
         body = self._strip_mention(msg.body) if msg.body else msg.body
         # The push never includes attachments (ENG-603): describe any media on
         # the event so the agent knows it exists (an uncaptioned image would
@@ -1748,6 +1846,185 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # gate only restricts data turns, which set an explicit allowed set).
         current_capabilities.set(None)
         await self.handle_message(event)
+
+    # ── Slash commands (control plane, no LLM) ──────────────────────
+
+    async def _slash_channels(
+        self,
+    ) -> tuple[list[tuple[str, str]], tuple[str, str] | None]:
+        """The agent's *shared* channels as ``(room_id, name)`` for
+        slash-command channel resolution, plus the excluded backchannel —
+        server-attributed data from ``list_channels`` (loops/spaces are
+        filtered out; only channels can carry per-channel config). The cc
+        room is excluded from the vocabulary: per-channel controls are
+        meaningless for the control plane, and it must never surface as a
+        help example — it is returned separately so a command explicitly
+        targeting it gets the shared-channels-only note. Best-effort:
+        ``([], …)`` on any failure, which makes every channel token
+        unresolvable and the reply an error, never a guess."""
+        backchannel: tuple[str, str] | None = (
+            (self._cc_room_id, "") if self._cc_room_id else None
+        )
+        if not self._filament_api:
+            return [], backchannel
+        try:
+            with bound_context(call_origin="slash_command"):
+                raw = await self._filament_api.call_tool("list_channels", {})
+            parsed = FilamentAPI.parse_tool_result(raw)
+        except Exception:
+            logger.warning(
+                "filament-fcm: list_channels failed for slash command",
+                exc_info=True,
+            )
+            return [], backchannel
+        rows = parsed.get("channels") if isinstance(parsed, dict) else None
+        channels: list[tuple[str, str]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("type") == "m.space":
+                continue
+            room_id = row.get("channel_id")
+            if not (isinstance(room_id, str) and room_id):
+                continue
+            name = row.get("name")
+            clean = name if isinstance(name, str) else ""
+            if self._cc_room_id and room_id == self._cc_room_id:
+                backchannel = (room_id, clean)
+                continue
+            channels.append((room_id, clean))
+        return channels, backchannel
+
+    async def _handle_slash_command(self, msg: PushMessage, body: str) -> None:
+        """Execute one backchannel slash command deterministically.
+
+        Parsing and mutation compilation live in ``slash.py`` (pure,
+        stdlib-only); this method supplies the live vocabularies (channels
+        from the server, MCP servers from the registry, the current store
+        documents), performs the writes, mirrors changed sections to the
+        server document, and sends the confirmation/help reply. No LLM is
+        ever involved, in success or failure."""
+        slog.info(
+            "filament_fcm.slash.dispatch",
+            event_id=msg.event_id,
+            room_id=msg.room_id,
+        )
+        channels, backchannel = await self._slash_channels()
+        mcp_servers = _mcp_server_inventory()
+        capability_policy = self._capability_store.read()
+        raw_bundles = capability_policy.get("bundles")
+        bundles = (
+            [str(b) for b in raw_bundles]
+            if isinstance(raw_bundles, dict)
+            else []
+        )
+        result = slash.parse(
+            body,
+            channels=channels,
+            mcp_servers=mcp_servers,
+            bundles=bundles,
+            features=KNOWN_FEATURES,
+            backchannel=backchannel,
+        )
+        sections: tuple[str, ...] = ()
+        if isinstance(result, slash.HelpRequest):
+            text = slash.help_for(
+                result.command,
+                channels=channels,
+                mcp_servers=mcp_servers,
+                other_sources=_other_tool_sources(),
+                features=KNOWN_FEATURES,
+            )
+        elif isinstance(result, slash.Redirect):
+            # A retired old-form invocation: reply-only pointer to the new
+            # /fil-config spelling.
+            text = result.reply
+        elif isinstance(result, slash.ChannelsOverview):
+            text = slash.render_config_list(
+                capability_policy=capability_policy,
+                wake_policy=self._wake_policy.read(),
+                channel_instructions=self._channel_instructions.read(),
+                channels=channels,
+            )
+        elif isinstance(result, slash.ChannelShow):
+            text = slash.render_channel_show(
+                room_id=result.room_id,
+                channel_name=result.channel_name,
+                capability_policy=capability_policy,
+                feature_flags=self._feature_flags.read(),
+                wake_policy=self._wake_policy.read(),
+                channel_instructions=self._channel_instructions.read(),
+                mcp_servers=mcp_servers,
+                other_sources=_other_tool_sources(),
+            )
+        elif isinstance(result, slash.ToolsList):
+            text = slash.render_tools_list(
+                channels=channels,
+                mcp_servers=mcp_servers,
+                other_sources=_other_tool_sources(),
+            )
+        elif isinstance(result, slash.FeatureList):
+            text = slash.render_feature_list(
+                features=KNOWN_FEATURES,
+                feature_flags=self._feature_flags.read(),
+            )
+        elif isinstance(result, slash.FeatureShow):
+            text = slash.render_feature_show(
+                feature=result.feature,
+                features=KNOWN_FEATURES,
+                feature_flags=self._feature_flags.read(),
+            )
+        elif isinstance(result, slash.GuidanceShow):
+            text = slash.render_guidance_show(
+                room_id=result.room_id,
+                channel_name=result.channel_name,
+                channel_instructions=self._channel_instructions.read(),
+            )
+        elif isinstance(result, slash.ToolsCommand):
+            mutation = slash.apply_tools(
+                result, capability_policy, self._feature_flags.read()
+            )
+            if mutation.changed:
+                self._capability_store.write(mutation.capability_policy)
+                if mutation.feature_flags is not None:
+                    self._feature_flags.write(mutation.feature_flags)
+            text, sections = mutation.reply, mutation.sections
+        elif isinstance(result, slash.WakeCommand):
+            mutation = slash.apply_wake(result, self._wake_policy.read())
+            if mutation.changed:
+                self._wake_policy.write(mutation.wake_policy)
+            text, sections = mutation.reply, mutation.sections
+        elif isinstance(result, slash.GuidanceCommand):
+            mutation = slash.apply_guidance(
+                result, self._channel_instructions.read()
+            )
+            if mutation.changed:
+                self._channel_instructions.write(mutation.channel_instructions)
+            text, sections = mutation.reply, mutation.sections
+        elif isinstance(result, slash.FeatureCommand):
+            mutation = slash.apply_feature(result, self._feature_flags.read())
+            if mutation.changed:
+                self._feature_flags.write(mutation.feature_flags)
+            text, sections = mutation.reply, mutation.sections
+        else:
+            text = slash.render_reply(result)
+        logger.info(
+            "filament-fcm: slash command → %s (sections=%s)",
+            type(result).__name__,
+            list(sections),
+        )
+        # One batched write-back: separate per-section calls would let the
+        # first call's rebase overwrite the second section's fresh local
+        # edit with the server's stale copy before it was ever pushed.
+        if sections:
+            await self._server_config.write_back(*sections)
+        # Reply where the principal spoke: in their thread if they used one,
+        # else on the main timeline — same shape as an LLM control reply.
+        metadata = {"thread_id": msg.thread_id} if msg.thread_id else None
+        send_result = await self.send(msg.room_id, text, metadata=metadata)
+        if not send_result.success:
+            logger.warning(
+                "filament-fcm: slash reply failed to send: %s",
+                send_result.error,
+            )
 
     def _on_reaction(self, reaction: ReactionMessage) -> None:
         """An emoji reaction arrived via FCM (a potential wake-up signal)."""

@@ -957,3 +957,29 @@ def test_capability_hint_principal_aware_decline():
     assert "your principal can enable it" not in second
     # Ungated turns still produce no hint regardless of the flag.
     assert reactive.capability_hint(None, sender_is_principal=True) == ""
+
+
+def test_expand_bundle_deep_chain_no_recursion_error():
+    depth = 5000
+    bundles = {f"b{i}": [f"@b{i + 1}"] for i in range(depth)}
+    bundles[f"b{depth}"] = ["leaf_tool"]
+    store = reactive.CapabilityPolicyStore(Path("/nonexistent"))
+    policy = {"bundles": bundles}
+    tools = store.expand_bundle("b0", policy)
+    assert tools == frozenset({"leaf_tool"})
+
+
+def test_expand_bundle_diamond_expands_once_cycle_still_nothing():
+    store = reactive.CapabilityPolicyStore(Path("/nonexistent"))
+    policy = {
+        "bundles": {
+            "top": ["@left", "@right"],
+            "left": ["@base", "l"],
+            "right": ["@base", "r"],
+            "base": ["deep"],
+            "loop": ["@loop", "x"],
+        }
+    }
+    assert store.expand_bundle("top", policy) == frozenset({"l", "r", "deep"})
+    # A self-cycle still grants only its non-cyclic members.
+    assert store.expand_bundle("loop", policy) == frozenset({"x"})

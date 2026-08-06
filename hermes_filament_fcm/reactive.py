@@ -20,9 +20,13 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import ClassVar
+
+# Worklist sentinel: distinguishes "iterator exhausted" from a literal None
+# entry in a (malformed) bundle member list.
+_EXHAUSTED = object()
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -395,10 +399,11 @@ class ChannelInstructionsStore:
     A JSON object on disk mapping Matrix room id → guidance string, read fresh
     on every wake so a config change takes effect on the next event — no
     restart. Written by the server-config sync (the app edits the server
-    document; there is deliberately no ``set_*`` backchannel tool for this
-    section). Fail-closed: a missing, malformed, or unreadable file reads as
-    empty, so no channel is ever framed with guidance the principal didn't
-    save.
+    document) and, from the backchannel, by the ``/guidance`` slash command
+    and the generic ``set_agent_config`` tool — there is deliberately no
+    *typed* ``set_*`` tool for this section. Fail-closed: a missing,
+    malformed, or unreadable file reads as empty, so no channel is ever
+    framed with guidance the principal didn't save.
     """
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
@@ -964,35 +969,62 @@ class CapabilityPolicyStore:
         stays stdlib-only), and to nothing when there is no lookup or the
         server is unknown — fail closed, like an unknown bundle.
 
-        Cycles are detected by tracking the bundle names on the *current path*
-        (``_seen``), so a genuinely deep-but-acyclic chain expands fully (no
-        arbitrary depth cap that would silently drop its terminal tools) while a
-        self- or mutually-recursive chain terminates the moment a name repeats.
-        A ``list`` entry that isn't a ``list`` is ignored (malformed policy)."""
+        Cycles are detected by tracking the bundle names on the *current path*,
+        so a genuinely deep-but-acyclic chain expands fully (no arbitrary depth
+        cap that would silently drop its terminal tools) while a self- or
+        mutually-recursive chain terminates the moment a name repeats. A
+        ``list`` entry that isn't a ``list`` is ignored (malformed policy).
+
+        Iterative (explicit frame stack), not recursive: the include graph is
+        config-document data, so neither a deep chain (Python stack depth) nor
+        a diamond of shared includes (exponential re-expansion) may crash or
+        stall the enforcement path. Expansion is context-free, so each bundle
+        is expanded at most once; a diamond revisit skips silently, and only a
+        true cycle (name still on the current path) warns."""
         if name.startswith(MCP_BUNDLE_PREFIX):
             return _expand_mcp_bundle(name, toolset_tools)
         defs = _defs if _defs is not None else self.bundles(policy)
-        seen = _seen if _seen is not None else frozenset()
-        if name in seen:
-            logger.warning(
-                "filament-fcm: capability bundle cycle at %r (granting nothing)", name
-            )
-            return frozenset()
-        entries = defs.get(name)
-        if not isinstance(entries, list):
-            if entries is None:
-                logger.warning(
-                    "filament-fcm: unknown capability bundle %r (granting nothing)",
-                    name,
-                )
-            return frozenset()
-        seen = seen | {name}
         tools: set[str] = set()
-        for entry in entries:
-            if isinstance(entry, str) and entry.startswith("@"):
-                tools |= self.expand_bundle(
-                    entry[1:], policy, defs, seen, toolset_tools=toolset_tools
+        frames: list[tuple[str, Iterator]] = []
+        path: set[str] = set(_seen or ())
+        expanded: set[str] = set(path)
+
+        def _enter(nm: str) -> None:
+            if nm.startswith(MCP_BUNDLE_PREFIX):
+                tools.update(_expand_mcp_bundle(nm, toolset_tools))
+                return
+            if nm in path:
+                logger.warning(
+                    "filament-fcm: capability bundle cycle at %r "
+                    "(granting nothing)",
+                    nm,
                 )
+                return
+            if nm in expanded:
+                return
+            expanded.add(nm)
+            entries = defs.get(nm)
+            if not isinstance(entries, list):
+                if entries is None:
+                    logger.warning(
+                        "filament-fcm: unknown capability bundle %r "
+                        "(granting nothing)",
+                        nm,
+                    )
+                return
+            path.add(nm)
+            frames.append((nm, iter(entries)))
+
+        _enter(name)
+        while frames:
+            nm, it = frames[-1]
+            entry = next(it, _EXHAUSTED)
+            if entry is _EXHAUSTED:
+                frames.pop()
+                path.discard(nm)
+                continue
+            if isinstance(entry, str) and entry.startswith("@"):
+                _enter(entry[1:])
             elif entry:
                 tools.add(str(entry))
         return frozenset(tools)
@@ -1091,6 +1123,11 @@ class CapabilityPolicyStore:
 # policy, so a toggle takes effect on the next turn with no restart.
 FEATURE_ADVANCED_TOOL_CONTROLS = "advanced_tool_controls"
 
+# The deterministic /fil-* slash-command surface on the backchannel. Off by
+# default like every flag: a /fil- message then falls through to normal LLM
+# dispatch exactly like any other leading-/ message.
+FEATURE_SLASH_COMMANDS = "slash_commands"
+
 # Human-facing descriptions for the flags the code actually checks. Keep in
 # sync with the checks; surfaced by get_features and the set_feature tool so the
 # principal (and the agent mapping their request) knows what can be toggled.
@@ -1101,6 +1138,13 @@ KNOWN_FEATURES: dict[str, str] = {
         "tunable from the backchannel with set_capabilities. Off by default; "
         "when off the agent behaves exactly as a fresh install (all tools "
         "available in shared channels, subject only to the standing framing)."
+    ),
+    FEATURE_SLASH_COMMANDS: (
+        "Deterministic /fil-* slash commands on the backchannel "
+        "(/fil-help, /fil-config): intercepted before any LLM dispatch. Off "
+        "by default; when off, /fil- messages go to the model like any other "
+        "text. Enable via set_feature or the server config document — the "
+        "slash surface can't enable itself while it is off."
     ),
 }
 
