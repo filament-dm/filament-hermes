@@ -169,6 +169,51 @@ def test_update_check_disabled_env(monkeypatch):
     assert not update_check.update_check_disabled()
 
 
+def _fetch_with_fake_httpx(monkeypatch):
+    """Run fetch_latest_version against a stubbed httpx, return the URL hit."""
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '[project]\nname = "x"\nversion = "9.9.9"\n'
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            seen["url"] = url
+            return FakeResponse()
+
+    monkeypatch.setattr(update_check.httpx, "AsyncClient", FakeAsyncClient)
+    got = asyncio.run(update_check.fetch_latest_version())
+    assert got == "9.9.9"
+    return seen["url"]
+
+
+def test_fetch_latest_version_env_url_override(monkeypatch):
+    # The env var is read per call, after module load — a harness that sets
+    # it before starting the gateway redirects the check to its own server.
+    monkeypatch.setenv(
+        "FILAMENT_UPDATE_CHECK_URL", "http://127.0.0.1:9/pyproject.toml"
+    )
+    assert _fetch_with_fake_httpx(monkeypatch) == "http://127.0.0.1:9/pyproject.toml"
+
+
+def test_fetch_latest_version_default_url(monkeypatch):
+    # Without the override (or with it empty) the GitHub raw URL is used.
+    monkeypatch.delenv("FILAMENT_UPDATE_CHECK_URL", raising=False)
+    assert _fetch_with_fake_httpx(monkeypatch) == _version.LATEST_PYPROJECT_URL
+    monkeypatch.setenv("FILAMENT_UPDATE_CHECK_URL", "")
+    assert _fetch_with_fake_httpx(monkeypatch) == _version.LATEST_PYPROJECT_URL
+
+
 def test_build_reminder_mentions_versions():
     note = update_check.build_reminder("0.2.0", "0.1.0")
     assert "0.2.0" in note and "0.1.0" in note
@@ -271,3 +316,17 @@ def test_fetch_tools_sends_version(monkeypatch):
         assert headers.get("User-Agent", "").startswith("hermes-filament-fcm/")
         assert "X-Filament-Plugin-Version" in headers
     assert seen["bodies"][0]["params"]["clientInfo"]["name"] == "hermes-filament-fcm"
+
+
+def test_adapter_imports_what_the_reminder_delivery_uses():
+    # The delivery block was once commented out and the import cleanup took
+    # build_reminder with it; re-enabling then raised a NameError that the
+    # update-check loop swallowed at debug level — the reminder silently
+    # never sent. Pin the import to the usage.
+    adapter_src = (_PKG_DIR / "adapter.py").read_text()
+    if "build_reminder(" in adapter_src:
+        import_line = next(
+            line for line in adapter_src.splitlines()
+            if line.startswith("from .update_check import")
+        )
+        assert "build_reminder" in import_line
