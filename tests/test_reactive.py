@@ -862,3 +862,14 @@ def _run() -> None:
 
 if __name__ == "__main__":
     _run()
+
+
+def test_capability_hint_principal_aware_decline():
+    allowed = frozenset({"get_recent_messages"}) | reactive.BASELINE_TOOLS
+    third = reactive.capability_hint(allowed)
+    second = reactive.capability_hint(allowed, sender_is_principal=True)
+    assert "your principal can enable it" in third
+    assert "you can enable it in my settings" in second
+    assert "your principal can enable it" not in second
+    # Ungated turns still produce no hint regardless of the flag.
+    assert reactive.capability_hint(None, sender_is_principal=True) == ""

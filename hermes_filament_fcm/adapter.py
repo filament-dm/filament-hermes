@@ -1919,7 +1919,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             allowed = self._capability_store.resolve(
                 channel, sender, toolset_tools=_registry_toolset_tools
             )
-            tool_hint = capability_hint(allowed)
+            # Same server-attributed comparison as the wake-note: the decline
+            # coaching must not tell the principal about "your principal".
+            tool_hint = capability_hint(
+                allowed, sender_is_principal=bool(sender_note)
+            )
         else:
             allowed = None
             tool_hint = ""
