@@ -336,6 +336,22 @@ def test_old_form_slash_gets_redirect_not_mutation(tmp_path, monkeypatch):
     assert not (tmp_path / "capability_policy.json").exists()
 
 
+def test_feature_list_slash_replies_live_states(tmp_path, monkeypatch):
+    # The fixture seeds slash_commands on; the list must reflect the live
+    # store, read-only.
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(a._handle_control_message(_control_msg("/fil-config feature list")))
+    assert dispatched == []
+    assert len(api.posted) == 1
+    reply = api.posted[0][1]
+    assert reply.startswith("**Features:**")
+    assert "- **slash_commands** — " in reply
+    assert "(on)" in reply
+    assert "- **advanced_tool_controls** — " in reply
+    assert "(off)" in reply
+    assert sync.written_back == []
+
+
 def test_non_slash_control_message_still_dispatches(tmp_path, monkeypatch):
     a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
     asyncio.run(a._handle_control_message(_control_msg("hello there")))

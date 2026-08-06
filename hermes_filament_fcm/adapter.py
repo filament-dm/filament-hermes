@@ -1927,6 +1927,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 mcp_servers=mcp_servers,
                 other_sources=_other_tool_sources(),
             )
+        elif isinstance(result, slash.FeatureList):
+            text = slash.render_feature_list(
+                features=KNOWN_FEATURES,
+                feature_flags=self._feature_flags.read(),
+            )
+        elif isinstance(result, slash.FeatureShow):
+            text = slash.render_feature_show(
+                feature=result.feature,
+                features=KNOWN_FEATURES,
+                feature_flags=self._feature_flags.read(),
+            )
         elif isinstance(result, slash.GuidanceShow):
             text = slash.render_guidance_show(
                 room_id=result.room_id,

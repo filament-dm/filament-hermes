@@ -424,8 +424,45 @@ def test_feature_unknown_name_is_unparsed():
     assert "warp_drive" in result.problem
 
 
-def test_feature_keyword_alone_routes_to_contextual_help():
-    assert parse("/fil-config feature") == slash.HelpRequest("feature")
+def test_feature_bare_and_list_render_the_feature_list():
+    features = dict(reactive.KNOWN_FEATURES)
+    assert parse("/fil-config feature", features=features) == slash.FeatureList()
+    assert (
+        parse("/fil-config feature list", features=features)
+        == slash.FeatureList()
+    )
+    # Fuzzy like any other token.
+    assert (
+        parse("/fil-config feature lst", features=features)
+        == slash.FeatureList()
+    )
+
+
+def test_feature_name_without_verb_is_a_show_query():
+    features = dict(reactive.KNOWN_FEATURES)
+    result = parse("/fil-config feature slash_commands", features=features)
+    assert result == slash.FeatureShow(feature="slash_commands")
+    # Typos resolve the same way as in the mutation form.
+    result = parse(
+        "/fil-config feature advnced_tool_controls", features=features
+    )
+    assert result == slash.FeatureShow(feature="advanced_tool_controls")
+
+
+def test_feature_state_without_name_still_asks():
+    result = parse(
+        "/fil-config feature on", features=dict(reactive.KNOWN_FEATURES)
+    )
+    assert isinstance(result, slash.Unparsed)
+    assert "feature name" in result.problem
+
+
+def test_feature_list_mixed_with_other_tokens_is_unparsed():
+    result = parse(
+        "/fil-config feature list on", features=dict(reactive.KNOWN_FEATURES)
+    )
+    assert isinstance(result, slash.Unparsed)
+    assert "`/fil-config feature list`" in result.problem
 
 
 # ── Old-form redirects ───────────────────────────────────────────────
@@ -994,3 +1031,41 @@ def test_render_guidance_show_when_unset():
     )
     assert "No guidance is set for **#welcome**." in text
     assert "`/fil-config #welcome guidance <text…>`" in text
+
+
+# ── /fil-config feature rendering ────────────────────────────────────
+
+
+def test_render_feature_list_shows_states_and_change_example():
+    text = slash.render_feature_list(
+        features=reactive.KNOWN_FEATURES,
+        feature_flags={"slash_commands": True},
+    )
+    assert text.startswith("**Features:**")
+    # One bullet per known feature: bold name, one-line summary, state.
+    for name, description in reactive.KNOWN_FEATURES.items():
+        summary = str(description).split(". ")[0].rstrip(".")
+        assert f"- **{name}** — {summary} " in text
+    assert "- **slash_commands** — " in text
+    assert "(on)" in text
+    assert "(off)" in text  # advanced_tool_controls not set in the flags
+    assert "`/fil-config feature slash_commands off`" in text
+    assert "`/fil-config feature <name> <on|off>`" in text
+
+
+def test_render_feature_show_state_and_full_description():
+    text = slash.render_feature_show(
+        feature="slash_commands",
+        features=reactive.KNOWN_FEATURES,
+        feature_flags={"slash_commands": True},
+    )
+    assert text.startswith("**slash_commands** is **on**.")
+    # The full description, not just the first sentence.
+    assert reactive.KNOWN_FEATURES["slash_commands"].strip() in text
+    assert "`/fil-config feature slash_commands <on|off>`" in text
+    text = slash.render_feature_show(
+        feature="slash_commands",
+        features=reactive.KNOWN_FEATURES,
+        feature_flags={},
+    )
+    assert text.startswith("**slash_commands** is **off**.")

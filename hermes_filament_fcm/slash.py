@@ -226,6 +226,21 @@ class FeatureCommand:
 
 
 @dataclass(frozen=True)
+class FeatureList:
+    """``/fil-config feature`` / ``/fil-config feature list`` — the adapter
+    renders every known feature with its current state
+    (``render_feature_list``)."""
+
+
+@dataclass(frozen=True)
+class FeatureShow:
+    """``/fil-config feature <name>`` with no on/off — the adapter renders
+    that feature's state and description (``render_feature_show``)."""
+
+    feature: str
+
+
+@dataclass(frozen=True)
 class Redirect:
     """A retired pre-consolidation invocation (``/fil-tools`` & co, old
     ``/fil-config show``): the reply is a one-line pointer to the new
@@ -762,17 +777,39 @@ def _parse_feature(
         _Entry("state", w, True, w) for w in GRANT_WORDS
     ] + [
         _Entry("state", w, False, w) for w in REVOKE_WORDS
+    ] + [
+        _Entry("list", LIST_WORD, LIST_WORD, LIST_WORD)
     ]
     slots, result = _fill_slots(
         tokens,
         entries,
         "feature",
-        "a feature name or on/off",
-        {"feature": "feature", "state": "on/off"},
-        ("feature", "state"),
+        "a feature name, on/off, or list",
+        {},
+        (),
     )
-    if result is not None or slots is None:
+    if result is not None and not isinstance(result, HelpRequest):
         return result
+    keys = set(slots or {})
+    # Bare `feature` and `feature list` are the same question: every known
+    # feature with its current state.
+    if not keys or keys == {"list"}:
+        return FeatureList()
+    if "list" in keys:
+        return Unparsed(
+            command="feature",
+            problem='"list" stands alone — say '
+            f"`{PREFIX}config feature list`.",
+        )
+    if keys == {"feature"}:
+        # A feature with no on/off is a question: show its state.
+        return FeatureShow(feature=str(slots["feature"].canonical))
+    if keys == {"state"}:
+        return Unparsed(
+            command="feature",
+            problem=f"I understood on/off {slots['state'].prose}, but still "
+            "need the feature name.",
+        )
     return FeatureCommand(
         feature=str(slots["feature"].canonical),
         enabled=bool(slots["state"].canonical),
@@ -979,6 +1016,12 @@ def help_guidance(channels: Sequence[tuple[str, str]] = ()) -> str:
     )
 
 
+def _feature_summary(description: str) -> str:
+    """First sentence only — the full description lives in get_features and
+    the single-feature show."""
+    return str(description).split(". ")[0].rstrip(".")
+
+
 def help_feature(features: Mapping[str, str] | None = None) -> str:
     lines = [
         "`/fil-config feature <name> <on|off>` — toggle a runtime feature."
@@ -987,10 +1030,7 @@ def help_feature(features: Mapping[str, str] | None = None) -> str:
     if features:
         lines.append("**Known features:**")
         for name in sorted(features):
-            # First sentence only — the full description lives in
-            # get_features.
-            summary = str(features[name]).split(". ")[0].rstrip(".")
-            lines.append(f"- **{name}** — {summary}.")
+            lines.append(f"- **{name}** — {_feature_summary(features[name])}.")
     lines.append(
         f"Example: `/fil-config feature {FEATURE_ADVANCED_TOOL_CONTROLS} on`"
     )
@@ -1437,6 +1477,49 @@ def render_tools_list(
         "enable/disable, grant/revoke, allow/deny).",
         "",
         _channels_line(channels),
+    ]
+    return "\n".join(lines)
+
+
+def render_feature_list(
+    *,
+    features: Mapping[str, str],
+    feature_flags: dict,
+) -> str:
+    """The ``/fil-config feature`` / ``/fil-config feature list`` reply:
+    every known feature as one bullet — bold name, one-line summary, current
+    state — plus the change example."""
+    lines = ["**Features:**"]
+    for name in sorted(features):
+        state = "on" if feature_flags.get(name) else "off"
+        lines.append(
+            f"- **{name}** — {_feature_summary(features[name])} ({state})"
+        )
+    lines += [
+        "",
+        f"Change with `{PREFIX}config feature <name> <on|off>` "
+        f"(e.g. `{PREFIX}config feature slash_commands off`); "
+        f"`{PREFIX}config feature <name>` shows one feature in full.",
+    ]
+    return "\n".join(lines)
+
+
+def render_feature_show(
+    *,
+    feature: str,
+    features: Mapping[str, str],
+    feature_flags: dict,
+) -> str:
+    """The ``/fil-config feature <name>`` reply: that feature's current
+    state plus its full description."""
+    state = "on" if feature_flags.get(feature) else "off"
+    lines = [f"**{feature}** is **{state}**."]
+    description = str(features.get(feature, "")).strip()
+    if description:
+        lines += ["", description]
+    lines += [
+        "",
+        f"Change with `{PREFIX}config feature {feature} <on|off>`.",
     ]
     return "\n".join(lines)
 
