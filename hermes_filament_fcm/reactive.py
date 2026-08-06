@@ -395,10 +395,11 @@ class ChannelInstructionsStore:
     A JSON object on disk mapping Matrix room id → guidance string, read fresh
     on every wake so a config change takes effect on the next event — no
     restart. Written by the server-config sync (the app edits the server
-    document; there is deliberately no ``set_*`` backchannel tool for this
-    section). Fail-closed: a missing, malformed, or unreadable file reads as
-    empty, so no channel is ever framed with guidance the principal didn't
-    save.
+    document) and, from the backchannel, by the ``/guidance`` slash command
+    and the generic ``set_agent_config`` tool — there is deliberately no
+    *typed* ``set_*`` tool for this section. Fail-closed: a missing,
+    malformed, or unreadable file reads as empty, so no channel is ever
+    framed with guidance the principal didn't save.
     """
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:

@@ -34,6 +34,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
+from . import slash
 from ._version import PLUGIN_VERSION
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -55,6 +56,7 @@ from .observability import (
 from .reactive import (
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
+    KNOWN_FEATURES,
     CapabilityPolicyStore,
     ChannelInstructionsStore,
     EngagedThreadStore,
@@ -118,6 +120,43 @@ def _registry_toolset_tools(toolset: str) -> list[str]:
         logger.debug(
             "filament-fcm: toolset lookup failed for %r", toolset, exc_info=True
         )
+        return []
+
+
+def _mcp_server_inventory() -> dict[str, int]:
+    """Connected MCP servers as ``{server_name: live tool count}``, read from
+    the same Hermes registry the ``mcp:<server>`` auto-bundles expand
+    against — so the slash layer's target vocabulary and the capability
+    resolution agree on which servers exist. Defensive: a Hermes without a
+    readable registry yields ``{}``."""
+    try:
+        from tools.registry import registry  # noqa: PLC0415
+
+        out: dict[str, int] = {}
+        for ts in registry.get_registered_toolset_names():
+            name = str(ts)
+            server = name[len("mcp-") :]
+            if name.startswith("mcp-") and server:
+                out[server] = len(list(registry.get_tool_names_for_toolset(name)))
+        return out
+    except Exception:
+        logger.debug("filament-fcm: mcp server inventory unavailable", exc_info=True)
+        return {}
+
+
+def _other_tool_sources() -> list[str]:
+    """Registered toolsets that are neither Filament's own nor an MCP server
+    — surfaced in ``/tools help`` as tool sources that exist but are not
+    per-channel switchable (no ``mcp:<server>`` auto-bundle names them)."""
+    try:
+        from tools.registry import registry  # noqa: PLC0415
+
+        return sorted(
+            str(ts)
+            for ts in registry.get_registered_toolset_names()
+            if str(ts) != "filament" and not str(ts).startswith("mcp-")
+        )
+    except Exception:
         return []
 
 
@@ -1675,6 +1714,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         directly — no wake policy, no standing-instructions framing, full
         command authority."""
         body = self._strip_mention(msg.body) if msg.body else msg.body
+        # Slash commands are for the plugin, not the model: intercept before
+        # any LLM dispatch. A slash message must never reach inference — even
+        # an unparseable one is answered deterministically with help text.
+        # Control-plane only by construction (this method is only reached for
+        # the backchannel), which is what makes the writes below legitimate.
+        if body and body.strip().startswith("/"):
+            await self._handle_slash_command(msg, body.strip())
+            return
         # The push never includes attachments (ENG-603): describe any media on
         # the event so the agent knows it exists (an uncaptioned image would
         # otherwise arrive as an empty message).
@@ -1744,6 +1791,129 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # gate only restricts data turns, which set an explicit allowed set).
         current_capabilities.set(None)
         await self.handle_message(event)
+
+    # ── Slash commands (control plane, no LLM) ──────────────────────
+
+    async def _slash_channels(self) -> list[tuple[str, str]]:
+        """The agent's channels as ``(room_id, name)`` for slash-command
+        channel resolution — server-attributed data from ``list_channels``
+        (loops/spaces are filtered out; only channels can carry per-channel
+        config). Best-effort: ``[]`` on any failure, which makes every
+        channel token unresolvable and the reply an error, never a guess."""
+        if not self._filament_api:
+            return []
+        try:
+            with bound_context(call_origin="slash_command"):
+                raw = await self._filament_api.call_tool("list_channels", {})
+            parsed = FilamentAPI.parse_tool_result(raw)
+        except Exception:
+            logger.warning(
+                "filament-fcm: list_channels failed for slash command",
+                exc_info=True,
+            )
+            return []
+        rows = parsed.get("channels") if isinstance(parsed, dict) else None
+        channels: list[tuple[str, str]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("type") == "m.space":
+                continue
+            room_id = row.get("channel_id")
+            if isinstance(room_id, str) and room_id:
+                name = row.get("name")
+                channels.append((room_id, name if isinstance(name, str) else ""))
+        return channels
+
+    async def _handle_slash_command(self, msg: PushMessage, body: str) -> None:
+        """Execute one backchannel slash command deterministically.
+
+        Parsing and mutation compilation live in ``slash.py`` (pure,
+        stdlib-only); this method supplies the live vocabularies (channels
+        from the server, MCP servers from the registry, the current store
+        documents), performs the writes, mirrors changed sections to the
+        server document, and sends the confirmation/help reply. No LLM is
+        ever involved, in success or failure."""
+        slog.info(
+            "filament_fcm.slash.dispatch",
+            event_id=msg.event_id,
+            room_id=msg.room_id,
+        )
+        channels = await self._slash_channels()
+        mcp_servers = _mcp_server_inventory()
+        capability_policy = self._capability_store.read()
+        raw_bundles = capability_policy.get("bundles")
+        bundles = (
+            [str(b) for b in raw_bundles]
+            if isinstance(raw_bundles, dict)
+            else []
+        )
+        result = slash.parse(
+            body,
+            channels=channels,
+            mcp_servers=mcp_servers,
+            bundles=bundles,
+            features=KNOWN_FEATURES,
+        )
+        sections: tuple[str, ...] = ()
+        if isinstance(result, slash.HelpRequest):
+            text = slash.help_for(
+                result.command,
+                channels=channels,
+                mcp_servers=mcp_servers,
+                other_sources=_other_tool_sources(),
+                features=KNOWN_FEATURES,
+            )
+        elif isinstance(result, slash.ShowConfig):
+            text = slash.render_config_show(
+                capability_policy=capability_policy,
+                wake_policy=self._wake_policy.read(),
+                channel_instructions=self._channel_instructions.read(),
+                feature_flags=self._feature_flags.read(),
+                channels=channels,
+            )
+        elif isinstance(result, slash.ToolsCommand):
+            mutation = slash.apply_tools(
+                result, capability_policy, self._feature_flags.read()
+            )
+            if mutation.changed:
+                self._capability_store.write(mutation.capability_policy)
+                if mutation.feature_flags is not None:
+                    self._feature_flags.write(mutation.feature_flags)
+            text, sections = mutation.reply, mutation.sections
+        elif isinstance(result, slash.WakeCommand):
+            mutation = slash.apply_wake(result, self._wake_policy.read())
+            if mutation.changed:
+                self._wake_policy.write(mutation.wake_policy)
+            text, sections = mutation.reply, mutation.sections
+        elif isinstance(result, slash.GuidanceCommand):
+            mutation = slash.apply_guidance(
+                result, self._channel_instructions.read()
+            )
+            if mutation.changed:
+                self._channel_instructions.write(mutation.channel_instructions)
+            text, sections = mutation.reply, mutation.sections
+        elif isinstance(result, slash.FeatureCommand):
+            mutation = slash.apply_feature(result, self._feature_flags.read())
+            if mutation.changed:
+                self._feature_flags.write(mutation.feature_flags)
+            text, sections = mutation.reply, mutation.sections
+        else:
+            text = slash.render_reply(result)
+        logger.info(
+            "filament-fcm: slash command → %s (sections=%s)",
+            type(result).__name__,
+            list(sections),
+        )
+        for section in sections:
+            await self._server_config.write_back(section)
+        # Reply where the principal spoke: in their thread if they used one,
+        # else on the main timeline — same shape as an LLM control reply.
+        metadata = {"thread_id": msg.thread_id} if msg.thread_id else None
+        send_result = await self.send(msg.room_id, text, metadata=metadata)
+        if not send_result.success:
+            logger.warning(
+                "filament-fcm: slash reply failed to send: %s",
+                send_result.error,
+            )
 
     def _on_reaction(self, reaction: ReactionMessage) -> None:
         """An emoji reaction arrived via FCM (a potential wake-up signal)."""
