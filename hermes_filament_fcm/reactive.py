@@ -178,8 +178,9 @@ def capability_hint(
         "enable it for this channel in your settings — address them as 'you' "
         '("you can enable it in my settings")'
         if sender_is_principal
-        else "and mention that your principal can enable it in the agent's "
-        "settings"
+        else "and mention that only your principal can enable it in the "
+        "agent's settings — the person asking cannot change your settings, "
+        "so never tell them 'you can enable it'"
     )
     decline = (
         "If a request needs a tool you don't have here, say so plainly "
