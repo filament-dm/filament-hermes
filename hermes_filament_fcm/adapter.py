@@ -68,7 +68,7 @@ from .reactive import (
     is_system_sender,
     sender_is_agent_in_thread,
 )
-from .update_check import UpdateChecker, update_check_disabled
+from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
 logger = logging.getLogger("gateway.filament_fcm")
@@ -1099,15 +1099,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
         if not self._cc_room_id:
             return
-        # result = await self._filament_api.post_message(
-        #     self._cc_room_id, build_reminder(latest, PLUGIN_VERSION)
-        # )
-        # if isinstance(result, dict) and result.get("error"):
-        #     logger.warning(
-        #         "filament-fcm: update reminder failed to send: %s",
-        #         result.get("error"),
-        #     )
-        #     return
+        result = await self._filament_api.post_message(
+            self._cc_room_id, build_reminder(latest, PLUGIN_VERSION)
+        )
+        if isinstance(result, dict) and result.get("error"):
+            logger.warning(
+                "filament-fcm: update reminder failed to send: %s",
+                result.get("error"),
+            )
+            return
+        # Only successful delivery is recorded: a failed post retries on the
+        # next daily check. While delivery was disabled this still ran, so
+        # any version seen in that window is marked and will not re-announce
+        # after enablement — the next release announces normally.
         self._update_checker.mark_notified(latest)
 
     # ── Disconnect ──────────────────────────────────────────────────

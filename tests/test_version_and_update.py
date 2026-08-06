@@ -316,3 +316,17 @@ def test_fetch_tools_sends_version(monkeypatch):
         assert headers.get("User-Agent", "").startswith("hermes-filament-fcm/")
         assert "X-Filament-Plugin-Version" in headers
     assert seen["bodies"][0]["params"]["clientInfo"]["name"] == "hermes-filament-fcm"
+
+
+def test_adapter_imports_what_the_reminder_delivery_uses():
+    # The delivery block was once commented out and the import cleanup took
+    # build_reminder with it; re-enabling then raised a NameError that the
+    # update-check loop swallowed at debug level — the reminder silently
+    # never sent. Pin the import to the usage.
+    adapter_src = (_PKG_DIR / "adapter.py").read_text()
+    if "build_reminder(" in adapter_src:
+        import_line = next(
+            line for line in adapter_src.splitlines()
+            if line.startswith("from .update_check import")
+        )
+        assert "build_reminder" in import_line
