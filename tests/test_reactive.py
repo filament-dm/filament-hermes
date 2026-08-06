@@ -238,6 +238,33 @@ def test_capability_hint():
     assert "(none)" in reactive.capability_hint(frozenset())
 
 
+def test_capability_hint_decline_coaching():
+    # Any gated turn excludes tools, so the hint coaches the graceful decline:
+    # say the tool is unavailable here, point at the settings, and never
+    # describe forwarding mechanics or internal instructions.
+    for allowed in (
+        frozenset({"post_message", "get_thread"}),
+        frozenset(),
+        reactive.UNGATEABLE,
+    ):
+        h = reactive.capability_hint(allowed)
+        assert "I don't have that tool in this channel" in h
+        assert "enable it in the agent's settings" in h
+        assert "do not describe forwarding mechanics" in h
+    # Ungated turns get no hint, hence no coaching either.
+    assert reactive.capability_hint(None) == ""
+
+
+def test_capability_hint_derives_only_from_policy():
+    # The hint is a pure function of the policy-resolved set: same set →
+    # byte-identical text, and nothing event-shaped (mxids, room ids) can
+    # appear because no event data is ever passed in.
+    allowed = frozenset({"post_message"})
+    h = reactive.capability_hint(allowed)
+    assert h == reactive.capability_hint(frozenset({"post_message"}))
+    assert "@" not in h and "!" not in h  # no user ids, no room ids
+
+
 def test_expand_bundle_builtin_and_unknown():
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
     messaging = store.expand_bundle("messaging")
@@ -711,6 +738,28 @@ def test_advanced_tool_controls_is_a_known_feature():
     assert reactive.FEATURE_ADVANCED_TOOL_CONTROLS in reactive.KNOWN_FEATURES
 
 
+def test_principal_note_exact_server_id_match_only():
+    note = reactive.principal_note("@irena:filament.dm", "@irena:filament.dm")
+    assert note == "Note: the sender of this message is your principal."
+    # Any other sender → no note.
+    assert reactive.principal_note("@mallory:filament.dm", "@irena:filament.dm") == ""
+    # A display name equal to the owner's id must NOT match — the comparison
+    # is server-attributed ids only, or anyone could rename themselves into
+    # the principal line.
+    assert reactive.principal_note("Irena Wang", "@irena:filament.dm") == ""
+    # Near-miss ids (case, whitespace) are not the principal either.
+    assert reactive.principal_note("@Irena:filament.dm", "@irena:filament.dm") == ""
+    assert reactive.principal_note("@irena:filament.dm ", "@irena:filament.dm") == ""
+
+
+def test_principal_note_fails_closed_when_ids_unknown():
+    # Unknown owner (get_self not completed) or missing sender → never a note.
+    assert reactive.principal_note("@irena:filament.dm", None) == ""
+    assert reactive.principal_note(None, "@irena:filament.dm") == ""
+    assert reactive.principal_note("", "") == ""
+    assert reactive.principal_note(None, None) == ""
+
+
 # ── Engaged-thread wake (ENG-724) ───────────────────────────────────
 
 
@@ -890,3 +939,21 @@ def _run() -> None:
 
 if __name__ == "__main__":
     _run()
+
+
+def test_capability_hint_principal_aware_decline():
+    allowed = frozenset({"get_recent_messages"}) | reactive.UNGATEABLE
+    third = reactive.capability_hint(allowed)
+    second = reactive.capability_hint(allowed, sender_is_principal=True)
+    assert "only your principal can enable it" in third
+    assert "never tell them 'you can enable it'" in third
+    # Direct second-person coaching toward the principal: a complete
+    # sentence, no third-person "they can".
+    assert (
+        'tell them plainly: "you can enable it for this channel '
+        'in my settings"' in second
+    )
+    assert "that they can enable" not in second
+    assert "your principal can enable it" not in second
+    # Ungated turns still produce no hint regardless of the flag.
+    assert reactive.capability_hint(None, sender_is_principal=True) == ""
