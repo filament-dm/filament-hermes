@@ -40,6 +40,7 @@ from .reactive import (
     KNOWN_FEATURES,
     MCP_BUNDLE_PREFIX,
     CapabilityPolicyStore,
+    ChannelInstructionsStore,
     FeatureFlagStore,
     InstructionsStore,
     WakePolicyStore,
@@ -646,6 +647,7 @@ def _register_reactive_tools(
     wake_store = WakePolicyStore()
     capability_store = CapabilityPolicyStore()
     feature_flags = FeatureFlagStore()
+    channel_instructions_store = ChannelInstructionsStore()
 
     def _deny(tool: str) -> str:
         logger.info(
@@ -810,6 +812,128 @@ def _register_reactive_tools(
             {"ok": True, "feature": name, "enabled": enabled, "flags": flags}
         )
 
+    # ── Generic section-scoped config access ────────────────────────
+    #
+    # One tool per direction over the whole server-config document, keyed by
+    # section name — the same five sections ServerConfigSync syncs. The typed
+    # set_*/get_* tools above remain the primary conversational surface; these
+    # exist so new sections (channel_instructions today) and future ones need
+    # no bespoke tool, and so the slash layer, the app, and the LLM path all
+    # converge on the same store-write + write_back(section) shape.
+
+    def _config_document() -> dict:
+        return {
+            "capability_policy": capability_store.read(),
+            "wake_policy": wake_store.read(),
+            "instructions": instructions_store.read(),
+            "channel_instructions": channel_instructions_store.read(),
+            "feature_flags": feature_flags.read(),
+        }
+
+    _CONFIG_SECTIONS = (
+        "capability_policy",
+        "wake_policy",
+        "instructions",
+        "channel_instructions",
+        "feature_flags",
+    )
+
+    def _section_error(section: str, value: Any) -> str | None:
+        """Validate *value* for *section* with the same rules the typed
+        tools enforce, so the generic path can't store what the typed path
+        would reject. Returns an error message, or None when valid."""
+        if section == "capability_policy":
+            if not isinstance(value, dict):
+                return "capability_policy must be an object."
+            return _capability_policy_error(value)
+        if section == "wake_policy":
+            if not isinstance(value, dict):
+                return "wake_policy must be an object."
+            return _wake_policy_error(value)
+        if section == "instructions":
+            if not isinstance(value, str):
+                return "instructions must be a string."
+            return None
+        if section == "channel_instructions":
+            if not isinstance(value, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in value.items()
+            ):
+                return (
+                    "channel_instructions must be an object mapping room id "
+                    "→ guidance string."
+                )
+            return None
+        # feature_flags
+        if not isinstance(value, dict):
+            return "feature_flags must be an object of feature → boolean."
+        for name, enabled in value.items():
+            if name not in KNOWN_FEATURES:
+                return (
+                    f"Unknown feature {name!r}. "
+                    f"Known: {', '.join(sorted(KNOWN_FEATURES))}."
+                )
+            if not isinstance(enabled, bool):
+                return f"feature_flags[{name}] must be true or false."
+        return None
+
+    def _apply_section(section: str, value: Any) -> None:
+        if section == "capability_policy":
+            capability_store.write(value)
+        elif section == "wake_policy":
+            wake_store.write(value)
+        elif section == "instructions":
+            instructions_store.write(value)
+        elif section == "channel_instructions":
+            channel_instructions_store.write(value)
+        else:
+            feature_flags.write(value)
+
+    async def _set_agent_config(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: set_agent_config (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("set_agent_config")
+        section = args.get("section")
+        if section not in _CONFIG_SECTIONS:
+            return json.dumps(
+                {
+                    "error": f"Unknown section {section!r}.",
+                    "sections": list(_CONFIG_SECTIONS),
+                }
+            )
+        # Same opt-in coupling as set_capabilities: the capability policy is
+        # inert until the feature is on, so writing it dark is a foot-gun.
+        if section == "capability_policy" and not feature_flags.is_enabled(
+            FEATURE_ADVANCED_TOOL_CONTROLS
+        ):
+            return _feature_off_notice()
+        value = args.get("value")
+        err = _section_error(section, value)
+        if err:
+            return json.dumps({"error": err})
+        _apply_section(section, value)
+        await server_sync.write_back(section)
+        return json.dumps({"ok": True, "section": section})
+
+    async def _get_agent_config(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: get_agent_config (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("get_agent_config")
+        section = args.get("section")
+        if section is None:
+            return json.dumps({"config": _config_document()}, indent=2)
+        if section not in _CONFIG_SECTIONS:
+            return json.dumps(
+                {
+                    "error": f"Unknown section {section!r}.",
+                    "sections": list(_CONFIG_SECTIONS),
+                }
+            )
+        return json.dumps(
+            {"section": section, "value": _config_document()[section]},
+            indent=2,
+        )
+
     def _reg(name: str, desc: str, params: dict, handler: Any) -> None:
         ctx.register_tool(
             name=name,
@@ -925,4 +1049,50 @@ def _register_reactive_tools(
         "whether it's currently enabled. Backchannel/owner only.",
         _empty,
         _get_features,
+    )
+    _reg(
+        "set_agent_config",
+        "Write one section of the agent's config document by name — the "
+        "generic form of the typed set_* tools. 'section' is one of "
+        "capability_policy, wake_policy, instructions, channel_instructions, "
+        "feature_flags; 'value' is the full new section content (an object, "
+        "or the instructions string), validated with the same rules as the "
+        "typed tool for that section and mirrored to the server document. "
+        "Prefer the typed tools where one exists; this is the only writer "
+        "for channel_instructions (per-channel guidance, room id → text). "
+        "Backchannel/owner only.",
+        {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "enum": [
+                        "capability_policy",
+                        "wake_policy",
+                        "instructions",
+                        "channel_instructions",
+                        "feature_flags",
+                    ],
+                },
+                "value": {
+                    "description": "The full new content for the section: an "
+                    "object for every section except 'instructions', which "
+                    "is a string."
+                },
+            },
+            "required": ["section", "value"],
+        },
+        _set_agent_config,
+    )
+    _reg(
+        "get_agent_config",
+        "Read the agent's config document: pass 'section' "
+        "(capability_policy, wake_policy, instructions, "
+        "channel_instructions, feature_flags) for one section, or omit it "
+        "for the whole document. Backchannel/owner only.",
+        {
+            "type": "object",
+            "properties": {"section": {"type": "string"}},
+        },
+        _get_agent_config,
     )
