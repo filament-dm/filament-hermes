@@ -58,14 +58,23 @@ def build_reminder(latest: str, current: str) -> str:
 
 
 async def fetch_latest_version(timeout: float = 10.0) -> str | None:
-    """Version on main, or None on any failure (network, parse, ...)."""
+    """Version on main, or None on any failure (network, parse, ...).
+
+    The pyproject.toml URL is ``FILAMENT_UPDATE_CHECK_URL`` when that env var
+    is set, else the GitHub raw URL for main. The override exists so a test
+    harness can stand in for "the version on main" and observe the reminder
+    end to end; production deployments never set it and always hit GitHub.
+    Read per call (not at import time) so tests and harnesses can set it
+    after the module is loaded.
+    """
+    url = os.environ.get("FILAMENT_UPDATE_CHECK_URL") or LATEST_PYPROJECT_URL
     try:
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             headers={"User-Agent": USER_AGENT},
         ) as client:
-            resp = await client.get(LATEST_PYPROJECT_URL)
+            resp = await client.get(url)
             if resp.status_code != 200:
                 logger.debug("filament-fcm: update check got HTTP %d", resp.status_code)
                 return None
