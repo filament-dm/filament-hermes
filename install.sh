@@ -309,8 +309,17 @@ PYEOF
 if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
   # A pyproject parse hiccup must never leave the plugin without its hard
   # dependency — fall back to the essential set.
+  #
+  # firebase-messaging must stay the fork here too. Installing the stock package
+  # would put it ahead of the vendored fork on sys.path, and the agent would
+  # connect, look healthy and never receive a push. Keep the ref in step with
+  # pyproject.toml and scripts/vendor-deps.sh.
   warn "could not read dependencies from pyproject.toml; using built-in defaults."
-  FCM_DEPS=("firebase-messaging>=0.4.5,<1" "httpx>=0.24" "structlog>=25.5.0,<26")
+  FCM_DEPS=(
+    "firebase-messaging @ git+https://github.com/filament-dm/firebase-messaging.git@filament/integration"
+    "httpx>=0.24"
+    "structlog>=25.5.0,<26"
+  )
 fi
 "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}"
 

@@ -748,7 +748,7 @@ wheels = [
 [[package]]
 name = "firebase-messaging"
 version = "0.4.5"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/filament-dm/firebase-messaging.git?rev=81a7249a9510569e74f9e210a8b7d4873485cfac#81a7249a9510569e74f9e210a8b7d4873485cfac" }
 dependencies = [
     { name = "aiohttp", version = "3.13.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "aiohttp", version = "3.14.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
@@ -757,10 +757,6 @@ dependencies = [
     { name = "http-ece" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/52/a0/20dc16682beff1b382ec10a9fba156f9bd5c33bfbbf227be5af437daff94/firebase_messaging-0.4.5.tar.gz", hash = "sha256:11f19509ea839e53f995d93d25d63a4a1385572a37fc2cff2c1b389534cb80f1", size = 36088, upload-time = "2025-05-10T09:16:26.553Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1d/10/f4e266f9e0aa025d23077c733e5a7f646fc9ced3c8b2711168e93d12742a/firebase_messaging-0.4.5-py3-none-any.whl", hash = "sha256:b566b5dedb15463fa35540d42acfda41040a2ae19c562b33b52f226e90212168", size = 33836, upload-time = "2025-05-10T09:16:24.843Z" },
 ]
 
 [[package]]
@@ -928,7 +924,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "firebase-messaging", specifier = ">=0.4.5,<1" },
+    { name = "firebase-messaging", git = "https://github.com/filament-dm/firebase-messaging.git?rev=81a7249a9510569e74f9e210a8b7d4873485cfac" },
     { name = "httpx", specifier = ">=0.24" },
     { name = "structlog", specifier = ">=25.5.0,<26" },
 ]

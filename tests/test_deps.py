@@ -138,3 +138,42 @@ def test_optional_warning_when_soft_dep_out_of_range(monkeypatch):
     warnings = deps.optional_dep_warnings()
     assert len(warnings) == 1
     assert "structlog" in warnings[0]
+
+
+# ── fork_warning() — stock firebase-messaging shadowing our fork ─────
+
+
+def test_fork_warning_silent_when_the_fix_is_present():
+    # The real dependency is the fork, so this is also a live check that the
+    # installed build is the one we expect.
+    assert deps.fork_warning() is None
+
+
+def test_fork_warning_flags_a_stock_build(monkeypatch):
+    # A stock build has no header parser. It keeps upstream's version, so no
+    # version check would catch it — this is the only thing that does.
+    stub = types.ModuleType("firebase_messaging.fcmpushclient")
+    parent = types.ModuleType("firebase_messaging")
+    parent.fcmpushclient = stub
+    monkeypatch.setitem(sys.modules, "firebase_messaging", parent)
+    monkeypatch.setitem(sys.modules, "firebase_messaging.fcmpushclient", stub)
+
+    warning = deps.fork_warning()
+    assert warning is not None
+    assert "fork" in warning
+    assert "never wake" in warning
+
+
+def test_fork_warning_quiet_when_firebase_is_absent(monkeypatch):
+    # dep_problem owns the missing-dependency case; saying it twice helps nobody.
+    monkeypatch.delitem(sys.modules, "firebase_messaging", raising=False)
+    monkeypatch.delitem(sys.modules, "firebase_messaging.fcmpushclient", raising=False)
+
+    class _BlockFirebase:
+        def find_spec(self, name, path=None, target=None):
+            if name.startswith("firebase_messaging"):
+                raise ModuleNotFoundError(name)
+            return None
+
+    monkeypatch.setattr(sys, "meta_path", [_BlockFirebase(), *sys.meta_path])
+    assert deps.fork_warning() is None

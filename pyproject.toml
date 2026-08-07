@@ -9,7 +9,10 @@ license-files = ["LICENSE"]
 # what deps.py checks at runtime. httpx is a Hermes core dependency, so it is
 # declared but not vendored; the other two are (see the root __init__.py).
 dependencies = [
-    "firebase-messaging>=0.4.5,<1",
+    # Our fork, not PyPI — scripts/vendor-deps.sh says why. Pinned to the commit
+    # that script vendors, so the tests exercise the code that actually ships;
+    # tests/test_vendor_source.py fails if the two drift apart.
+    "firebase-messaging @ git+https://github.com/filament-dm/firebase-messaging.git@81a7249a9510569e74f9e210a8b7d4873485cfac",
     "httpx>=0.24",
     "structlog>=25.5.0,<26",
 ]
@@ -37,13 +40,19 @@ filament-fcm-setup = "hermes_filament_fcm.setup_cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+# firebase-messaging is a git dependency (our fork), which hatchling refuses to
+# accept as a direct reference without this.
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_filament_fcm"]
 
 [tool.ruff]
-# vendor/ is third-party code unpacked from PyPI wheels, byte-for-byte. Linting
-# it reports 292 findings about other people's code, and "fixing" any of them
-# would make the tree diverge from the wheel scripts/vendor-deps.sh rebuilds.
+# vendor/ is third-party code unpacked byte-for-byte — from PyPI wheels, and for
+# firebase-messaging from our fork. Linting it reports hundreds of findings about
+# other people's code, and "fixing" any of them would make the tree diverge from
+# what scripts/vendor-deps.sh rebuilds. Fix firebase-messaging on the fork.
 extend-exclude = ["vendor"]
 
 [tool.ruff.lint]

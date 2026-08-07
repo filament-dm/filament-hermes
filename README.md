@@ -45,6 +45,14 @@ Nothing else to install. The plugin's Python dependencies ship inside it (see
 install` clones a directory and never runs pip — and on the Docker and cloud
 images the venv the gateway imports from is not writable by the gateway anyway.
 
+`firebase-messaging` comes from our fork,
+[filament-dm/firebase-messaging](https://github.com/filament-dm/firebase-messaging),
+branch `filament/integration`, rather than from PyPI. Fixes we need land there
+first and are upstreamed from there. The fork keeps upstream's version number, so
+a separately installed copy of the stock package will shadow it without tripping
+any version check — the plugin warns at startup if it sees one, because the
+symptom otherwise is an agent that connects, looks healthy and never wakes.
+
 To update:
 
 ```

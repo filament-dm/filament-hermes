@@ -12,6 +12,15 @@ dependency outranks the vendored one (deliberately — see the root
 can also be missing outright, from a partial clone or a hand-assembled plugin
 directory.
 
+``firebase-messaging`` is a special case, because we vendor our own fork
+(``filament/integration`` — see ``scripts/vendor-deps.sh``) and it keeps
+upstream's version number. A stock PyPI build therefore shadows the fork without
+failing any version check, and the symptom is an agent that connects, looks
+healthy and never wakes: upstream cannot decode a push header on current
+CPython, and treats that failure as fatal to the whole receiver.
+``fork_warning()`` looks for the fix itself rather than a version, so that case
+says so instead of going quiet.
+
 ``dep_problem()`` makes either case legible: it verifies ``firebase-messaging``
 is importable and within the required version range, and returns a
 human-readable remediation string when it isn't (or ``None`` when all is well).
@@ -149,6 +158,37 @@ def dep_problem() -> str | None:
                 f"To fix: {REFRESH_HINT}."
             )
     return None
+
+
+def fork_warning() -> str | None:
+    """Warn when firebase-messaging is a stock build rather than our fork.
+
+    Detects the fix by looking for the header parser it introduced, because the
+    fork carries upstream's version number and no version check can separate the
+    two (see the module docstring).
+
+    A warning rather than a hard failure: this reads a private name, so a future
+    fork could rename it, and taking the platform down over a heuristic is worse
+    than the thing it guards. Returns ``None`` when the fix is present, and also
+    when firebase_messaging cannot be imported at all — ``dep_problem`` owns that
+    case and reporting it twice helps nobody.
+    """
+    try:
+        from firebase_messaging import fcmpushclient  # noqa: PLC0415
+    except Exception:
+        return None
+
+    if hasattr(fcmpushclient, "_header_param"):
+        return None
+
+    return (
+        "firebase-messaging looks like a stock build, not the Filament fork: it "
+        "has no Crypto-Key/Encryption header parser, so on current CPython every "
+        "push fails to decode and the receiver shuts down — this agent will "
+        "connect and then never wake. A separately installed copy takes "
+        "precedence over the vendored one, so uninstall it; if the vendored tree "
+        f"itself is stale, {REFRESH_HINT}."
+    )
 
 
 def optional_dep_warnings() -> list[str]:
