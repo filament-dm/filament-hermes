@@ -1,7 +1,8 @@
 """Update-available reminder.
 
-The plugin is installed from git main (see install.sh), so "latest
-available version" means the version currently on main. Once a day the
+The plugin is installed from git main (`hermes plugins install` clones the
+default branch), so "latest available version" means the version currently on
+main. Once a day the
 adapter fetches the raw pyproject.toml from GitHub, compares it to the
 installed version, and — when a newer one exists — reminds the principal
 once per new version via the backchannel (every check still logs, so
@@ -50,10 +51,11 @@ def build_reminder(latest: str, current: str) -> str:
         f"📦 A new version of the Filament↔Hermes plugin is available: "
         f"v{latest} (this agent runs v{current}). To update, run on the "
         f"machine hosting this agent:\n"
-        f"```\nhermes plugins update filament-fcm && hermes gateway restart\n```\n"
-        f"If the plugin reports a dependency problem after updating (rare — only "
-        f"when a release bumps a dependency), re-run the connect command from "
-        f"the Filament app instead, which also refreshes dependencies."
+        f"```\nhermes plugins update filament && hermes gateway restart\n```\n"
+        f"That pulls the plugin's vendored dependencies along with its code, so "
+        f"it is the whole update. If it reports any problem, re-run the connect "
+        f"command from the Filament app instead — it replaces the plugin outright "
+        f"rather than updating it in place, so it recovers from any state."
     )
 
 

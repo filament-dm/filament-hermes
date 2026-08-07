@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
+from .cli import register_cli
 from .deps import dep_problem, optional_dep_warnings
 from .filament_api import FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
@@ -46,7 +47,7 @@ from .reactive import (
     current_capabilities,
     current_zone,
 )
-from .setup_cli import _enable_plugin, _run_interactive_setup
+from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -135,11 +136,11 @@ def check_requirements() -> bool:
     additional senders).
 
     The dependency check matters because this plugin ships as a *directory
-    plugin* whose deps are installed out of band (see install.sh) and are not
-    refreshed by ``hermes plugins update``. A release that bumps a dep, pulled
-    via ``plugins update`` without a dep refresh, would otherwise crash with a
-    raw ImportError deep in ``connect()``; here it surfaces as an actionable
-    warning and the platform simply stays down until the dep is refreshed.
+    plugin* carrying its deps in its own ``vendor/`` tree, which an ambient copy
+    can outrank (see the root ``__init__.py``). An out-of-range ambient copy, or
+    an incomplete plugin tree, would otherwise crash with a raw ImportError deep
+    in ``connect()``; here it surfaces as an actionable warning and the platform
+    simply stays down until it is resolved.
     """
     if not os.environ.get("FILAMENT_MCP_TOKEN"):
         logger.debug("filament-fcm: missing env var: FILAMENT_MCP_TOKEN")
@@ -181,7 +182,7 @@ def interactive_setup() -> None:
 
     Delegates to ``setup_cli`` which owns the shared implementation.
     """
-    _enable_plugin()
+    migrate_legacy_install()
     _run_interactive_setup()
 
 
@@ -217,15 +218,16 @@ def register(ctx: Any) -> None:
         adapter_factory=lambda cfg: FCMFilamentAdapter(cfg, filament_api=api),
         check_fn=check_requirements,
         setup_fn=interactive_setup,
-        plugin_name="filament-fcm",
+        plugin_name=PLUGIN_ID,
         required_env=[
             "FILAMENT_MCP_TOKEN",
         ],
         install_hint=(
-            "Install with the one-line connect command from the Filament app "
-            "(it installs the plugin and its dependencies, then connects). "
-            "If this platform is down after a `hermes plugins update`, a "
-            "dependency likely needs refreshing — re-run that connect command."
+            "Install with `hermes plugins install filament-dm/filament-hermes "
+            "--enable`, which prompts for the agent token from Filament's "
+            "connect flow, then restart the gateway. If this platform is down "
+            "after a `hermes plugins update`, check the gateway log for a "
+            "dependency warning."
         ),
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="FILAMENT_HOME_ROOM",
@@ -357,6 +359,7 @@ def register(ctx: Any) -> None:
 
     _register_reactive_tools(ctx)
     _register_capability_gate(ctx)
+    register_cli(ctx)
 
 
 def _register_capability_gate(ctx: Any) -> None:

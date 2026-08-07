@@ -16,7 +16,9 @@ Usage:
 
 import asyncio
 import os
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -57,14 +59,123 @@ def _find_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
+# The plugin id: the install directory under $HERMES_HOME/plugins, the entry in
+# plugins.enabled, and the argument to `hermes plugins update`.
+# LEGACY_PLUGIN_ID is what it was called before, which an older install
+# still has enabled.
+#
+# Neither the platform name nor the state directory ~/.hermes/filament-fcm/
+# follows this id — both keep the old spelling, so renaming moves no state.
+PLUGIN_ID = "filament"
+LEGACY_PLUGIN_ID = "filament-fcm"
+
+
+def migrate_enabled(enabled: list) -> list:
+    """Return *enabled* with the legacy id replaced by the current one.
+
+    Order is preserved so an unrelated plugin's position never moves, and the id
+    is not duplicated if both are somehow listed.
+    """
+    out = []
+    for item in enabled:
+        replaced = PLUGIN_ID if item == LEGACY_PLUGIN_ID else item
+        if replaced not in out:
+            out.append(replaced)
+    if PLUGIN_ID not in out:
+        out.append(PLUGIN_ID)
+    return out
+
+
+def legacy_dir_is_ours(path: Path) -> bool:
+    """True if *path* is a directory holding a copy of this plugin.
+
+    The gate on deleting anything. It must be a real directory (not a symlink,
+    which rmtree refuses anyway) containing our package, so a directory that
+    merely happens to sit at the legacy path is left alone.
+    """
+    if path.is_symlink() or not path.is_dir():
+        return False
+    return (path / "hermes_filament_fcm").is_dir()
+
+
+def running_from(path: Path) -> bool:
+    """True if this module is being executed out of *path*."""
+    try:
+        Path(__file__).resolve().relative_to(path.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def retire_legacy_plugin_dir() -> bool:
+    """Move an install off the legacy plugin id. True if anything changed.
+
+    No current install: the legacy tree IS the install (what `hermes plugins
+    update` on the old id leaves behind), so rename it. That keeps the git remote,
+    and on POSIX is safe even when this code is running out of it — the rename
+    keeps the inode.
+
+    Current install present: the legacy tree is a leftover, so remove it. Left in
+    place it re-arms whenever anything enables that id, and being loaded second it
+    overwrites the new plugin's platform entry.
+
+    Never the state directory ~/.hermes/filament-fcm/ — that is a separate path.
+    """
+    plugins = _find_hermes_home() / "plugins"
+    legacy, current = plugins / LEGACY_PLUGIN_ID, plugins / PLUGIN_ID
+    if not legacy_dir_is_ours(legacy):
+        return False
+
+    if not current.exists():
+        try:
+            shutil.move(str(legacy), str(current))
+        except OSError as exc:
+            print_warning(
+                f"Could not move {legacy} to {current} ({exc}). Re-run the "
+                f"connect command from the Filament app to reinstall."
+            )
+            return False
+        print_info(f"Moved the plugin from {LEGACY_PLUGIN_ID} to {PLUGIN_ID}")
+        return True
+
+    if running_from(legacy):
+        print_info(
+            f"Leaving the old {LEGACY_PLUGIN_ID} directory in place for now — "
+            f"this command is running out of it. It is disabled, and the next "
+            f"run removes it."
+        )
+        return False
+
+    try:
+        shutil.rmtree(legacy)
+    except OSError as exc:
+        print_warning(
+            f"Could not remove the old plugin directory {legacy} ({exc}). "
+            f"Remove it by hand, or it may shadow this install."
+        )
+        return False
+    print_info(f"Retired the old {LEGACY_PLUGIN_ID} plugin directory")
+    return True
+
+
+def migrate_legacy_install() -> None:
+    """Enable the current plugin id, then move the tree off the legacy one.
+
+    Config first: if the second step never runs, a leftover tree is disabled and
+    inert, whereas a removed tree leaves nothing loadable.
+    """
+    _enable_plugin()
+    retire_legacy_plugin_dir()
+
+
 def _enable_plugin() -> None:
-    """Add 'filament-fcm' to plugins.enabled in config.yaml."""
+    """Enable the plugin in config.yaml, migrating off the legacy id."""
     config_path = _find_hermes_home() / "config.yaml"
 
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("plugins:\n  enabled:\n  - filament-fcm\n")
-        print_info(f"Created {config_path} with filament-fcm enabled")
+        config_path.write_text(f"plugins:\n  enabled:\n  - {PLUGIN_ID}\n")
+        print_info(f"Created {config_path} with {PLUGIN_ID} enabled")
         return
 
     with open(config_path) as f:
@@ -74,23 +185,31 @@ def _enable_plugin() -> None:
     enabled = plugins.get("enabled")
     if not isinstance(enabled, list):
         enabled = []
-    if "filament-fcm" in enabled:
-        print_info("Plugin filament-fcm is already enabled")
+
+    migrated = migrate_enabled(enabled)
+    if migrated == enabled:
+        print_info(f"Plugin {PLUGIN_ID} is already enabled")
         return
 
-    enabled.append("filament-fcm")
-    plugins["enabled"] = enabled
-
+    plugins["enabled"] = migrated
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
 
-    print_info(f"Enabled filament-fcm in {config_path}")
+    if LEGACY_PLUGIN_ID in enabled:
+        print_info(f"Renamed {LEGACY_PLUGIN_ID} to {PLUGIN_ID} in {config_path}")
+    else:
+        print_info(f"Enabled {PLUGIN_ID} in {config_path}")
 
 
 # JSON-RPC codes from the agents MCP. -32002: token valid but the account
 # doesn't exist yet ("reserved" — the principal hasn't finished the connect
 # flow). Anything else (e.g. -32001) means the token isn't usable.
 _RESERVED_CODE = -32002
+
+# How long to keep trying an endpoint that never answers before giving up.
+# Generous, because a laptop waking from sleep or a VPN reconnecting can take
+# tens of seconds and neither means the URL is wrong.
+UNREACHABLE_BUDGET_S = 60.0
 
 
 def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
@@ -105,11 +224,11 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     - ``(False, None)`` when the token is definitively rejected (auth
       error) or the user pressed Ctrl+C.
 
-    While the agent is reserved, ``get_self`` returns -32002; we show a
-    one-time nudge and keep polling, so the flow connects automatically
-    once the user finishes naming the agent.  Transient errors (transport
-    failures, HTTP 500, non-dict error responses) are retried — only a
-    well-formed JSON-RPC auth rejection (-32001) aborts.
+    While the agent is reserved, ``get_self`` returns -32002; we nudge once and
+    keep polling, unbounded, because that wait is paced by a human naming the
+    agent in the app. Being unreachable is bounded at ``UNREACHABLE_BUDGET_S``
+    instead — a bad URL never resolves itself. Any reply resets that budget. An
+    endpoint that answers but errs is retried forever; only -32001 aborts.
     """
     # Only this specific error code means the token itself is bad and
     # retrying won't help. Everything else is transient or reserved.
@@ -118,13 +237,35 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     async def _poll() -> tuple[bool, str | None]:
         api = FilamentAPI(url, token)
         nudged = False
+        # When the endpoint cannot be reached AT ALL, give up after this long.
+        # Waiting out the reserved window is unbounded on purpose (see the
+        # docstring); waiting on an endpoint that never answers is not, because a
+        # typo, a dead host or a TLS failure will not fix itself and an indefinite
+        # hang tells the user nothing. Reset on any reply, so a blip partway
+        # through a legitimate long wait cannot eat the budget and abort it.
+        unreachable_since: float | None = None
         try:
             while True:
                 try:
                     resp = await api.get_self()
-                except Exception:
-                    await asyncio.sleep(3)  # transient transport error — retry
+                except Exception as exc:
+                    now = time.monotonic()
+                    if unreachable_since is None:
+                        unreachable_since = now
+                    elif now - unreachable_since >= UNREACHABLE_BUDGET_S:
+                        detail = str(exc).strip()
+                        print_warning(
+                            f"Could not reach {url} for "
+                            f"{UNREACHABLE_BUDGET_S:.0f}s "
+                            f"({type(exc).__name__}"
+                            f"{': ' + detail if detail else ''}). Check the "
+                            f"endpoint, then re-run with --url."
+                        )
+                        return False, None
+                    await asyncio.sleep(3)
                     continue
+                # It answered, so the endpoint is real — whatever it said.
+                unreachable_since = None
                 err = (resp or {}).get("error")
                 if err is None:
                     # Finalized. Pull the principal (owner) out of the
@@ -314,6 +455,109 @@ def _run_interactive_setup() -> bool:
     return True
 
 
+def _persist(token: str, url: str, principal_id: str | None) -> None:
+    """Write the validated connection to the engine's .env.
+
+    Seeds FILAMENT_CONTROL_USERS with the principal, which is the platform's
+    allowed_users_env. The owner then reaches the agent from the first message,
+    with no `hermes pairing approve` step.
+    """
+    save_env_value("FILAMENT_MCP_TOKEN", token)
+    save_env_value("FILAMENT_MCP_URL", url)
+
+    # Carry the Firebase project through, as the interactive path does (see
+    # _FIREBASE_ENV_KEYS). Against a non-production homeserver these come from
+    # the invoking environment, and a gateway that starts without them registers
+    # with the wrong project: it connects, looks healthy, and is never woken.
+    for key in _FIREBASE_ENV_KEYS:
+        value = (get_env_value(key) or "").strip()
+        if value:
+            save_env_value(key, value)
+
+    # The principal alone, matching what the interactive path writes on this
+    # same (CONNECT_TOKEN) branch. That path also prompts for extra commanders,
+    # and re-writing this key drops any that were granted — but that is main's
+    # behaviour and predates this command, so it is fixed separately.
+    if principal_id:
+        save_env_value("FILAMENT_CONTROL_USERS", principal_id)
+    else:
+        remove_env_value("FILAMENT_CONTROL_USERS")
+        print_warning(
+            "Could not determine the principal (owner) from the token. Run "
+            "`hermes pairing approve` once, or set FILAMENT_CONTROL_USERS."
+        )
+
+
+def token_source(token: str, from_stdin: bool) -> str:
+    """Where to read the token: "argv", "stdin", or "conflict".
+
+    Both together is a conflict rather than a preference: the one on the command
+    line is already in the shell's history whichever we honour.
+    """
+    if from_stdin and token:
+        return "conflict"
+    if from_stdin or not token:
+        return "stdin"
+    return "argv"
+
+
+def _read_token_without_argv() -> str:
+    """The token from stdin when it is piped or redirected, else from a prompt."""
+    if not sys.stdin.isatty():
+        return (sys.stdin.readline() or "").strip()
+    return (prompt("Agent token (fmcp_...)", password=True) or "").strip()
+
+
+def connect(
+    token: str,
+    url: str | None = None,
+    restart: bool = True,
+    from_stdin: bool = False,
+) -> int:
+    """Connect this agent to Filament with *token*. Returns an exit code.
+
+    Blocks while the agent is reserved, so it may be run before the agent is
+    named in the app. Overwrites an existing token, so it is the reconnect path
+    too. With *from_stdin*, the token is read from stdin instead of *token*.
+    """
+    token = (token or "").strip()
+    source = token_source(token, from_stdin)
+    if source == "conflict":
+        print_warning(
+            "-p reads the token from stdin, so do not also pass it as an "
+            "argument. Drop one of the two."
+        )
+        return 2
+    if source == "stdin":
+        token = _read_token_without_argv()
+    if not token:
+        print_warning("A token is required. Copy it from Filament's connect flow.")
+        return 2
+
+    resolved = (
+        url or get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents"
+    ).strip().rstrip("/")
+
+    print_header("Filament (FCM)")
+
+    # Validate before touching anything. A rejected or abandoned token must
+    # leave the existing configuration working — and the migration below
+    # relocates a directory, which is not something to do on a guess.
+    ready, principal_id = _wait_for_finalization(token, resolved)
+    if not ready:
+        return 1
+
+    migrate_legacy_install()
+    _persist(token, resolved, principal_id)
+    print_success("Connected. Configuration saved.")
+
+    if restart:
+        _restart_gateway()
+    else:
+        print_info("Restart the gateway to load it: hermes gateway restart")
+    return 0
+
+
 def _restart_gateway() -> None:
     """Restart the gateway immediately, launched DETACHED so setup can exit.
 
@@ -378,7 +622,7 @@ def main() -> None:
     print()
     print_header("filament-fcm-setup")
 
-    _enable_plugin()
+    migrate_legacy_install()
     print()
     ready = _run_interactive_setup()
     print()
