@@ -6,11 +6,15 @@ This plugin is installed as a *directory plugin* (git-cloned into
 ``hermes plugins update`` — a git pull of the plugin tree — refreshes code and
 dependencies together, and there is no separate dependency step to forget.
 
-What can still go wrong is an environment mismatch: an ambient copy of a
-dependency outranks the vendored one (deliberately — see the root
-``__init__.py``), and it may be older than this release needs. The vendored tree
-can also be missing outright, from a partial clone or a hand-assembled plugin
-directory.
+The root ``__init__.py`` prepends that tree, so the vendored copy wins over
+anything already installed. What can still go wrong is the tree being missing
+outright, from a partial clone or a hand-assembled plugin directory.
+
+Winning is deliberate: these packages are ours alone, and a stale copy left in
+site-packages by an older install used to shadow them. ``vendor_shadow_warnings()``
+reports the one case where winning is the wrong call — the environment holding a
+*different* version, which is what it would look like if Hermes started shipping
+one of them.
 
 ``firebase-messaging`` is a special case, because we vendor our own fork
 (``filament/integration`` — see ``scripts/vendor-deps.sh``) and it keeps
@@ -40,8 +44,10 @@ as ``_version`` and never adds a dependency of its own.
 from __future__ import annotations
 
 import re
-from importlib.metadata import PackageNotFoundError
+import sys
+from importlib.metadata import Distribution, DistributionFinder, PackageNotFoundError
 from importlib.metadata import version as _dist_version
+from pathlib import Path
 
 # HARD dependencies — the plugin cannot function without these, so a missing
 # one makes check_requirements() fail (the platform stays down with an
@@ -57,9 +63,8 @@ REQUIRED = {"firebase-messaging": ">=0.4.5,<1"}
 OPTIONAL = {"structlog": ">=25.5.0,<26"}
 
 # How the operator gets back to a good state. `plugins update` re-pulls the
-# plugin tree, vendor/ included, which is the fix when the tree is incomplete.
-# When the problem is instead an out-of-range ambient copy shadowing the
-# vendored one, uninstalling that copy is what hands the vendored tree back.
+# plugin tree, vendor/ included, which is the fix when the tree is incomplete —
+# and since vendor/ is prepended, that is enough. Nothing has to be uninstalled.
 #
 # The plugin id is spelled out rather than imported: this module is deliberately
 # stdlib-only (see the docstring) and setup_cli, which owns PLUGIN_ID, pulls in
@@ -67,9 +72,7 @@ OPTIONAL = {"structlog": ">=25.5.0,<26"}
 # no-stale-command test guards the pair.
 REFRESH_HINT = (
     "run `hermes plugins update filament` (this pulls the plugin's "
-    "vendored dependencies too) and restart the gateway; if a separately "
-    "pip-installed copy of the dependency is shadowing the vendored one, "
-    "uninstall it"
+    "vendored dependencies too) and restart the gateway"
 )
 
 
@@ -158,6 +161,76 @@ def dep_problem() -> str | None:
                 f"To fix: {REFRESH_HINT}."
             )
     return None
+
+
+def _vendor_dir() -> Path:
+    """The plugin's ``vendor/`` tree, which the root ``__init__.py`` prepends."""
+    return Path(__file__).resolve().parent.parent / "vendor"
+
+
+def _normalize(name: str) -> str:
+    return name.replace("_", "-").strip().lower()
+
+
+def vendored_distributions() -> dict[str, str]:
+    """``{distribution: version}`` from ``vendor/``'s .dist-info directories.
+
+    Read off the tree rather than listed here, so adding or dropping a vendored
+    package needs no second edit.
+    """
+    out: dict[str, str] = {}
+    vendor = _vendor_dir()
+    if not vendor.is_dir():
+        return out
+    for entry in vendor.glob("*.dist-info"):
+        stem = entry.name[: -len(".dist-info")]
+        name, _, version = stem.rpartition("-")
+        if name and version:
+            out[_normalize(name)] = version
+    return out
+
+
+def vendor_shadow_warnings() -> list[str]:
+    """Warn when vendor/ is shadowing a *different* build of what it carries.
+
+    vendor/ is prepended, so ours wins. That is right while these packages are
+    ours alone, and wrong the day Hermes ships one, because we would then be
+    forcing our pin on the rest of the process. Path order cannot express that
+    difference and would never tell us reality had changed; this does.
+
+    Only a version mismatch is reported. Our own install.sh pip-installs these
+    same distributions into the engine venv, so "present outside vendor/" is the
+    normal case and warning on it would be constant noise — which is how a real
+    signal gets ignored. A different version is the case worth a human look.
+    """
+    ours = vendored_distributions()
+    if not ours:
+        return []
+
+    vendor = str(_vendor_dir())
+    elsewhere = [p for p in sys.path if p and p != vendor]
+    try:
+        context = DistributionFinder.Context(path=elsewhere)
+        found = Distribution.discover(context=context)
+        outside = {}
+        for dist in found:
+            name = _normalize((dist.metadata or {}).get("Name") or "")
+            if name and name not in outside:
+                outside[name] = dist.version
+    except Exception:
+        return []
+
+    warnings: list[str] = []
+    for name, mine in sorted(ours.items()):
+        theirs = outside.get(name)
+        if theirs and theirs != mine:
+            warnings.append(
+                f"vendor/ ships {name} {mine} and the environment has {theirs}, "
+                f"which the vendored copy is shadowing for the whole process. If "
+                f"{theirs} now comes from Hermes, stop vendoring {name} and widen "
+                f"its range in pyproject.toml rather than overriding it."
+            )
+    return warnings
 
 
 def fork_warning() -> str | None:

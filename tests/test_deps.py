@@ -177,3 +177,52 @@ def test_fork_warning_quiet_when_firebase_is_absent(monkeypatch):
 
     monkeypatch.setattr(sys, "meta_path", [_BlockFirebase(), *sys.meta_path])
     assert deps.fork_warning() is None
+
+
+# ── vendor_shadow_warnings() — when vendoring stops being right ──────
+
+
+def test_vendored_distributions_reads_the_tree():
+    # Discovered, not listed, so adding or dropping one needs no second edit.
+    dists = deps.vendored_distributions()
+    assert set(dists) == {"firebase-messaging", "http-ece", "structlog"}
+    assert dists["firebase-messaging"] == "0.4.5"
+
+
+def test_quiet_when_the_environment_matches_what_we_vendor(monkeypatch):
+    # The normal case. install.sh pip-installs these same distributions, so
+    # "present outside vendor/" must not warn or the signal becomes noise.
+    monkeypatch.setattr(sys, "path", [str(deps._vendor_dir())])
+    assert deps.vendor_shadow_warnings() == []
+
+
+def test_warns_when_the_environment_has_a_different_version(tmp_path, monkeypatch):
+    # Stands in for Hermes shipping its own, newer structlog: we would then be
+    # forcing our pin on the whole process.
+    (tmp_path / "structlog-26.1.0.dist-info").mkdir()
+    (tmp_path / "structlog-26.1.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: structlog\nVersion: 26.1.0\n"
+    )
+    monkeypatch.setattr(sys, "path", [str(deps._vendor_dir()), str(tmp_path)])
+
+    warnings = deps.vendor_shadow_warnings()
+    assert len(warnings) == 1
+    assert "structlog" in warnings[0]
+    assert "26.1.0" in warnings[0] and "25.5.0" in warnings[0]
+    # It has to say what to do, not merely that something is odd.
+    assert "stop vendoring" in warnings[0]
+
+
+def test_same_version_elsewhere_is_not_a_warning(tmp_path, monkeypatch):
+    # Exactly what our own installer leaves behind.
+    (tmp_path / "structlog-25.5.0.dist-info").mkdir()
+    (tmp_path / "structlog-25.5.0.dist-info" / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: structlog\nVersion: 25.5.0\n"
+    )
+    monkeypatch.setattr(sys, "path", [str(deps._vendor_dir()), str(tmp_path)])
+    assert deps.vendor_shadow_warnings() == []
+
+
+def test_vendor_dir_itself_is_never_the_shadowed_one(monkeypatch):
+    monkeypatch.setattr(sys, "path", [str(deps._vendor_dir())] * 2)
+    assert deps.vendor_shadow_warnings() == []
