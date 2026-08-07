@@ -41,9 +41,32 @@ logger = logging.getLogger("gateway.filament_fcm")
 slog = get_logger()
 
 # Enable firebase-messaging library logging so connection state is visible
-# in the gateway logs.
+# in the gateway logs. That state — connecting, reconnecting, resetting — is all
+# logged at DEBUG, which is why the level is set here rather than left alone.
+#
+# The heartbeat is the one message at that level that repeats forever: a healthy
+# client sends one every 20s, so it buries the lines worth reading and puts a
+# pair on the console of anyone running the gateway in the foreground. Drop it.
+# Set FILAMENT_FCM_LOG_HEARTBEAT=1 to keep it while diagnosing a stalled push —
+# an absent heartbeat is evidence, so it has to stay reachable.
+#
+# Filtered on the format string, not the rendered message, so the match does not
+# depend on the arguments. If upstream rewords these, the filter stops matching
+# and the noise comes back — visibly, rather than silently dropping something
+# else.
+_HEARTBEAT_MARKERS = ("heartbeat ping", "heartbeat ack")
+
+
+class _DropHeartbeats(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not any(m in str(record.msg) for m in _HEARTBEAT_MARKERS)
+
+
 _fb_logger = logging.getLogger("firebase_messaging")
 _fb_logger.setLevel(logging.DEBUG)
+if not os.environ.get("FILAMENT_FCM_LOG_HEARTBEAT"):
+    # On the logger, not the handler, so it applies wherever these records go.
+    _fb_logger.addFilter(_DropHeartbeats())
 if not _fb_logger.handlers:
     _fb_logger.addHandler(logging.StreamHandler())
     _fb_logger.propagate = True
