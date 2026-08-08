@@ -59,8 +59,16 @@ Hermes ever ships one of them, drop it from `vendor/` and widen its range in
 `pyproject.toml`. The plugin warns at startup if it finds a *different* version
 outside `vendor/`, which is what that day would look like.
 
-To update:
+Updating is normally not something anyone does: the agent checks daily and,
+when a newer version is on main, pulls it and restarts itself into it, posting
+a note in the principal's backchannel before and after (`self_update.py`; set
+`FILAMENT_DISABLE_AUTO_UPDATE=true` to be reminded instead). By hand:
 
 ```
 hermes plugins update filament && hermes gateway restart
 ```
+
+Note that `hermes gateway restart` runs the restarted gateway in the foreground
+of the terminal you type it in — fine at a dev prompt, not something to hand a
+principal, which is why the self-update path goes through the gateway's own
+restart machinery instead.

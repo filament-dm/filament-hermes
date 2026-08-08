@@ -34,7 +34,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from ._version import PLUGIN_VERSION
+from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
     FCMConfig,
@@ -67,6 +67,17 @@ from .reactive import (
     is_agent_mention,
     is_system_sender,
     sender_is_agent_in_thread,
+)
+from .self_update import (
+    PendingUpgradeStore,
+    auto_update_disabled,
+    build_complete_notice,
+    build_failure_notice,
+    build_start_notice,
+    git_pull,
+    is_git_checkout,
+    request_gateway_restart,
+    version_on_disk,
 )
 from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
@@ -234,6 +245,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._heartbeat_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task | None = None
         self._update_checker = UpdateChecker(self._credentials)
+        self._pending_upgrade = PendingUpgradeStore(self._credentials)
         # The gateway's event loop, captured in connect(). FCM callbacks (which
         # fire from the firebase-messaging thread) are bridged onto it so all
         # handling — and the shared httpx client — stay on one loop.
@@ -503,6 +515,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 principal_id=self._owner_id,
                 backchannel_id=self._cc_room_id,
             )
+
+            # If an auto-update restarted us, this is the process that says
+            # so. Before the update check, so the completion message can't
+            # be overtaken by whatever the first check finds.
+            await self._announce_completed_upgrade()
 
             # Daily update check (first pass right away). Started after the
             # connect stages so a reminder has a live send path; never
@@ -1076,18 +1093,157 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def _update_check_loop(self, interval_seconds: int = 86400) -> None:
         """Once now and then daily: is a newer plugin version on main?
 
-        A newer version always logs a warning (UpdateChecker.check); the
-        backchannel reminder to the principal fires at most once per new
-        version, persisted across restarts (update_notice.json).
+        A newer version always logs a warning (UpdateChecker.check); what
+        happens next is either the unattended upgrade (the default, when the
+        plugin is a git checkout we can pull) or — when it isn't, or the
+        principal opted out — the once-per-version reminder to update by
+        hand, persisted across restarts (update_notice.json).
         """
         while True:
             try:
                 newer = await self._update_checker.check()
                 if newer:
-                    await self._notify_update_available(newer)
+                    if self._auto_update_possible():
+                        await self._auto_upgrade(newer)
+                    else:
+                        await self._notify_update_available(newer)
             except Exception:
                 logger.debug("filament-fcm: update check failed", exc_info=True)
             await asyncio.sleep(interval_seconds)
+
+    def _auto_update_possible(self) -> bool:
+        """Can we update ourselves, or must we ask the principal to?
+
+        A pip-installed package has no repo to pull, so there is nothing to
+        do unattended — that install gets the reminder instead.
+        """
+        if auto_update_disabled():
+            logger.info("filament-fcm: auto-update disabled by env")
+            return False
+        if not is_git_checkout():
+            logger.info(
+                "filament-fcm: plugin tree is not a git checkout — "
+                "reminding instead of auto-updating"
+            )
+            return False
+        return True
+
+    async def _auto_upgrade(self, latest: str) -> None:
+        """Pull the new version and restart the gateway into it.
+
+        The principal is told it is happening, not asked. Two messages
+        bracket the restart: this one, and the completion posted by the
+        process that comes back (see _announce_completed_upgrade) — the one
+        running here cannot report its own success, because succeeding means
+        it stops existing.
+
+        ``mark_notified`` is called up front, before anything can fail: it
+        is the loop guard. Whatever happens to this attempt, the daily check
+        will not start another one for the same version — a repeatedly
+        failing upgrade must not become a repeatedly restarting agent.
+        """
+        self._update_checker.mark_notified(latest)
+        logger.info("filament-fcm: auto-updating to v%s", latest)
+        await self._post_backchannel(build_start_notice(latest))
+
+        ok, output = await asyncio.to_thread(git_pull)
+        if not ok:
+            logger.error("filament-fcm: auto-update git pull failed: %s", output)
+            await self._post_backchannel(build_failure_notice(latest, output))
+            return
+        logger.info("filament-fcm: auto-update pulled: %s", output)
+
+        # What the tree holds now, not what GitHub advertised: a pull that
+        # left us where we were (already current, or a checkout tracking
+        # something other than main) means restarting would change nothing,
+        # so say so rather than bouncing the gateway for no reason.
+        pulled = version_on_disk()
+        if not pulled or not is_newer(pulled, PLUGIN_VERSION):
+            reason = (
+                f"the pull left the plugin on v{pulled or 'unknown'} "
+                f"(is this checkout tracking main?)"
+            )
+            logger.error("filament-fcm: auto-update no-op — %s", reason)
+            await self._post_backchannel(build_failure_notice(latest, reason))
+            return
+
+        # Written before the restart is requested: after it, there is no
+        # "we" left to write it. The room travels with the marker so the
+        # next process announces where this one announced.
+        self._pending_upgrade.save(pulled, self._cc_room_id)
+        if not request_gateway_restart():
+            self._pending_upgrade.clear()
+            reason = "the new code is installed but the gateway wouldn't restart"
+            await self._post_backchannel(build_failure_notice(latest, reason))
+            return
+        logger.info(
+            "filament-fcm: auto-update to v%s staged — gateway restarting", pulled
+        )
+
+    async def _announce_completed_upgrade(self) -> None:
+        """Post the result of an upgrade that restarted us. No-op otherwise.
+
+        Runs on connect, after the send path is live. The marker is cleared
+        whatever the outcome: it describes exactly one restart, and a marker
+        that survived its restart would re-announce on every start.
+        """
+        try:
+            pending = self._pending_upgrade.load()
+        except Exception:
+            # Announcing an upgrade is never worth failing a connect over.
+            logger.warning(
+                "filament-fcm: could not read the pending-upgrade marker",
+                exc_info=True,
+            )
+            return
+        if not pending:
+            return
+        target = pending.get("target_version")
+        room_id = pending.get("room_id") or self._cc_room_id
+        self._pending_upgrade.clear()
+        if not target:
+            return
+
+        if is_newer(target, PLUGIN_VERSION):
+            # Restarted, but into the old code — the tree was pulled, so this
+            # is a load problem (stale bytecode, a second copy winning on
+            # sys.path), not something a retry fixes.
+            logger.error(
+                "filament-fcm: upgrade to v%s did not take effect — still "
+                "running v%s",
+                target,
+                PLUGIN_VERSION,
+            )
+            await self._post_backchannel(
+                build_failure_notice(
+                    target, f"after restarting, this agent still runs v{PLUGIN_VERSION}"
+                ),
+                room_id=room_id,
+            )
+            return
+
+        logger.info("filament-fcm: upgrade to v%s complete", PLUGIN_VERSION)
+        await self._post_backchannel(
+            build_complete_notice(PLUGIN_VERSION), room_id=room_id
+        )
+
+    async def _post_backchannel(self, text: str, room_id: str | None = None) -> None:
+        """Best-effort post to the principal's backchannel.
+
+        Update progress is a courtesy, never a reason to fail an update or a
+        connect: no backchannel (or a failing post) only costs the message.
+        """
+        target = room_id or self._cc_room_id
+        if not target:
+            return
+        try:
+            result = await self._filament_api.post_message(target, text)
+            if isinstance(result, dict) and result.get("error"):
+                logger.warning(
+                    "filament-fcm: backchannel post failed: %s", result.get("error")
+                )
+        except Exception:
+            logger.warning("filament-fcm: backchannel post failed", exc_info=True)
 
     async def _notify_update_available(self, latest: str) -> None:
         """Post the small update reminder to the principal's backchannel.

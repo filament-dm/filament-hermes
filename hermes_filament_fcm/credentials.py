@@ -80,6 +80,31 @@ class CredentialStore:
         """Persist the update-reminder state."""
         self._write_json("update_notice.json", data)
 
+    def load_pending_upgrade(self) -> dict[str, Any] | None:
+        """Load the in-flight self-update marker — see self_update.py."""
+        return self._read_json("pending_upgrade.json")
+
+    def save_pending_upgrade(self, data: dict[str, Any]) -> None:
+        """Persist the in-flight self-update marker.
+
+        Written before the gateway restarts and read by the process that
+        comes back, which is the only way the "upgrade complete" message can
+        be sent by a process that knows the upgrade happened.
+        """
+        self._write_json("pending_upgrade.json", data)
+
+    def clear_pending_upgrade(self) -> None:
+        """Drop the marker once the upgrade result has been announced.
+
+        Missing file is success: the marker must never outlive the one
+        restart it describes, or the agent re-announces on every start.
+        """
+        path = self._dir / "pending_upgrade.json"
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to remove %s", path, exc_info=True)
+
     def load_or_create_installation_id(self) -> str:
         """Return a stable, report-safe id for this Hermes plugin install."""
         data = self._read_json("installation.json")
