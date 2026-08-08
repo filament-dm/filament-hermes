@@ -46,16 +46,23 @@ def update_check_disabled() -> bool:
 
 
 def build_reminder(latest: str, current: str) -> str:
-    """The small backchannel note shown to the principal."""
+    """The small backchannel note shown to the principal.
+
+    Deliberately does *not* hand the principal a `hermes gateway restart`
+    command: on some hosts that restarts the gateway in the foreground of
+    whatever terminal it is typed into, which is not what the instruction
+    reads like it will do. The two routes offered instead are asking the
+    agent to update itself, and the reconnect one-liner from the Filament
+    app — the same command that installed the plugin in the first place, so
+    it recovers from any state.
+    """
     return (
-        f"📦 A new version of the Filament↔Hermes plugin is available: "
-        f"v{latest} (this agent runs v{current}). To update, run on the "
-        f"machine hosting this agent:\n"
-        f"```\nhermes plugins update filament && hermes gateway restart\n```\n"
-        f"That pulls the plugin's vendored dependencies along with its code, so "
-        f"it is the whole update. If it reports any problem, re-run the connect "
-        f"command from the Filament app instead — it replaces the plugin outright "
-        f"rather than updating it in place, so it recovers from any state."
+        f"📦 A new version of the Filament plugin is available: "
+        f"v{latest} (this agent runs v{current}). To update, reply with "
+        f'"Update the filament plugin". If that doesn\'t work, copy the '
+        f'reconnect command (from "View Profile" sidebar → Connected … → '
+        f"reconnect) and paste that into your Hermes terminal, like you did "
+        f"during setup."
     )
 
 

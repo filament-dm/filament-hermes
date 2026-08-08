@@ -217,9 +217,13 @@ def test_fetch_latest_version_default_url(monkeypatch):
 def test_build_reminder_mentions_versions():
     note = update_check.build_reminder("0.2.0", "0.1.0")
     assert "0.2.0" in note and "0.1.0" in note
-    # The plugin is a directory plugin now, so the update instruction is the
-    # `hermes plugins update` command (not a pip/repo URL).
-    assert "hermes plugins update" in note
+    # Two routes, both usable from the app: ask the agent to update itself,
+    # or re-run the reconnect one-liner from the profile sidebar.
+    assert "Update the filament plugin" in note
+    assert "reconnect" in note
+    # No `hermes gateway restart` — on some hosts that runs the gateway in the
+    # foreground of the terminal it is pasted into, so the instruction lies.
+    assert "gateway restart" not in note
 
 
 # ── filament_api: client survives a disconnect/reconnect cycle ───────
