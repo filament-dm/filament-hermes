@@ -14,6 +14,7 @@ that are easy to break without noticing:
 Loaded standalone (no Hermes, no firebase) like the other tests here.
 """
 
+import importlib.machinery
 import importlib.util
 import re
 import sys
@@ -35,6 +36,9 @@ _VENDOR = _ROOT / "vendor"
 # nothing else supplies it.
 VENDORED = ("firebase-messaging", "http-ece", "structlog")
 NOT_VENDORED = ("httpx", "aiohttp", "cryptography", "protobuf")
+
+# The same three as importable names, for the tests that resolve them.
+VENDORED_MODULES = ("firebase_messaging", "http_ece", "structlog")
 
 
 def _load_root_init(package: str | None, seed_vendor: bool = False):
@@ -101,15 +105,31 @@ def test_root_init_puts_vendor_on_sys_path():
     assert callable(module.register)
 
 
-def test_vendor_is_appended_not_prepended():
-    """An ambient install must win over the vendored copy, package by package.
+def test_vendor_is_prepended_not_appended():
+    """The vendored copy must win over anything already installed.
 
-    Prepending would silently override a dependency the user installed
-    deliberately, and make deps.py report a version that isn't the one a
-    plain ``import`` in the same process would get.
+    These packages are ours alone — Hermes declares none of them — so there is
+    nobody to shadow, and a stale copy in site-packages is a failure we have
+    already hit: an agent that connects, reports healthy, and never wakes.
+    Appending is what let that copy win.
     """
     _, path_after = _load_root_init(package="filament_fcm_undertest2")
-    assert path_after.index(str(_VENDOR)) == len(path_after) - 1
+    assert path_after.index(str(_VENDOR)) == 0
+
+
+def test_a_stale_installed_copy_loses_to_vendor():
+    """The behaviour the ordering exists for, on a real resolution.
+
+    The second entry stands in for site-packages holding an older build: with
+    vendor/ first, the import resolves inside vendor/ and not from there.
+    """
+    stale = _ROOT / "tests"  # any real directory that is not vendor/
+    for name in VENDORED_MODULES:
+        found = importlib.machinery.PathFinder.find_spec(
+            name, path=[str(_VENDOR), str(stale)]
+        )
+        assert found is not None and found.origin, f"{name} not found in vendor/"
+        assert str(_VENDOR) in found.origin, f"{name} did not resolve from vendor/"
 
 
 def test_root_init_is_idempotent():

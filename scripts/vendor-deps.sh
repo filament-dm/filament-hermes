@@ -1,5 +1,5 @@
 #!/bin/sh
-# Rebuild vendor/ from PyPI.
+# Rebuild vendor/ from our firebase-messaging fork and PyPI.
 #
 # vendor/ carries the plugin's runtime dependencies inside the plugin
 # directory, so `hermes plugins install <repo> --enable` is the whole
@@ -22,9 +22,23 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 VENDOR_DIR="$ROOT/vendor"
 
+# firebase-messaging comes from our fork, not PyPI. Upstream sliced the
+# Crypto-Key and Encryption headers by label length instead of parsing them,
+# which fed the trailing parameters to the base64 decoder. That was harmless
+# until CPython gh-145264 stopped the decoder discarding data after the first
+# padded quad; from 3.13.x/3.14.4 on it raises "Incorrect padding", and because
+# the client treats any error from a payload as fatal, one bad push killed the
+# whole receiver and no notification arrived again.
+#
+# Carry fixes on filament/integration and upstream them from there. The branch
+# is the source of truth; the pin below is the commit vendored into this tree,
+# so bump it when the branch moves.
+FIREBASE_MESSAGING_REPO=https://github.com/filament-dm/firebase-messaging.git
+FIREBASE_MESSAGING_BRANCH=filament/integration
+FIREBASE_MESSAGING_COMMIT=81a7249a9510569e74f9e210a8b7d4873485cfac
+
 # Keep in sync with [project.dependencies] in pyproject.toml. Exact pins here
 # (the constraints there are ranges) so the committed tree is reproducible.
-FIREBASE_MESSAGING_VERSION=0.4.5
 HTTP_ECE_VERSION=1.1.0   # firebase-messaging pins http-ece~=1.1.0
 STRUCTLOG_VERSION=25.5.0
 
@@ -42,9 +56,18 @@ mkdir -p "$VENDOR_DIR"
 
 # shellcheck disable=SC2086
 $INSTALL "$VENDOR_DIR" --no-deps \
-    "firebase-messaging==${FIREBASE_MESSAGING_VERSION}" \
+    "firebase-messaging @ git+${FIREBASE_MESSAGING_REPO}@${FIREBASE_MESSAGING_COMMIT}" \
     "http-ece==${HTTP_ECE_VERSION}" \
     "structlog==${STRUCTLOG_VERSION}"
+
+# The fork keeps upstream's version number, so the tree cannot be told apart
+# from a PyPI build by version alone. Record what was vendored, because "which
+# fork commit is in here" is the first question when a push stops arriving.
+cat > "$VENDOR_DIR/FIREBASE_MESSAGING_SOURCE" <<EOF
+repo   ${FIREBASE_MESSAGING_REPO}
+branch ${FIREBASE_MESSAGING_BRANCH}
+commit ${FIREBASE_MESSAGING_COMMIT}
+EOF
 
 # A compiled artifact here means --no-deps was bypassed or a dependency
 # stopped being pure Python; the tree would silently stop being portable.

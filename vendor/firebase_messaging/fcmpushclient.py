@@ -45,6 +45,35 @@ _logger = logging.getLogger(__name__)
 OnNotificationCallable = Callable[[dict[str, Any], str, Any], None]
 CredentialsUpdatedCallable = Callable[[dict[str, Any]], None]
 
+
+def _urlsafe_b64decode_padded(data: str) -> bytes:
+    """Decode urlsafe base64, restoring any missing "=" padding."""
+    return urlsafe_b64decode(data.encode("ascii") + b"=" * (-len(data) % 4))
+
+
+def _header_param(header_value: str, name: str) -> str:
+    """Return the named parameter from an ``Encryption``/``Crypto-Key`` header.
+
+    Both fields use the #list syntax of draft-ietf-httpbis-encryption-encoding-03
+    sections 3 and 4, a comma separated list of entries holding semicolon
+    separated parameters whose values may be tokens or quoted strings::
+
+        Encryption = #encryption_params
+        encryption_params = [ parameter *( OWS ";" OWS parameter ) ]
+
+    Raises ``ValueError`` if the parameter is absent.
+    """
+    for entry in header_value.split(","):
+        for param in entry.split(";"):
+            key, sep, value = param.partition("=")
+            if sep and key.strip().lower() == name:
+                value = value.strip()
+                if len(value) > 1 and value[0] == '"' and value[-1] == '"':
+                    value = value[1:-1]
+                return value
+    raise ValueError(f"No {name!r} parameter in header value {header_value!r}")
+
+
 # MCS Message Types and Tags
 MCS_MESSAGE_TAG = {
     HeartbeatPing: 0,
@@ -108,6 +137,9 @@ class FcmPushClientConfig:  # pylint:disable=too-many-instance-attributes
 
     reset_interval: float = 3
     """Time in seconds to wait between resets after errors or disconnection."""
+
+    max_wait_in_listen_for_reset: int = 200
+    """Time in seconds to wait in _listen() for a _reset() to succeed."""
 
     heartbeat_ack_timeout: float = 5
     """Time in seconds to wait for a heartbeat ack before resetting."""
@@ -375,12 +407,10 @@ class FcmPushClient:  # pylint:disable=too-many-instance-attributes
         salt_str: str,
         raw_data: bytes,
     ) -> bytes:
-        crypto_key = urlsafe_b64decode(crypto_key_str.encode("ascii"))
-        salt = urlsafe_b64decode(salt_str.encode("ascii"))
-        der_data_str = credentials["keys"]["private"]
-        der_data = urlsafe_b64decode(der_data_str.encode("ascii") + b"========")
-        secret_str = credentials["keys"]["secret"]
-        secret = urlsafe_b64decode(secret_str.encode("ascii") + b"========")
+        crypto_key = _urlsafe_b64decode_padded(crypto_key_str)
+        salt = _urlsafe_b64decode_padded(salt_str)
+        der_data = _urlsafe_b64decode_padded(credentials["keys"]["private"])
+        secret = _urlsafe_b64decode_padded(credentials["keys"]["secret"])
         privkey = load_der_private_key(
             der_data, password=None, backend=default_backend()
         )
@@ -422,8 +452,6 @@ class FcmPushClient:  # pylint:disable=too-many-instance-attributes
         ):
             # The deleted_messages message does not contain data.
             return
-        crypto_key = self._app_data_by_key(msg, "crypto-key")[3:]  # strip dh=
-        salt = self._app_data_by_key(msg, "encryption")[5:]  # strip salt=
         subtype = self._app_data_by_key(msg, "subtype")
         if TYPE_CHECKING:
             assert self.credentials
@@ -436,9 +464,21 @@ class FcmPushClient:  # pylint:disable=too-many-instance-attributes
             )
         if not self.credentials:
             return
-        decrypted = self._decrypt_raw_data(
-            self.credentials, crypto_key, salt, msg.raw_data
-        )
+        try:
+            crypto_key = _header_param(self._app_data_by_key(msg, "crypto-key"), "dh")
+            salt = _header_param(self._app_data_by_key(msg, "encryption"), "salt")
+            decrypted = self._decrypt_raw_data(
+                self.credentials, crypto_key, salt, msg.raw_data
+            )
+        except ValueError as ex:
+            # A missing parameter, binascii.Error from a malformed base64
+            # value and an http_ece decryption failure are all ValueError.
+            # Skip the single message rather than letting it propagate up to
+            # _listen() and tear down the whole client.
+            self._log_warn_with_limit(
+                "Failed to decrypt data for message %s: %s", msg.persistent_id, ex
+            )
+            return
         decrypted_json = None
         with contextlib_suppress(json.JSONDecodeError, ValueError):
             decrypted_json = json.loads(decrypted.decode("utf-8"))
@@ -682,8 +722,43 @@ class FcmPushClient:  # pylint:disable=too-many-instance-attributes
 
             while self.do_listen:
                 try:
-                    if self.run_state == FcmPushClientRunState.RESETTING:
-                        await asyncio.sleep(1)
+                    if self.run_state in (
+                        FcmPushClientRunState.RESETTING,
+                        FcmPushClientRunState.STARTING_CONNECTION,
+                    ):
+                        counter = 0
+                        while counter < self.config.max_wait_in_listen_for_reset and (
+                            self.run_state == FcmPushClientRunState.RESETTING
+                            or self.run_state
+                            == FcmPushClientRunState.STARTING_CONNECTION
+                        ):
+                            if (counter > 0) and (counter % 10 == 0):
+                                _logger.debug(
+                                    "Listen is waiting for reset to succeed. "
+                                    "Already slept for %ss, and run state "
+                                    "is still %s.",
+                                    counter,
+                                    self.run_state,
+                                )
+                            counter += 1
+                            await asyncio.sleep(1)
+                        if self.run_state in (
+                            FcmPushClientRunState.RESETTING,
+                            FcmPushClientRunState.STARTING_CONNECTION,
+                        ):
+                            _logger.warning(
+                                "Listen gave up waiting for reset to succeed "
+                                "after %ss: run state is still %s.",
+                                counter,
+                                self.run_state,
+                            )
+                        else:
+                            _logger.debug(
+                                "Listen waited %ss for reset to succeed: "
+                                "run state is now %s.",
+                                counter,
+                                self.run_state,
+                            )
                     elif msg := await self._receive_msg():
                         await self._handle_message(msg)
 

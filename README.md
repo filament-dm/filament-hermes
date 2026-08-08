@@ -45,6 +45,20 @@ Nothing else to install. The plugin's Python dependencies ship inside it (see
 install` clones a directory and never runs pip — and on the Docker and cloud
 images the venv the gateway imports from is not writable by the gateway anyway.
 
+`firebase-messaging` comes from our fork,
+[filament-dm/firebase-messaging](https://github.com/filament-dm/firebase-messaging),
+branch `filament/integration`, rather than from PyPI. Fixes we need land there
+first and are upstreamed from there.
+
+`vendor/` goes on the front of `sys.path`, so what it carries wins over anything
+already installed. Nothing else in a Hermes process imports these packages, and a
+stale copy left in site-packages by an older install used to shadow the fork
+silently — an agent that connects, looks healthy and never wakes. What decides
+whether a package is vendored is whether it is in that tree, not path order: if
+Hermes ever ships one of them, drop it from `vendor/` and widen its range in
+`pyproject.toml`. The plugin warns at startup if it finds a *different* version
+outside `vendor/`, which is what that day would look like.
+
 To update:
 
 ```

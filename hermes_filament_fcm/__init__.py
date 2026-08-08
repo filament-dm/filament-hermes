@@ -31,7 +31,12 @@ from typing import Any
 
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
 from .cli import register_cli
-from .deps import dep_problem, optional_dep_warnings
+from .deps import (
+    dep_problem,
+    fork_warning,
+    optional_dep_warnings,
+    vendor_shadow_warnings,
+)
 from .filament_api import FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .observability import bound_context
@@ -165,6 +170,16 @@ def check_requirements() -> bool:
     if problem:
         logger.warning("filament-fcm: dependency check failed — %s", problem)
         return False
+    # A stock firebase-messaging shadowing our fork starts cleanly and then
+    # never delivers a push, so say so loudly at the one moment someone is
+    # reading the log.
+    if fork := fork_warning():
+        logger.warning("filament-fcm: %s", fork)
+    # vendor/ is prepended, so ours wins. Say so when something else supplies
+    # the same package — that is the signal to stop vendoring it, and nothing
+    # about the path order would ever raise it on its own.
+    for shadowed in vendor_shadow_warnings():
+        logger.warning("filament-fcm: %s", shadowed)
     # Soft deps (e.g. structlog): the plugin still runs, just degraded, so nudge
     # rather than refuse to start.
     for warning in optional_dep_warnings():
