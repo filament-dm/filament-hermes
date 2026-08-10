@@ -169,6 +169,121 @@ def test_scaffolded_default_true_is_not_a_pin():
         assert a._shared_sessions_effective() is True
 
 
+def test_partially_constructed_adapter_is_a_noop():
+    # Instances built via __new__ without __init__ (other test files do
+    # this) must never mutate config.
+    a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)
+    a._apply_session_keying()  # must not raise
+
+
+def test_flag_residue_is_not_an_operator_pin():
+    # The privacy regression the review caught: the flag writes into
+    # config.extra, and a later adapter construction over the same config
+    # object must NOT read that residue as an operator pin (which would
+    # freeze shared sessions ON after the principal turned them off).
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a = _make(tmp, extra={}, pinned_by_operator=False)
+        _enable(tmp, True)
+        a._apply_session_keying()
+        assert a.config.extra["group_sessions_per_user"] is False
+        # The platform rebuilds the adapter over the same config object.
+        extra = a.config.extra
+        pinned = (
+            "group_sessions_per_user" in extra
+            and adapter._SESSION_KEYING_MANAGED_KEY not in extra
+        )
+        assert pinned is False  # managed residue, not an operator pin
+        b = _make(tmp, extra=extra, pinned_by_operator=pinned)
+        _enable(tmp, False)
+        b._apply_session_keying()
+        assert "group_sessions_per_user" not in b.config.extra
+
+
+def test_operator_pin_without_marker_still_pins():
+    extra = {"group_sessions_per_user": False}
+    pinned = (
+        extra.get("group_sessions_per_user") is False
+        and adapter._SESSION_KEYING_MANAGED_KEY not in extra
+    )
+    assert pinned is True
+
+
+def test_breadcrumb_consults_cursor_only_under_shared_sessions():
+    # A channel-wide cursor only means "this conversation has seen it"
+    # when the channel has one conversation. With per-sender keying (flag
+    # off), one sender's fetch must not silence another sender's cue.
+    import asyncio
+    import json as _json
+
+    class _API:
+        @staticmethod
+        def parse_tool_result(raw):
+            return raw
+
+        async def call_tool(self, name, arguments):
+            return {
+                "messages": [
+                    {"event_id": "$a", "sender": "@x:s", "is_from_self": False},
+                    {"event_id": "$b", "sender": "@y:s", "is_from_self": False},
+                ]
+            }
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)
+        a._filament_api = _API()
+        a._feature_flags = reactive.FeatureFlagStore(tmp / "flags.json")
+        a._channel_cursors = reactive.ChannelCursorStore(tmp / "cursors.json")
+        a._channel_cursors.record("!room:s", "$b")  # fully caught up
+
+        # Flag OFF: the cursor is ignored — windowed count, cue fires.
+        crumb = asyncio.run(a._context_breadcrumb("!room:s", "$t"))
+        assert crumb is not None and "recent message(s)" in crumb
+
+        # Flag ON: the cursor applies — caught up, cue quiet.
+        (tmp / "flags.json").write_text(
+            _json.dumps({"shared_channel_sessions": True})
+        )
+        assert asyncio.run(a._context_breadcrumb("!room:s", "$t")) is None
+
+
+
+def test_cursor_recording_scoped_to_shared_session_turns():
+    # A cursor asserts "the CHANNEL's conversation has read up to here";
+    # only a data turn that IS the channel's shared session may record one.
+    # Under per-sender keying nothing may record — else a cursor laid down
+    # before a keying flip marks the brand-new shared session as caught up
+    # on messages it never saw (and outside any turn: fail-safe None).
+    assert reactive.current_cursor_channel.get() is None
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a = _make(tmp, extra={}, pinned_by_operator=False)
+        _enable(tmp, True)
+        assert a._cursor_channel_for_turn("!room:s") == "!room:s"
+        # A thread turn joins the thread's conversation, not the
+        # channel's (conversation_key) — it never records, even with
+        # shared keying on.
+        assert a._cursor_channel_for_turn("!room:s", "$thread") is None
+        _enable(tmp, False)
+        assert a._cursor_channel_for_turn("!room:s") is None
+        # An operator pin (explicit False = shared) records with the flag
+        # off; the scaffolded True follows the flag like any unpinned
+        # config.
+        pinned_shared = _make(
+            tmp,
+            extra={"group_sessions_per_user": False},
+            pinned_by_operator=True,
+        )
+        assert pinned_shared._cursor_channel_for_turn("!r:s") == "!r:s"
+        scaffolded = _make(
+            tmp,
+            extra={"group_sessions_per_user": True},
+            pinned_by_operator=False,
+        )
+        assert scaffolded._cursor_channel_for_turn("!r:s") is None
+
+
 def test_effective_keying_pin_means_shared_scaffold_follows_flag():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -194,43 +309,3 @@ def test_effective_keying_pin_means_shared_scaffold_follows_flag():
         assert c._shared_sessions_effective() is True
         _enable(tmp, False)
         assert c._shared_sessions_effective() is False
-
-
-def test_partially_constructed_adapter_is_a_noop():
-    # Instances built via __new__ without __init__ (other test files do
-    # this) must never mutate config.
-    a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)
-    a._apply_session_keying()  # must not raise
-
-
-def test_flag_residue_is_not_an_operator_pin():
-    # The privacy regression the review caught: the flag writes into
-    # config.extra, and a later adapter construction over the same config
-    # object must NOT read that residue as an operator pin (which would
-    # freeze shared sessions ON after the principal turned them off).
-    with tempfile.TemporaryDirectory() as d:
-        tmp = Path(d)
-        a = _make(tmp, extra={}, pinned_by_operator=False)
-        _enable(tmp, True)
-        a._apply_session_keying()
-        assert a.config.extra["group_sessions_per_user"] is False
-        # The platform rebuilds the adapter over the same config object.
-        extra = a.config.extra
-        pinned = (
-            extra.get("group_sessions_per_user") is False
-            and adapter._SESSION_KEYING_MANAGED_KEY not in extra
-        )
-        assert pinned is False  # managed residue, not an operator pin
-        b = _make(tmp, extra=extra, pinned_by_operator=pinned)
-        _enable(tmp, False)
-        b._apply_session_keying()
-        assert "group_sessions_per_user" not in b.config.extra
-
-
-def test_operator_pin_without_marker_still_pins():
-    extra = {"group_sessions_per_user": False}
-    pinned = (
-        extra.get("group_sessions_per_user") is False
-        and adapter._SESSION_KEYING_MANAGED_KEY not in extra
-    )
-    assert pinned is True

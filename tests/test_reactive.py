@@ -990,3 +990,139 @@ def test_expand_bundle_diamond_expands_once_cycle_still_nothing():
     assert store.expand_bundle("top", policy) == frozenset({"l", "r", "deep"})
     # A self-cycle still grants only its non-cyclic members.
     assert store.expand_bundle("loop", policy) == frozenset({"x"})
+
+
+def test_breadcrumb_delta_counts_only_after_cursor():
+    # The read cursor marks $b as already fetched: only $c and $d count,
+    # and the wording says so ("since your last read", exact — not "recent").
+    msgs = [_msg("$a"), _msg("$b"), _msg("$c"), _msg("$d")]
+    out = reactive.context_breadcrumb(
+        msgs, trigger_event_id="$t", last_seen_event_id="$b"
+    )
+    assert "2 message(s) in this channel since your last read" in out
+    assert "get_recent_messages" in out
+
+
+def test_breadcrumb_delta_none_when_caught_up():
+    # Cursor at the newest message → nothing unread → NO cue, no fetch
+    # order. This is the collapse of the fetch-every-wake loop.
+    msgs = [_msg("$a"), _msg("$b")]
+    assert (
+        reactive.context_breadcrumb(
+            msgs, trigger_event_id="$t", last_seen_event_id="$b"
+        )
+        is None
+    )
+
+
+def test_breadcrumb_delta_trigger_after_cursor_still_excluded():
+    msgs = [_msg("$a"), _msg("$t")]
+    assert (
+        reactive.context_breadcrumb(
+            msgs, trigger_event_id="$t", last_seen_event_id="$a"
+        )
+        is None
+    )
+
+
+def test_breadcrumb_cursor_out_of_window_falls_back_to_full_count():
+    # A cursor that rolled out of the window means at least a windowful is
+    # unread — count the whole window with the windowed ("recent") wording.
+    msgs = [_msg("$a"), _msg("$b")]
+    out = reactive.context_breadcrumb(
+        msgs, trigger_event_id="$t", last_seen_event_id="$gone"
+    )
+    assert "2 recent message(s)" in out
+
+
+# ── ChannelCursorStore ───────────────────────────────────────────────
+
+
+def test_channel_cursor_roundtrip_and_missing():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        assert store.get("!room:s") is None
+        store.record("!room:s", "$e1")
+        assert store.get("!room:s") == "$e1"
+        store.record("!room:s", "$e2")  # advances
+        assert store.get("!room:s") == "$e2"
+
+
+def test_channel_cursor_ignores_empty_values():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store.record("", "$e1")
+        store.record("!room:s", "")
+        assert store.read() == {}
+
+
+def test_channel_cursor_stale_write_skipped():
+    # Overlapping fetches completing out of order: the older result must
+    # not rewind a newer cursor (both carry timestamps — provably stale).
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store.record("!room:s", "$newer", ts=2000)
+        store.record("!room:s", "$older", ts=1000)
+        assert store.get("!room:s") == "$newer"
+        # Equal or newer timestamps advance normally.
+        store.record("!room:s", "$same", ts=2000)
+        assert store.get("!room:s") == "$same"
+        store.record("!room:s", "$next", ts=3000)
+        assert store.get("!room:s") == "$next"
+
+
+def test_channel_cursor_unknown_ts_stays_fail_open():
+    # Without both timestamps ordering is unknowable: the write proceeds
+    # (a rewind re-fires the cue once; a wrong skip could pin forever).
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store.record("!room:s", "$a", ts=2000)
+        store.record("!room:s", "$b")  # incoming ts unknown — allowed
+        assert store.get("!room:s") == "$b"
+        store.record("!room:s", "$c", ts=1000)  # stored ts unknown — allowed
+        assert store.get("!room:s") == "$c"
+
+
+def test_channel_cursor_survives_non_finite_ts():
+    # json.loads admits NaN/Infinity; int() raises on both. A poisoned
+    # file must read as ts-unknown (best-effort state), never crash the
+    # per-wake get() in the breadcrumb path.
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "cursors.json"
+        path.write_text(
+            '{"!room:s": {"event_id": "$e", "ts": NaN},'
+            ' "!inf:s": {"event_id": "$i", "ts": Infinity}}',
+            encoding="utf-8",
+        )
+        store = reactive.ChannelCursorStore(path)
+        assert store.get("!room:s") == "$e"
+        assert store.get("!inf:s") == "$i"
+        # ts unknown → ordering unknowable → the write proceeds.
+        store.record("!room:s", "$new", ts=1000)
+        assert store.get("!room:s") == "$new"
+
+
+def test_channel_cursor_reads_bare_string_values():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "cursors.json"
+        path.write_text('{"!room:s": "$bare"}', encoding="utf-8")
+        store = reactive.ChannelCursorStore(path)
+        assert store.get("!room:s") == "$bare"
+        store.record("!room:s", "$new", ts=1000)  # rewrites to the dict form
+        assert store.get("!room:s") == "$new"
+        assert store.read()["!room:s"] == {"event_id": "$new", "ts": 1000}
+
+
+def test_channel_cursor_bounded_drops_oldest():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store._MAX_CHANNELS = 3
+        for i in range(4):
+            store.record(f"!r{i}:s", f"$e{i}")
+        cursors = store.read()
+        assert len(cursors) == 3
+        assert "!r0:s" not in cursors  # oldest dropped
+        # Re-recording refreshes a channel's position.
+        store.record("!r1:s", "$e1b")
+        store.record("!r9:s", "$e9")
+        assert store.get("!r1:s") == "$e1b"

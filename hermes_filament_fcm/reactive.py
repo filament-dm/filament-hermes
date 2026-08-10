@@ -79,6 +79,18 @@ current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
     contextvars.ContextVar("filament_capabilities", default=None)
 )
 
+# Per-turn read-cursor authority: the room id whose shared channel-session
+# THIS turn is (a data turn in that channel under effective shared-session
+# keying), or None. A recorded cursor asserts "the channel's conversation
+# has read up to here", and only the channel's own shared session can
+# truthfully assert that — not a backchannel turn, not a per-sender
+# session, not a fetch into another channel. The tool proxy therefore
+# records a cursor only for this room. Default None = record nothing
+# (fail-safe: an unrecorded cursor just re-fires the context cue).
+current_cursor_channel: contextvars.ContextVar["str | None"] = (
+    contextvars.ContextVar("filament_cursor_channel", default=None)
+)
+
 
 def conversation_key(
     channel: str, thread_id: "str | None"
@@ -249,9 +261,17 @@ def context_breadcrumb(
     messages: list[dict],
     *,
     trigger_event_id: str | None,
+    last_seen_event_id: str | None = None,
 ) -> str | None:
     """Build a counted "you may be missing context" cue, or None if there's
     nothing worth flagging.
+
+    ``last_seen_event_id`` is the read cursor: the newest message the
+    agent has actually fetched through ``get_recent_messages``. When it
+    is present in the window, only messages AFTER it count: an exact
+    delta, so the cue goes quiet (None) once the agent is caught up. A
+    cursor that has fallen out of the window means at least a windowful is
+    unread; the count falls back to the whole window.
 
     A push-model agent is handed only the single triggering event, so a turn
     dispatched into a fresh session — a cold start, or a shared-channel turn
@@ -269,10 +289,19 @@ def context_breadcrumb(
     an upper bound — some of these may already be in the session — so it is
     phrased "up to N"; an over-count costs at most one redundant read.
 
-    `messages` is the get_recent_messages payload (a list of message dicts).
+    `messages` is the get_recent_messages payload (a list of message dicts),
+    oldest first.
     """
+    window = messages
+    seen_cursor = False
+    if last_seen_event_id:
+        for i, m in enumerate(messages):
+            if m.get("event_id") == last_seen_event_id:
+                window = messages[i + 1 :]
+                seen_cursor = True
+                break
     n = 0
-    for m in messages:
+    for m in window:
         # Count real messages only — skip reactions, membership, other state.
         if m.get("type") not in (None, "m.room.message"):
             continue
@@ -293,13 +322,118 @@ def context_breadcrumb(
     # that" from an empty memory. So the cue orders the fetch outright whenever
     # unseen messages exist, and forbids the "I lack the info" reply until the
     # agent has actually read them.
+    if seen_cursor:
+        # Exact delta: everything before the cursor was actually fetched.
+        lead = (
+            f"{n} message(s) in this channel since your last read are NOT "
+            "in this conversation"
+        )
+        what = "read them"
+    else:
+        lead = (
+            f"{n} recent message(s) in this channel are NOT in this "
+            "conversation — you have not seen them"
+        )
+        what = "read the recent channel history"
     return (
-        f"[CONTEXT: {n} recent message(s) in this channel are NOT in this "
-        "conversation — you have not seen them. Before you reply, call "
-        "get_recent_messages to read the recent channel history. Do NOT answer "
-        "from memory, and do NOT say you lack the information, until you have "
-        "read those messages — the answer may be in them.]"
+        f"[CONTEXT: {lead}. Before you reply, call get_recent_messages "
+        f"(limit {BREADCRUMB_LIMIT} or more) to {what}. Do NOT answer "
+        "from memory, and do NOT say you lack the information, until you "
+        "have read those messages — the answer may be in them.]"
     )
+
+
+class ChannelCursorStore:
+    """The per-channel read cursor: the newest message event id the agent
+    has provably fetched with ``get_recent_messages``.
+
+    The tool proxy advances it only for fetches that cover the context
+    cue's own window (un-paged, un-narrowed, keyed by room id): the one
+    place that KNOWS the agent read, never faith that a wake implies a
+    read. The context breadcrumb consumes it to count the exact unread
+    delta and go quiet at zero, and only while ``shared_channel_sessions``
+    is on: a channel-wide cursor is only a sound "this conversation has
+    seen it" fact when the channel has exactly one conversation.
+
+    Declarative JSON on disk, read fresh per event::
+
+        {"!room:host": {"event_id": "$newest_read", "ts": 1723334400000}, …}
+
+    (A bare-string value reads as an event id with no timestamp.)
+
+    Best-effort state, not policy: a missing or unreadable file just means
+    the breadcrumb falls back to its windowed count. Bounded: oldest
+    entries are dropped past ``_MAX_CHANNELS`` (dict insertion order — a
+    re-recorded channel moves to the back).
+
+    Overlapping reads can complete out of order (two ``get_recent_messages``
+    calls in one turn, the older network round-trip landing last), so
+    ``record`` refuses a PROVABLY stale advance: when both the stored and
+    incoming cursors carry a timestamp and the incoming one is strictly
+    older, the write is skipped — otherwise a slow older fetch would rewind
+    the cursor past messages the agent has already seen and re-fire the cue
+    it exists to quiet. Without both timestamps ordering is unknowable and
+    the write proceeds: an over-eager skip could pin a wrong cursor
+    forever, while a rewind re-fires the cue once.
+    """
+
+    _MAX_CHANNELS = 500
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(path) if path else _default_dir() / "channel_cursors.json"
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def read(self) -> dict:
+        try:
+            loaded = json.loads(self._path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning(
+                "filament-fcm: failed to read channel cursors", exc_info=True
+            )
+        return {}
+
+    @staticmethod
+    def _entry_parts(value: object) -> "tuple[str | None, int | None]":
+        """(event_id, ts) from a stored value, bare string or dict. A ts
+        that won't convert (json.loads admits NaN/Infinity, int() raises
+        on both) reads as None, ordering unknowable, never a crash: this
+        is best-effort state, and ``get()`` runs on every wake."""
+        if isinstance(value, dict):
+            event_id = value.get("event_id")
+            ts = value.get("ts")
+            try:
+                ts = int(ts) if isinstance(ts, (int, float)) else None
+            except (ValueError, OverflowError):
+                ts = None
+            return (str(event_id) if event_id else None), ts
+        return (str(value) if value else None), None
+
+    def get(self, room_id: str) -> str | None:
+        event_id, _ = self._entry_parts(self.read().get(str(room_id)))
+        return event_id
+
+    def record(
+        self, room_id: str, event_id: str, ts: "int | None" = None
+    ) -> None:
+        if not room_id or not event_id:
+            return
+        cursors = self.read()
+        _, stored_ts = self._entry_parts(cursors.get(str(room_id)))
+        if stored_ts is not None and ts is not None and ts < stored_ts:
+            return  # provably stale — an older overlapping fetch lost the race
+        # Re-insert so the freshest channel sits last (LRU-ish bound).
+        cursors.pop(str(room_id), None)
+        cursors[str(room_id)] = {"event_id": str(event_id), "ts": ts}
+        while len(cursors) > self._MAX_CHANNELS:
+            cursors.pop(next(iter(cursors)))
+        _atomic_write_text(self._path, json.dumps(cursors, indent=2))
 
 
 def is_system_sender(sender: str | None, self_user_id: str | None) -> bool:

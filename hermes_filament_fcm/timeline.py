@@ -335,3 +335,96 @@ def render_tool_result(
                 exc_info=True,
             )
     return json.dumps(parsed, indent=2, default=str)
+
+
+# The context cue's window size, restated so this module stays standalone
+# (reactive.BREADCRUMB_LIMIT is the source; a sync test pins them equal).
+CURSOR_MIN_WINDOW = 15
+
+
+def cursor_advance_is_sound(
+    args: Mapping | None,
+    channel: str,
+    payload: Mapping | None = None,
+    prev_cursor: str | None = None,
+    min_window: int = CURSOR_MIN_WINDOW,
+) -> bool:
+    """Whether a get_recent_messages call may advance the read cursor.
+
+    The cursor asserts "the agent has seen everything the context cue could
+    complain about". A fetch earns the advance only when it provably covers
+    that claim:
+
+    - never for an older page (a pagination cursor arg) or a non-room-id
+      channel key (names the server may accept would strand the cursor
+      under a key the cue never looks up);
+    - a fetch with no limit, or limit >= the cue's window, covers the cue's
+      whole domain;
+    - a response SHORTER than its requested limit exhausted the channel —
+      complete coverage regardless of the limit;
+    - a response containing the PREVIOUS cursor is contiguous with
+      known-seen history — everything between the old cursor and the new
+      newest was fetched.
+
+    Anything else skips the advance: an un-advanced cursor merely re-fires
+    the cue — the fail-safe direction — while a wrongly advanced one tells
+    the model it has seen messages it never fetched (a limit=1 peek over a
+    deep unread backlog must not mark the backlog read).
+    """
+    if not channel.startswith("!"):
+        return False
+    a = args or {}
+    if a.get("cursor"):
+        return False
+    limit = a.get("limit")
+    if limit is None:
+        return True
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return False
+    if limit >= min_window:
+        return True
+    messages = (payload or {}).get("messages")
+    if isinstance(messages, list):
+        if len(messages) < limit and not (payload or {}).get("next_cursor"):
+            # Channel exhausted — nothing older left unseen. A short
+            # response WITH a next_cursor is a server-paginated page, not
+            # exhaustion; advancing on it would silence the cue over
+            # backlog the agent never saw.
+            return True
+        if prev_cursor and any(
+            isinstance(m, Mapping) and m.get("event_id") == prev_cursor
+            for m in messages
+        ):
+            return True  # contiguous with known-seen history
+    return False
+
+
+def newest_message(payload: Mapping) -> "tuple[str, int | None] | None":
+    """The newest real message in a ``get_recent_messages`` payload
+    (messages are oldest-first) as ``(event_id, epoch_ms_or_None)``, for
+    the read-cursor: state noise doesn't count as having "read" the
+    conversation past it, and the timestamp lets the cursor store refuse
+    a stale advance from an overlapping older fetch."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for msg in reversed(messages):
+        if not isinstance(msg, Mapping):
+            continue
+        if msg.get("type") in (None, "m.room.message"):
+            event_id = msg.get("event_id")
+            if event_id:
+                try:
+                    ts = int(msg.get("timestamp"))  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    ts = None
+                return str(event_id), ts
+    return None
+
+
+def newest_event_id(payload: Mapping) -> str | None:
+    """``newest_message`` without the timestamp."""
+    newest = newest_message(payload)
+    return newest[0] if newest else None

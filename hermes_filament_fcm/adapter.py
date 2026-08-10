@@ -60,6 +60,7 @@ from .reactive import (
     FEATURE_SLASH_COMMANDS,
     KNOWN_FEATURES,
     CapabilityPolicyStore,
+    ChannelCursorStore,
     ChannelInstructionsStore,
     EngagedThreadStore,
     FeatureFlagStore,
@@ -68,6 +69,7 @@ from .reactive import (
     capability_hint,
     context_breadcrumb,
     current_capabilities,
+    current_cursor_channel,
     current_zone,
     guidance_block,
     is_agent_mention,
@@ -290,6 +292,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # enables it from the backchannel, a data turn stays ungated (None) and
         # gets no tool hint — i.e. a fresh install behaves exactly as before.
         self._feature_flags = FeatureFlagStore()
+        # The per-channel read cursor: advanced by the get_recent_messages
+        # tool proxy for window-covering fetches, consumed here so the
+        # breadcrumb counts the exact unread delta and goes quiet once
+        # caught up (shared-session keying only — see _context_breadcrumb).
+        self._channel_cursors = ChannelCursorStore()
         # Whether the OPERATOR pinned session grouping to SHARED in the
         # platform config. Only an explicit, unmarked False can carry
         # operator intent: the engine scaffolds group_sessions_per_user at
@@ -1509,18 +1516,35 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             await self._handle_push_message_turn(msg, turn_id)
 
     def _shared_sessions_effective(self) -> bool:
-        """Whether shared channels currently key to ONE session per channel.
-        An operator pin (an explicit, unmarked
-        ``group_sessions_per_user: false``) means shared by config;
-        otherwise the feature flag decides. A True knob is the engine's
-        scaffolded default and never a pin — per-sender keying is
-        expressed by leaving the flag off, not by the knob."""
+        """Whether shared channels currently key to ONE session per channel
+        — the fact the read cursor's soundness rests on. An operator pin
+        (an explicit, unmarked ``group_sessions_per_user: false``) means
+        shared by config; otherwise the feature flag decides. A True knob
+        is the engine's scaffolded default and never a pin — per-sender
+        keying is expressed by leaving the flag off, not by the knob."""
         if getattr(self, "_session_grouping_pinned", False):
             return True
         flags = getattr(self, "_feature_flags", None)
         return bool(
             flags and flags.is_enabled(FEATURE_SHARED_CHANNEL_SESSIONS)
         )
+
+    def _cursor_channel_for_turn(
+        self, channel: str, thread_id: "str | None" = None
+    ) -> "str | None":
+        """The room this data turn may record a read cursor for: its own
+        channel, only when the turn's conversation IS the channel
+        (``conversation_key`` — a thread turn joins a different
+        conversation, whose reads say nothing about what the channel
+        session has seen) and only under effective shared-session keying.
+        Under per-sender keying a fetch is one reader's, not the channel
+        conversation's — recording it channel-wide would let a cursor laid
+        down before a keying flip mark the brand-new shared session as
+        caught up on messages it never saw."""
+        kind, _ = conversation_key(channel, thread_id)
+        if kind != "channel":
+            return None
+        return channel if self._shared_sessions_effective() else None
 
     def _apply_session_keying(self) -> None:
         """Honor the ``shared_channel_sessions`` flag: while on, shared
@@ -1764,8 +1788,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return None
+        # The read cursor is a channel-wide fact; it only means "THIS
+        # conversation has seen it" when the channel has exactly one
+        # conversation, so it is consulted only under EFFECTIVE
+        # shared-session keying (flag or operator pin, see
+        # _shared_sessions_effective). Per-sender sessions keep the
+        # windowed count: one sender's fetch must not silence another
+        # sender's cue.
+        cursors = getattr(self, "_channel_cursors", None)
+        cursor_applies = bool(cursors and self._shared_sessions_effective())
         crumb = context_breadcrumb(
-            messages, trigger_event_id=trigger_event_id
+            messages,
+            trigger_event_id=trigger_event_id,
+            last_seen_event_id=(
+                cursors.get(channel) if cursor_applies else None
+            ),
         )
         logger.info(
             "filament-fcm: context breadcrumb for %s: %d messages read, cue=%s",
@@ -1915,6 +1952,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Control plane keeps full capability: None = ungated (the capability
         # gate only restricts data turns, which set an explicit allowed set).
         current_capabilities.set(None)
+        # A backchannel turn is never a channel's shared session: its reads
+        # must not mark any channel's conversation as caught up.
+        current_cursor_channel.set(None)
         # Applied synchronously right before dispatch: the base adapter
         # derives the session key at handle_message entry, so no await can
         # interleave a flag toggle between decision and use — and the
@@ -2370,6 +2410,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # the set — hard enforcement the data-as-data framing can't be talked
         # out of. Fail-closed: an unlisted channel/user got the minimal default.
         current_capabilities.set(allowed)
+        # This turn may record a read cursor only for its own channel, and
+        # only while shared-session keying is effective. Under per-sender
+        # keying (or from any other channel's turn) a fetch is one reader's,
+        # not the channel conversation's, and must not quiet the cue for a
+        # session that never saw the messages.
+        current_cursor_channel.set(
+            self._cursor_channel_for_turn(channel, thread_id)
+        )
         # Same last-moment keying application as the control path.
         self._apply_session_keying()
         await self.handle_message(event)

@@ -117,6 +117,7 @@ BLOCKED_TOOLS: dict[str, str] = {
 def _make_tool_handler(
     tool_name: str,
     api: FilamentAPI,
+    cursor_store: "reactive_mod.ChannelCursorStore | None" = None,
     feature_flags: "reactive_mod.FeatureFlagStore | None" = None,
 ):
     """Create an async handler that proxies a tool call through the
@@ -125,10 +126,23 @@ def _make_tool_handler(
     The handler holds a direct reference to ``api`` — the same object
     the adapter uses.  No module-level mutable state needed.
 
-    With ``compact_timeline`` enabled (``feature_flags``, read fresh
-    per call), renderable results return as compact provenance-labeled
-    lines instead of pretty-printed JSON; any rendering surprise falls
-    back to the JSON form, never an error.
+    Two session-economy hooks ride on the proxy for the message-read
+    tools:
+
+    - ``cursor_store``: a ``get_recent_messages`` fetch that provably
+      covers the context cue's window advances the per-channel read cursor
+      to the newest message returned (see ``timeline.cursor_advance_is_sound``
+      for
+      what "provably" excludes: paged reads, narrow limits, non-id channel
+      keys), and only when the calling turn IS that channel's shared
+      session (``current_cursor_channel``). This is the one place that
+      KNOWS the channel's conversation read the channel, so the context
+      breadcrumb can count the exact unread delta and go quiet when
+      there is none.
+    - ``feature_flags``: with ``compact_timeline`` enabled, renderable
+      results return as compact provenance-labeled lines instead of
+      pretty-printed JSON. Read fresh per call; any rendering surprise
+      falls back to the JSON form, never an error.
     """
 
     async def handler(args: dict, **kwargs: Any) -> str:
@@ -143,6 +157,31 @@ def _make_tool_handler(
                 logger.warning("filament-fcm: tool %s rejected: %s", tool_name, error)
                 return json.dumps({"error": error})
             parsed = api.parse_tool_result(result)
+            if cursor_store is not None and tool_name == "get_recent_messages":
+                try:
+                    channel = str((args or {}).get("channel") or "")
+                    # Only the turn that IS this channel's shared session may
+                    # record (current_cursor_channel, set at dispatch): a
+                    # per-sender session's, backchannel's, or other channel's
+                    # fetch is one reader's; recording it channel-wide would
+                    # quiet the cue for a session that never saw the messages.
+                    if channel and channel == (
+                        reactive_mod.current_cursor_channel.get()
+                    ) and timeline.cursor_advance_is_sound(
+                        args,
+                        channel,
+                        payload=parsed,
+                        prev_cursor=cursor_store.get(channel),
+                        min_window=reactive_mod.BREADCRUMB_LIMIT,
+                    ):
+                        newest = timeline.newest_message(parsed)
+                        if newest:
+                            cursor_store.record(channel, newest[0], ts=newest[1])
+                except Exception:
+                    logger.warning(
+                        "filament-fcm: read-cursor update failed",
+                        exc_info=True,
+                    )
             if tool_name in timeline.RENDERABLE_TOOLS:
                 # Flag read gated on renderability: the file read costs
                 # nothing on the many tools that can never render compactly.
@@ -390,9 +429,11 @@ def register(ctx: Any) -> None:
     # handler closes over ``api`` — the same instance the adapter will
     # use — so tool calls proxy through the live MCP session.
     all_tools = _resolve_tools(mcp_url, mcp_token)
-    # The compact_timeline flag store for the message-read proxies —
-    # read fresh per call; like every store, state lives in the file, not
-    # the object.
+    # Session-economy hooks for the message-read proxies: the read
+    # cursor (always on) and the compact_timeline flag (read fresh per
+    # call). Fresh store instances — like every store, state lives in the
+    # files, not the objects.
+    cursor_store = reactive_mod.ChannelCursorStore()
     handler_flags = FeatureFlagStore()
     registered = 0
     skipped = 0
@@ -413,7 +454,10 @@ def register(ctx: Any) -> None:
             toolset="filament",
             schema=schema,
             handler=_make_tool_handler(
-                name, api, feature_flags=handler_flags
+                name,
+                api,
+                cursor_store=cursor_store,
+                feature_flags=handler_flags,
             ),
             is_async=True,
             description=tool.get("description", ""),
