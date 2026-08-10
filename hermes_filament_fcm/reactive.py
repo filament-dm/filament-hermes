@@ -1128,6 +1128,11 @@ FEATURE_ADVANCED_TOOL_CONTROLS = "advanced_tool_controls"
 # dispatch exactly like any other leading-/ message.
 FEATURE_SLASH_COMMANDS = "slash_commands"
 
+# Compact provenance-labeled rendering of message-tool results:
+# get_recent_messages / get_thread results become one line per message
+# instead of pretty-printed JSON. Off by default like every flag.
+FEATURE_COMPACT_TIMELINE = "compact_timeline"
+
 # Human-facing descriptions for the flags the code actually checks. Keep in
 # sync with the checks; surfaced by get_features and the set_feature tool so the
 # principal (and the agent mapping their request) knows what can be toggled.
@@ -1145,6 +1150,14 @@ KNOWN_FEATURES: dict[str, str] = {
         "by default; when off, /fil- messages go to the model like any other "
         "text. Enable via set_feature or the server config document — the "
         "slash surface can't enable itself while it is off."
+    ),
+    FEATURE_COMPACT_TIMELINE: (
+        "Compact rendering of get_recent_messages/get_thread results: one "
+        "provenance-labeled line per message instead of pretty-printed "
+        "JSON, cutting the per-fetch context cost roughly tenfold. Content "
+        "is never dropped — body, sender, time, event id, media and "
+        "reactions all survive; only envelope metadata goes. Off by "
+        "default; when off, results render as JSON exactly as before."
     ),
 }
 

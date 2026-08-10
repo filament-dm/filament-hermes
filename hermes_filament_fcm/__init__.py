@@ -29,6 +29,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from . import reactive as reactive_mod
+from . import timeline
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
 from .cli import register_cli
 from .deps import (
@@ -112,12 +114,21 @@ BLOCKED_TOOLS: dict[str, str] = {
 }
 
 
-def _make_tool_handler(tool_name: str, api: FilamentAPI):
+def _make_tool_handler(
+    tool_name: str,
+    api: FilamentAPI,
+    feature_flags: "reactive_mod.FeatureFlagStore | None" = None,
+):
     """Create an async handler that proxies a tool call through the
     given ``FilamentAPI`` instance.
 
     The handler holds a direct reference to ``api`` — the same object
     the adapter uses.  No module-level mutable state needed.
+
+    With ``compact_timeline`` enabled (``feature_flags``, read fresh
+    per call), renderable results return as compact provenance-labeled
+    lines instead of pretty-printed JSON; any rendering surprise falls
+    back to the JSON form, never an error.
     """
 
     async def handler(args: dict, **kwargs: Any) -> str:
@@ -132,7 +143,24 @@ def _make_tool_handler(tool_name: str, api: FilamentAPI):
                 logger.warning("filament-fcm: tool %s rejected: %s", tool_name, error)
                 return json.dumps({"error": error})
             parsed = api.parse_tool_result(result)
-            return json.dumps(parsed, indent=2, default=str)
+            if tool_name in timeline.RENDERABLE_TOOLS:
+                # Flag read gated on renderability: the file read costs
+                # nothing on the many tools that can never render compactly.
+                compact = (
+                    feature_flags is not None
+                    and feature_flags.is_enabled(
+                        reactive_mod.FEATURE_COMPACT_TIMELINE
+                    )
+                )
+                return timeline.render_tool_result(
+                    tool_name,
+                    parsed,
+                    compact=compact,
+                    channel=str((args or {}).get("channel") or "") or None,
+                )
+            return timeline.render_tool_result(
+                tool_name, parsed, compact=False
+            )
         except Exception as exc:
             logger.exception("filament-fcm: tool %s failed", tool_name)
             # Several transport errors, httpx.ReadError included, stringify to
@@ -362,6 +390,10 @@ def register(ctx: Any) -> None:
     # handler closes over ``api`` — the same instance the adapter will
     # use — so tool calls proxy through the live MCP session.
     all_tools = _resolve_tools(mcp_url, mcp_token)
+    # The compact_timeline flag store for the message-read proxies —
+    # read fresh per call; like every store, state lives in the file, not
+    # the object.
+    handler_flags = FeatureFlagStore()
     registered = 0
     skipped = 0
     for tool in all_tools:
@@ -380,7 +412,9 @@ def register(ctx: Any) -> None:
             name=name,
             toolset="filament",
             schema=schema,
-            handler=_make_tool_handler(name, api),
+            handler=_make_tool_handler(
+                name, api, feature_flags=handler_flags
+            ),
             is_async=True,
             description=tool.get("description", ""),
         )
