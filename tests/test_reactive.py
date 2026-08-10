@@ -169,6 +169,13 @@ def _msg(event_id, sender="@x:s", is_from_self=False, type="m.room.message"):
             "type": type}
 
 
+def test_conversation_key_rule():
+    # The session-scope rule: a thread turn joins the thread (root +
+    # replies); a top-level turn joins the channel (top-level messages).
+    assert reactive.conversation_key("!r:s", "$t") == ("thread", "$t")
+    assert reactive.conversation_key("!r:s", None) == ("channel", "!r:s")
+
+
 def test_breadcrumb_none_when_empty():
     assert reactive.context_breadcrumb([], trigger_event_id="$t") is None
 

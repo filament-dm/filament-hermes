@@ -80,6 +80,21 @@ current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
 )
 
 
+def conversation_key(
+    channel: str, thread_id: "str | None"
+) -> "tuple[str, str]":
+    """The one conversation a data turn joins — the session-scope rule in
+    a single line: a thread turn's conversation is the thread (history =
+    the root plus its replies, via ``get_thread``); a top-level turn's is
+    the channel (history = the channel's top-level messages, via
+    ``get_recent_messages``). Everything session-scoped keys off this
+    pair: the gateway's ``build_session_key`` derives the session from
+    the same (channel, thread) inputs, and the plugin's per-turn plumbing
+    must treat different pairs as different conversations.
+    """
+    return ("thread", thread_id) if thread_id else ("channel", channel)
+
+
 def is_agent_mention(
     is_mention: bool, is_everyone_mention: bool, body_mentions_me: bool
 ) -> bool:
@@ -1133,6 +1148,19 @@ FEATURE_SLASH_COMMANDS = "slash_commands"
 # instead of pretty-printed JSON. Off by default like every flag.
 FEATURE_COMPACT_TIMELINE = "compact_timeline"
 
+# Session = channel: shared channels get ONE session shared by every
+# participant (sender becomes a label, not a partition) instead of one
+# session per (channel, sender). Off by default like every flag.
+#
+# Engages only where a top-level message joins the CHANNEL conversation —
+# reply_style "channel" (see conversation_key). Under the default
+# reply_style "thread", every top-level message roots its own thread
+# conversation, so there is no per-sender partition for this flag to
+# collapse and keying is unchanged; the read cursor follows the same
+# rule. Decoupling reply placement from conversation identity is the
+# planned keying change that extends this to default channels.
+FEATURE_SHARED_CHANNEL_SESSIONS = "shared_channel_sessions"
+
 # Human-facing descriptions for the flags the code actually checks. Keep in
 # sync with the checks; surfaced by get_features and the set_feature tool so the
 # principal (and the agent mapping their request) knows what can be toggled.
@@ -1158,6 +1186,19 @@ KNOWN_FEATURES: dict[str, str] = {
         "is never dropped — body, sender, time, event id, media and "
         "reactions all survive; only envelope metadata goes. Off by "
         "default; when off, results render as JSON exactly as before."
+    ),
+    FEATURE_SHARED_CHANNEL_SESSIONS: (
+        "One conversation memory per shared channel, shared by every "
+        "participant (threads keep their own), instead of a separate "
+        "memory per (channel, sender). The agent then remembers what "
+        "anyone said in the channel — note this means one member's "
+        "exchanges with the agent are context for another's, matching "
+        "what any human channel member can already see. Takes effect in "
+        "channels whose reply_style is 'channel' (see set_wake_policy); "
+        "in default threaded channels each thread already keeps its own "
+        "conversation, so keying there is unchanged. Off by default; "
+        "existing per-sender sessions idle out, they are not migrated. "
+        "Takes effect on the next wake after toggling."
     ),
 }
 
