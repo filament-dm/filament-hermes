@@ -661,6 +661,8 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
         "search_messages",
         "list_mentions",
         "download_media",
+        # Reading who reacted to what is reading the channel.
+        "list_reactions",
     ],
     # Write into the channel: post, reply in threads, add/remove reactions.
     "post": [
@@ -668,6 +670,8 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
         "reply_in_thread",
         "react",
         "unreact",
+        # A quote is a message that re-surfaces another one — posting.
+        "quote",
     ],
     # Look up who people are.
     "directory": [

@@ -414,10 +414,11 @@ def test_builtin_rows_expand_to_exact_sets():
             "search_messages",
             "list_mentions",
             "download_media",
+            "list_reactions",
         }
     )
     assert store.expand_bundle("post") == frozenset(
-        {"post_message", "reply_in_thread", "react", "unreact"}
+        {"post_message", "reply_in_thread", "react", "unreact", "quote"}
     )
     assert store.expand_bundle("directory") == frozenset(
         {"get_user_profile", "search_user_profiles"}
@@ -459,15 +460,30 @@ def test_deprecated_aliases_expand_to_exact_original_sets():
     )
 
 
+# Tools the frozen "messaging" alias never named, restored to the rows because
+# the feature was silently taking them away: an ungated agent could always
+# quote a message and read reaction activity, so the fail-closed DEFAULT
+# profile must be able to as well (the same argument that put download_media
+# in the alias). Mirrors _RESTORED_TO_DEFAULT in the server's test suite.
+_RESTORED_TO_DEFAULT = frozenset({"quote", "list_reactions"})
+
+
 def test_new_default_matches_old_messaging_escalate_default():
-    # The no-behavior-change proof for the bundle recut: the new default rows
-    # plus baseline grant exactly what ["messaging", "escalate"] plus baseline
-    # granted (download_media moved from messaging into read_history, so the
-    # unions must come out identical).
+    # The no-silent-drift proof for the bundle recut: the new default rows
+    # grant everything ["messaging", "escalate"] granted — nothing was lost —
+    # plus exactly the deliberately restored pair. Asserting both directions
+    # means any OTHER addition fails here.
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
-    new = store.expand_capabilities(list(reactive.DEFAULT_CAPABILITIES))
-    old = store.expand_capabilities(["messaging", "escalate"])
-    assert new | reactive.BASELINE_TOOLS == old | reactive.BASELINE_TOOLS
+    # Unioned on both sides because the frozen alias still names get_self and
+    # mark_read, which the rows deliberately left to ALWAYS_GRANTED — the
+    # comparison is about what a turn can CALL, not which list names it.
+    new = (
+        store.expand_capabilities(list(reactive.DEFAULT_CAPABILITIES))
+        | reactive.ALWAYS_GRANTED
+    )
+    old = store.expand_capabilities(["messaging", "escalate"]) | reactive.ALWAYS_GRANTED
+    assert not (old - new), "the recut default lost a tool"
+    assert new - old == _RESTORED_TO_DEFAULT
 
 
 def test_resolve_always_includes_baseline():
