@@ -676,7 +676,7 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
     # Look up who people are.
     "directory": [
         "get_user_profile",
-        "search_user_profiles",
+        "search_members",
     ],
     # Reach the principal — the one channel-independent escalation path. Kept
     # separate so the principal can grant "read + post" without also letting a
@@ -694,7 +694,7 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
         "get_thread",
         "get_user_profile",
         "search_messages",
-        "search_user_profiles",
+        "search_members",
         "list_mentions",
         "react",
         "unreact",

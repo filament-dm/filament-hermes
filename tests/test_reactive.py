@@ -421,7 +421,7 @@ def test_builtin_rows_expand_to_exact_sets():
         {"post_message", "reply_in_thread", "react", "unreact", "quote"}
     )
     assert store.expand_bundle("directory") == frozenset(
-        {"get_user_profile", "search_user_profiles"}
+        {"get_user_profile", "search_members"}
     )
     assert store.expand_bundle("escalate") == frozenset({"message_principal"})
 
@@ -430,6 +430,11 @@ def test_deprecated_aliases_expand_to_exact_original_sets():
     # Server-held policy documents still grant these names, so the literal
     # sets below — their original member lists — must never drift, and must
     # never be redefined via @includes of the row bundles.
+    #
+    # One exception, already taken: the directory search was listed under the
+    # legacy "search_user_profiles" spelling, which no tool is registered
+    # under, so it granted nothing on either enforcer. Correcting it to
+    # "search_members" changes what the alias ENFORCES, not what it meant.
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
     assert store.expand_bundle("messaging") == frozenset(
         {
@@ -438,7 +443,7 @@ def test_deprecated_aliases_expand_to_exact_original_sets():
             "get_thread",
             "get_user_profile",
             "search_messages",
-            "search_user_profiles",
+            "search_members",
             "list_mentions",
             "react",
             "unreact",
