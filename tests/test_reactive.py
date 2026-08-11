@@ -336,7 +336,7 @@ def test_resolve_empty_channel_entry_narrows_to_nothing():
         # A present-but-empty entry is a deliberate override to nothing (a
         # silent-observer channel), not a fall-through to the default — only
         # the always-kept baseline self-context tools remain.
-        assert store.resolve("!silent:x", "@u:x") == reactive.BASELINE_TOOLS
+        assert store.resolve("!silent:x", "@u:x") == reactive.ALWAYS_GRANTED
         # The default is untouched elsewhere.
         assert "post_message" in store.resolve("!other:x", "@u:x")
 
@@ -383,7 +383,7 @@ def test_resolve_unknown_bundle_in_channel_entry_grants_nothing():
         # The entry overrides the default, and its unknown bundle expands to
         # nothing — fail closed, never a fall-back to the wider default. Only
         # the baseline rides along.
-        assert store.resolve("!room:x", "@u:x") == reactive.BASELINE_TOOLS
+        assert store.resolve("!room:x", "@u:x") == reactive.ALWAYS_GRANTED
 
 
 def test_resolve_empty_default_is_silent_observer():
@@ -394,7 +394,7 @@ def test_resolve_empty_default_is_silent_observer():
         # self-context tools for unlisted turns. capability_denies then blocks
         # every channel-action call.
         allowed = store.resolve("!room:x", "@x:x")
-        assert allowed == reactive.BASELINE_TOOLS
+        assert allowed == reactive.ALWAYS_GRANTED
         assert reactive.capability_denies(allowed, "get_thread") is True
         assert reactive.capability_denies(allowed, "post_message") is True
 
@@ -487,7 +487,7 @@ def test_resolve_always_includes_baseline():
         assert "post_message" in granted
         # A channel narrowed to an empty grant keeps exactly the baseline —
         # a gated turn never loses its identity/self-context tools.
-        assert store.resolve("!narrow:x", "@u:x") == reactive.BASELINE_TOOLS
+        assert store.resolve("!narrow:x", "@u:x") == reactive.ALWAYS_GRANTED
         # And so does a narrowed global default.
         assert store.resolve("!other:x", "@u:x") >= reactive.BASELINE_TOOLS
 
@@ -496,10 +496,61 @@ def test_capability_hint_baseline_only():
     # A channel granted nothing still resolves to the baseline; the hint must
     # say plainly that the agent can orient itself but take no channel action,
     # while still naming exactly the permitted tools (hint == gate).
-    h = reactive.capability_hint(reactive.BASELINE_TOOLS)
+    h = reactive.capability_hint(reactive.ALWAYS_GRANTED)
     assert "no capabilities beyond" in h
-    assert "get_backchannel, get_self, mark_read" in h
+    # hint == gate: every always-granted name is listed, so the agent is never
+    # steered away from a tool it is in fact allowed to use.
+    for tool in reactive.ALWAYS_GRANTED:
+        assert tool in h
     assert "will be refused" in h
+
+
+def test_core_and_bridge_tools_survive_every_grant():
+    """No policy can revoke orientation or the deferred-tool bridge.
+
+    The regression this pins: `list_channels` belongs to no builtin bundle, so
+    before ALWAYS_GRANTED a channel granted EVERY row the app offers still had
+    it refused by the gate — an agent that cannot enumerate its own channels
+    cannot act in any of them, and no grant the UI can express fixed it.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        for policy in (
+            {},                                                   # unauthored
+            {"default_capabilities": []},                         # empty default
+            {"default_capabilities": list(reactive.DEFAULT_CAPABILITIES)},
+            {"default_capabilities": ["typo_bundle"]},            # unknown name
+            {                                                     # narrowed channel
+                "default_capabilities": ["read_history", "post"],
+                "per_channel": {"!room:x": []},
+            },
+            {                                                     # custom bundle
+                "bundles": {"list_channels": ["nothing"]},        # shadowing attempt
+                "default_capabilities": ["list_channels"],
+            },
+        ):
+            store.write(policy)
+            allowed = store.resolve("!room:x", "@u:x")
+            missing = reactive.ALWAYS_GRANTED - allowed
+            assert not missing, f"{policy} dropped {sorted(missing)}"
+            # And the gate agrees, since it is a pure function of that set.
+            for tool in reactive.ALWAYS_GRANTED:
+                assert not reactive.capability_denies(allowed, tool)
+
+
+def test_always_granted_is_baseline_plus_core_plus_bridge():
+    # The three groups stay distinct (different reasons, different mirrors:
+    # the server mirrors baseline+core, and never sees the bridge tools).
+    assert reactive.ALWAYS_GRANTED == (
+        reactive.BASELINE_TOOLS | reactive.CORE_TOOLS | reactive.BRIDGE_TOOLS
+    )
+    assert not (reactive.BASELINE_TOOLS & reactive.CORE_TOOLS)
+    assert not (reactive.CORE_TOOLS & reactive.BRIDGE_TOOLS)
+    # An always-granted tool must never also be a bundle member: that would
+    # imply a switch which cannot turn it off.
+    members = {m for ms in reactive.BUILTIN_BUNDLES.values() for m in ms}
+    assert not (reactive.CORE_TOOLS & members)
+    assert not (reactive.BRIDGE_TOOLS & members)
 
 
 def test_mcp_auto_bundle_expands_via_injected_lookup():
@@ -606,7 +657,7 @@ def test_resolve_survives_malformed_policy():
             }
         )
         allowed = store.resolve("!room:x", "@u:x")  # must not raise
-        assert allowed == reactive.BASELINE_TOOLS
+        assert allowed == reactive.ALWAYS_GRANTED
         # A malformed (non-list) channel entry reads as absent — the default
         # still applies rather than the turn crashing or the entry "winning".
         store.write(

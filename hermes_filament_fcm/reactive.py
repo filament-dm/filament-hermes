@@ -152,8 +152,8 @@ def capability_hint(allowed: "frozenset[str] | None") -> str:
     Advisory (soft) — it complements, never replaces, the hard ``pre_tool_call``
     gate. ``None`` (ungated control/other turns) → empty string (no hint, full
     access). A frozenset → a bracketed, trusted framing block listing exactly
-    the permitted tools; a set with nothing beyond ``BASELINE_TOOLS`` (a
-    channel granted no capabilities — ``resolve`` keeps the baseline in every
+    the permitted tools; a set with nothing beyond ``ALWAYS_GRANTED`` (a
+    channel granted no capabilities — ``resolve`` keeps those in every
     result) says so plainly: orient, but take no channel action. The text is
     derived from the principal's policy (trusted), not from event data, so it
     carries no injection risk. Stdlib-only for unit testing.
@@ -161,11 +161,12 @@ def capability_hint(allowed: "frozenset[str] | None") -> str:
     if allowed is None:
         return ""
     names = ", ".join(sorted(allowed)) if allowed else "(none)"
-    if allowed and allowed <= BASELINE_TOOLS:
+    if allowed and allowed <= ALWAYS_GRANTED:
         return (
             "[TOOLS AVAILABLE TO YOU IN THIS CHANNEL — your principal's policy "
             "grants this channel no capabilities beyond your baseline "
-            f"self-context tools: {names}. You may orient yourself with those, "
+            f"self-context and orientation tools: {names}. You may orient "
+            "yourself with those, "
             "but every other tool is disabled here and will be refused, so do "
             "not attempt it (and don't claim you used it).]"
         )
@@ -725,6 +726,37 @@ MCP_BUNDLE_PREFIX = "mcp:"
 # set and a locally-resolved set would disagree.
 BASELINE_TOOLS: frozenset[str] = frozenset({"get_self", "mark_read", "get_backchannel"})
 
+# Core orientation reads: WHERE the agent is, never authority to act there.
+# Always granted for the same reason as BASELINE_TOOLS, kept under a separate
+# name because the reason differs — baseline is turn hygiene, this is
+# navigation. Neither is a grantable row, so the app must not draw a switch
+# for either.
+#
+# Without this, enabling the feature silently removed them: they belong to no
+# builtin bundle, so a channel granted every row the UI offers still had
+# ``list_channels`` refused by this gate (live-observed). An agent that cannot
+# enumerate its own channels cannot act in any of them, and no grant the UI
+# can express fixes that — hence always-on rather than a new row.
+CORE_TOOLS: frozenset[str] = frozenset(
+    {"list_channels", "list_loop_channels", "get_channel_details"}
+)
+
+# Hermes' deferred-tool bridge. NOT Filament tools and never seen by the
+# server — they exist only in this process, which is why the server's mirror
+# of this vocabulary has no counterpart for them.
+#
+# Gating them is worse than useless: the bridge recurses into the underlying
+# tool and *all hooks fire against the real tool name* (hermes
+# ``model_tools.py``: "The bridge is invisible to hooks by design"), so this
+# gate still sees — and still refuses — whatever the bridge was asked to
+# reach. Blocking the bridge itself only severs the agent's ability to
+# discover or call any lazily-loaded tool, including ones a grant allows.
+BRIDGE_TOOLS: frozenset[str] = frozenset({"tool_search", "tool_describe", "tool_call"})
+
+# The union no grant can remove: what ``resolve`` adds to every result, and
+# the floor ``capability_hint`` measures "granted nothing" against.
+ALWAYS_GRANTED: frozenset[str] = BASELINE_TOOLS | CORE_TOOLS | BRIDGE_TOOLS
+
 # Fail-closed default profile for a data channel with no explicit policy
 # entry: read the channel, post in it, look people up, and escalate to the
 # principal — but no membership actions, no profile edits, and no
@@ -984,7 +1016,7 @@ class CapabilityPolicyStore:
                 source = "channel"
         allowed = (
             self.expand_capabilities(granted, policy, toolset_tools=toolset_tools)
-            | BASELINE_TOOLS
+            | ALWAYS_GRANTED
         )
         logger.info(
             "filament-fcm: capabilities room=%s sender=%s source=%s grants=%s "
