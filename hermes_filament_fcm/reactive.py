@@ -152,7 +152,7 @@ def capability_hint(allowed: "frozenset[str] | None") -> str:
     Advisory (soft) — it complements, never replaces, the hard ``pre_tool_call``
     gate. ``None`` (ungated control/other turns) → empty string (no hint, full
     access). A frozenset → a bracketed, trusted framing block listing exactly
-    the permitted tools; a set with nothing beyond ``ALWAYS_GRANTED`` (a
+    the permitted tools; a set with nothing beyond ``UNGATEABLE`` (a
     channel granted no capabilities — ``resolve`` keeps those in every
     result) says so plainly: orient, but take no channel action. The text is
     derived from the principal's policy (trusted), not from event data, so it
@@ -161,7 +161,7 @@ def capability_hint(allowed: "frozenset[str] | None") -> str:
     if allowed is None:
         return ""
     names = ", ".join(sorted(allowed)) if allowed else "(none)"
-    if allowed and allowed <= ALWAYS_GRANTED:
+    if allowed and allowed <= UNGATEABLE:
         return (
             "[TOOLS AVAILABLE TO YOU IN THIS CHANNEL — your principal's policy "
             "grants this channel no capabilities beyond your baseline "
@@ -724,33 +724,35 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
 # reference ``mcp:<server>`` freely.
 MCP_BUNDLE_PREFIX = "mcp:"
 
-# Baseline turn hygiene: tools every gated data turn keeps regardless of the
-# channel's grant — self-identity (get_self), the principal-backchannel
-# lookup (get_backchannel), and read-state (mark_read). ``resolve`` unions
-# this into every result, so a gated turn never loses its identity/self-
-# context, even in a channel narrowed to an empty grant. Any server-side
-# mirror of this resolution MUST apply the same union, or a server-resolved
-# set and a locally-resolved set would disagree.
-BASELINE_TOOLS: frozenset[str] = frozenset({"get_self", "mark_read", "get_backchannel"})
-
-# Core orientation reads: WHERE the agent is, never authority to act there.
-# Always granted for the same reason as BASELINE_TOOLS, kept under a separate
-# name because the reason differs — baseline is turn hygiene, this is
-# navigation. Neither is a grantable row, so the app must not draw a switch
-# for either.
-#
-# Without this, enabling the feature silently removed them: they belong to no
-# builtin bundle, so a channel granted every row the UI offers still had
-# ``list_channels`` refused by this gate (live-observed). An agent that cannot
-# enumerate its own channels cannot act in any of them, and no grant the UI
-# can express fixes that — hence always-on rather than a new row.
-CORE_TOOLS: frozenset[str] = frozenset(
-    {"list_channels", "list_loop_channels", "get_channel_details"}
+# What no grant can remove. One flat set, not named sub-groups: the *reasons*
+# an entry is here differ, but the rule is identical for all of them — none is
+# a grantable row, so the app must never draw a switch implying otherwise, and
+# ``resolve`` unions the whole set into every result. Any server-side mirror of
+# this resolution MUST apply the same union, or a server-resolved set and a
+# locally-resolved set would disagree; the server's copy is identical.
+ALWAYS_GRANTED: frozenset[str] = frozenset(
+    {
+        # Turn hygiene: self-identity (get_self), the principal-backchannel
+        # lookup (get_backchannel), and read-state (mark_read), so a gated
+        # turn never loses its own context even in a channel granted nothing.
+        "get_self",
+        "mark_read",
+        "get_backchannel",
+        # Orientation: WHERE the agent is, never authority to act there.
+        # These belong to no bundle and this gate is gateway-wide, so without
+        # them a channel granted EVERY row the app offers still had
+        # `list_channels` refused — and an agent that cannot enumerate its own
+        # channels cannot act in any of them.
+        "list_channels",
+        "list_loop_channels",
+        "get_channel_details",
+    }
 )
 
-# Hermes' deferred-tool bridge. NOT Filament tools and never seen by the
-# server — they exist only in this process, which is why the server's mirror
-# of this vocabulary has no counterpart for them.
+# Hermes' deferred-tool bridge. Deliberately NOT part of ALWAYS_GRANTED: those
+# are Filament tools the server mirrors, while these exist only in this
+# process and never reach it — folding them together would make the two
+# vocabularies disagree by construction.
 #
 # Gating them is worse than useless: the bridge recurses into the underlying
 # tool and *all hooks fire against the real tool name* (hermes
@@ -760,14 +762,13 @@ CORE_TOOLS: frozenset[str] = frozenset(
 # discover or call any lazily-loaded tool, including ones a grant allows.
 BRIDGE_TOOLS: frozenset[str] = frozenset({"tool_search", "tool_describe", "tool_call"})
 
-# The union no grant can remove: what ``resolve`` adds to every result, and
-# the floor ``capability_hint`` measures "granted nothing" against.
-ALWAYS_GRANTED: frozenset[str] = BASELINE_TOOLS | CORE_TOOLS | BRIDGE_TOOLS
+# The floor this gate applies: the mirrored Filament set plus the bridge.
+UNGATEABLE: frozenset[str] = ALWAYS_GRANTED | BRIDGE_TOOLS
 
 # Fail-closed default profile for a data channel with no explicit policy
 # entry: read the channel, post in it, look people up, and escalate to the
 # principal — but no membership actions, no profile edits, and no
-# non-Filament tools. Together with BASELINE_TOOLS this expands to the same
+# non-Filament tools. Together with ALWAYS_GRANTED this expands to the same
 # effective tool set as the deprecated ["messaging", "escalate"] default.
 DEFAULT_CAPABILITIES: list[str] = ["read_history", "post", "directory", "escalate"]
 
@@ -835,7 +836,7 @@ class CapabilityPolicyStore:
     listed channel resolves to exactly its own grant list, so a channel can be
     narrowed below the default (down to an empty grant) as well as widened.
     An unlisted channel gets exactly ``default_capabilities`` (a minimal
-    profile), never full access. ``BASELINE_TOOLS`` is then unioned into
+    profile), never full access. ``UNGATEABLE`` is then unioned into
     every resolved set — turn hygiene no grant vocabulary can remove.
 
     ``per_user`` is deferred: it stays in the document schema and
@@ -979,7 +980,7 @@ class CapabilityPolicyStore:
         """The allowed tool set for a data turn in ``room_id``: the channel's
         ``per_channel`` grant list if one is present, else
         ``default_capabilities``, expanded to tool names, unioned with
-        ``BASELINE_TOOLS``.
+        ``UNGATEABLE``.
 
         The channel entry REPLACES the default (override, not union) — the
         invariant is that a listed channel resolves to exactly its own grant
@@ -988,7 +989,7 @@ class CapabilityPolicyStore:
         an unlisted channel gets the minimal default, never full access, and a
         malformed (non-list) entry is treated as absent.
 
-        ``BASELINE_TOOLS`` rides on every result — turn hygiene: however
+        ``UNGATEABLE`` rides on every result — turn hygiene: however
         narrow the grant, a gated turn keeps its identity/self-context tools.
         The union happens AFTER expansion, so no grant vocabulary (a custom
         bundle shadowing a builtin, an empty channel entry) can remove it.
@@ -1023,7 +1024,7 @@ class CapabilityPolicyStore:
                 source = "channel"
         allowed = (
             self.expand_capabilities(granted, policy, toolset_tools=toolset_tools)
-            | ALWAYS_GRANTED
+            | UNGATEABLE
         )
         logger.info(
             "filament-fcm: capabilities room=%s sender=%s source=%s grants=%s "

@@ -336,7 +336,7 @@ def test_resolve_empty_channel_entry_narrows_to_nothing():
         # A present-but-empty entry is a deliberate override to nothing (a
         # silent-observer channel), not a fall-through to the default — only
         # the always-kept baseline self-context tools remain.
-        assert store.resolve("!silent:x", "@u:x") == reactive.ALWAYS_GRANTED
+        assert store.resolve("!silent:x", "@u:x") == reactive.UNGATEABLE
         # The default is untouched elsewhere.
         assert "post_message" in store.resolve("!other:x", "@u:x")
 
@@ -383,7 +383,7 @@ def test_resolve_unknown_bundle_in_channel_entry_grants_nothing():
         # The entry overrides the default, and its unknown bundle expands to
         # nothing — fail closed, never a fall-back to the wider default. Only
         # the baseline rides along.
-        assert store.resolve("!room:x", "@u:x") == reactive.ALWAYS_GRANTED
+        assert store.resolve("!room:x", "@u:x") == reactive.UNGATEABLE
 
 
 def test_resolve_empty_default_is_silent_observer():
@@ -394,7 +394,7 @@ def test_resolve_empty_default_is_silent_observer():
         # self-context tools for unlisted turns. capability_denies then blocks
         # every channel-action call.
         allowed = store.resolve("!room:x", "@x:x")
-        assert allowed == reactive.ALWAYS_GRANTED
+        assert allowed == reactive.UNGATEABLE
         assert reactive.capability_denies(allowed, "get_thread") is True
         assert reactive.capability_denies(allowed, "post_message") is True
 
@@ -480,13 +480,13 @@ def test_new_default_matches_old_messaging_escalate_default():
     # means any OTHER addition fails here.
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
     # Unioned on both sides because the frozen alias still names get_self and
-    # mark_read, which the rows deliberately left to ALWAYS_GRANTED — the
+    # mark_read, which the rows deliberately left to the floor — the
     # comparison is about what a turn can CALL, not which list names it.
     new = (
         store.expand_capabilities(list(reactive.DEFAULT_CAPABILITIES))
-        | reactive.ALWAYS_GRANTED
+        | reactive.UNGATEABLE
     )
-    old = store.expand_capabilities(["messaging", "escalate"]) | reactive.ALWAYS_GRANTED
+    old = store.expand_capabilities(["messaging", "escalate"]) | reactive.UNGATEABLE
     assert not (old - new), "the recut default lost a tool"
     assert new - old == _RESTORED_TO_DEFAULT
 
@@ -495,7 +495,7 @@ def test_resolve_always_includes_baseline():
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
         # Defaults (no file at all): the baseline rides along.
-        assert store.resolve("!room:x", "@u:x") >= reactive.BASELINE_TOOLS
+        assert store.resolve("!room:x", "@u:x") >= reactive.ALWAYS_GRANTED
         store.write(
             {
                 "default_capabilities": ["escalate"],
@@ -504,24 +504,24 @@ def test_resolve_always_includes_baseline():
         )
         # An explicit channel grant: the baseline is unioned in, not replaced.
         granted = store.resolve("!granted:x", "@u:x")
-        assert granted >= reactive.BASELINE_TOOLS
+        assert granted >= reactive.ALWAYS_GRANTED
         assert "post_message" in granted
         # A channel narrowed to an empty grant keeps exactly the baseline —
         # a gated turn never loses its identity/self-context tools.
-        assert store.resolve("!narrow:x", "@u:x") == reactive.ALWAYS_GRANTED
+        assert store.resolve("!narrow:x", "@u:x") == reactive.UNGATEABLE
         # And so does a narrowed global default.
-        assert store.resolve("!other:x", "@u:x") >= reactive.BASELINE_TOOLS
+        assert store.resolve("!other:x", "@u:x") >= reactive.ALWAYS_GRANTED
 
 
 def test_capability_hint_baseline_only():
     # A channel granted nothing still resolves to the baseline; the hint must
     # say plainly that the agent can orient itself but take no channel action,
     # while still naming exactly the permitted tools (hint == gate).
-    h = reactive.capability_hint(reactive.ALWAYS_GRANTED)
+    h = reactive.capability_hint(reactive.UNGATEABLE)
     assert "no capabilities beyond" in h
     # hint == gate: every always-granted name is listed, so the agent is never
     # steered away from a tool it is in fact allowed to use.
-    for tool in reactive.ALWAYS_GRANTED:
+    for tool in reactive.UNGATEABLE:
         assert tool in h
     assert "will be refused" in h
 
@@ -530,7 +530,7 @@ def test_core_and_bridge_tools_survive_every_grant():
     """No policy can revoke orientation or the deferred-tool bridge.
 
     The regression this pins: `list_channels` belongs to no builtin bundle, so
-    before ALWAYS_GRANTED a channel granted EVERY row the app offers still had
+    before this floor a channel granted EVERY row the app offers still had
     it refused by the gate — an agent that cannot enumerate its own channels
     cannot act in any of them, and no grant the UI can express fixed it.
     """
@@ -552,26 +552,29 @@ def test_core_and_bridge_tools_survive_every_grant():
         ):
             store.write(policy)
             allowed = store.resolve("!room:x", "@u:x")
-            missing = reactive.ALWAYS_GRANTED - allowed
+            missing = reactive.UNGATEABLE - allowed
             assert not missing, f"{policy} dropped {sorted(missing)}"
             # And the gate agrees, since it is a pure function of that set.
-            for tool in reactive.ALWAYS_GRANTED:
+            for tool in reactive.UNGATEABLE:
                 assert not reactive.capability_denies(allowed, tool)
 
 
-def test_always_granted_is_baseline_plus_core_plus_bridge():
-    # The three groups stay distinct (different reasons, different mirrors:
-    # the server mirrors baseline+core, and never sees the bridge tools).
-    assert reactive.ALWAYS_GRANTED == (
-        reactive.BASELINE_TOOLS | reactive.CORE_TOOLS | reactive.BRIDGE_TOOLS
-    )
-    assert not (reactive.BASELINE_TOOLS & reactive.CORE_TOOLS)
-    assert not (reactive.CORE_TOOLS & reactive.BRIDGE_TOOLS)
-    # An always-granted tool must never also be a bundle member: that would
-    # imply a switch which cannot turn it off.
-    members = {m for ms in reactive.BUILTIN_BUNDLES.values() for m in ms}
-    assert not (reactive.CORE_TOOLS & members)
-    assert not (reactive.BRIDGE_TOOLS & members)
+def test_the_gates_floor_is_the_mirrored_set_plus_the_bridge():
+    # ALWAYS_GRANTED is the Filament floor the server mirrors byte for byte;
+    # BRIDGE_TOOLS is this process's own machinery, which the server never
+    # sees. They stay separate so the two vocabularies can be compared.
+    assert reactive.UNGATEABLE == reactive.ALWAYS_GRANTED | reactive.BRIDGE_TOOLS
+    assert not (reactive.ALWAYS_GRANTED & reactive.BRIDGE_TOOLS)
+    # Nothing on the floor may also be a grantable ROW: a row is a switch, and
+    # that switch could never turn it off. (The deprecated aliases are exempt —
+    # frozen historical names with no switch, and they have always named
+    # get_self and mark_read.)
+    rows = {
+        m
+        for name in reactive.DEFAULT_CAPABILITIES
+        for m in reactive.BUILTIN_BUNDLES[name]
+    }
+    assert not (reactive.UNGATEABLE & rows)
 
 
 def test_mcp_auto_bundle_expands_via_injected_lookup():
@@ -623,7 +626,7 @@ def test_resolve_expands_mcp_grants_alongside_bundles():
         without = store.resolve("!room:x", "@u:x")
         assert "create_issue" not in without
         assert "post_message" in without
-        assert without >= reactive.BASELINE_TOOLS
+        assert without >= reactive.ALWAYS_GRANTED
 
 
 # ── Feature flags ────────────────────────────────────────────────────
@@ -678,7 +681,7 @@ def test_resolve_survives_malformed_policy():
             }
         )
         allowed = store.resolve("!room:x", "@u:x")  # must not raise
-        assert allowed == reactive.ALWAYS_GRANTED
+        assert allowed == reactive.UNGATEABLE
         # A malformed (non-list) channel entry reads as absent — the default
         # still applies rather than the turn crashing or the entry "winning".
         store.write(
