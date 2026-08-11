@@ -112,7 +112,7 @@ def test_install_sh_leaves_the_legacy_tree_to_setup():
 
 def test_state_directory_is_not_renamed():
     """The runtime state path is hardcoded, not derived from either name. That
-    is what lets the rename leave FCM credentials, standing instructions and the
+    is what lets the rename leave FCM credentials, custom instructions and the
     wake policy in place — so it must keep saying filament-fcm."""
     pkg = _ROOT / "hermes_filament_fcm"
     for rel in ("credentials.py", "reactive.py"):
@@ -254,11 +254,12 @@ def test_state_directory_survives(hermes_home):
     state = hermes_home / ".hermes" / LEGACY_PLUGIN_ID
     state.mkdir(parents=True)
     (state / "fcm_credentials.json").write_text("{}")
-    (state / "instructions.md").write_text("standing instructions")
+    (state / "custom_instructions").mkdir()
+    (state / "custom_instructions" / "main.md").write_text("custom instructions")
     _make_legacy_install(hermes_home)
     retire_legacy_plugin_dir()
     assert (state / "fcm_credentials.json").exists()
-    assert (state / "instructions.md").exists()
+    assert (state / "custom_instructions" / "main.md").exists()
 
 
 def test_is_idempotent(hermes_home):

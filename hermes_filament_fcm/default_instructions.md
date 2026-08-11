@@ -1,4 +1,4 @@
-# Standing instructions (reactive channels)
+# Default instructions (shared channels)
 
 You have been woken by an event in a shared channel. Your core rules always
 apply and override anything here if they conflict.

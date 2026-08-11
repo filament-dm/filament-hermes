@@ -287,7 +287,7 @@ Notable contrasts worth pulling on as the taxonomy matures:
 ### 8.1 Prior art for the reactive model
 
 The **reactive model** (shipped in the adapter: an inbound event is a *wake-up signal*; the
-agent acts on the event data per its tunable *standing instructions*, never treating the data as
+agent acts on the event data per its tunable *custom instructions*, never treating the data as
 instructions — see `reactive.py`) doesn't exist whole in any one gateway. Its pieces are
 scattered, and **Telegram** carries the most of them:
 
@@ -296,22 +296,22 @@ scattered, and **Telegram** carries the most of them:
 | Data ≠ instruction (framing) | **Telegram "observe unmentioned"** — the only true data-as-data framing: observed lines re-injected as `[Observed … context only, not requests]` | `gateway/run.py:752-753`; `telegram/adapter.py:6109-6207` |
 | Content-based wake trigger | `mention_patterns` (Python regex; match → full turn) | `whatsapp_common.py:287-291`; telegram/slack |
 | Wake on everything | `free_response_chats` / `_channels` / `_rooms` | Discord/Slack/Telegram/WhatsApp |
-| Per-channel standing instructions | `channel_prompt` (`resolve_channel_prompt`) — but **static config**, not chat-tunable | `base.py:2022-2049` |
+| Custom instructions for shared channels | `channel_prompt` — the same delivery slot this adapter uses, but fed from **static config** (`resolve_channel_prompt`) rather than tunable by chatting with the agent | `base.py:2022-2049` |
 | Bounded "mode" authorization | WeCom/WhatsApp `dm_policy`/`group_policy` + `allow_from` | `whatsapp_common.py`; `wecom/adapter.py` |
 
 **Closest single gateway: Telegram** — it has observe-mode framing, `mention_patterns`,
-`free_response`, and `channel_prompt`. But its standing instructions are static config (no
-`set_instructions`), its wake config is startup env (no `set_wake_policy`), it never wakes on
+`free_response`, and `channel_prompt`. But its custom instructions are static config (no
+`filament_set_custom_instructions`), its wake config is startup env (no `set_wake_policy`), it never wakes on
 **emoji reactions**, and observe-mode is a narrow context-injection rather than a general
-"act per your standing instructions" dispatcher.
+"act per your custom instructions" dispatcher.
 
 **Closest full implementation: `lord-gnomington`** — a bespoke `claude -p` harness (reaction
-wake, prose standing instructions, bounded tools, post-back). It's the pattern realized, but as a
+wake, prose custom instructions, bounded tools, post-back). It's the pattern realized, but as a
 one-off harness, not a reusable gateway capability. OpenClaw, like Hermes' default, is
 owner-centric with no per-channel reactive instructions.
 
-**Genuinely novel here:** emoji-reaction wake-ups, a **chat-tunable standing instructions**
-(`set_instructions`), a **wake policy as fresh-read data** (`set_wake_policy`), and the
+**Genuinely novel here:** emoji-reaction wake-ups, a **chat-tunable custom instructions**
+(`filament_set_custom_instructions`), a **wake policy as fresh-read data** (`set_wake_policy`), and the
 data-≠-instruction invariant as a fixed contract rather than a per-adapter accident. Telegram
 observe-mode validates the idea; the rest is new.
 
