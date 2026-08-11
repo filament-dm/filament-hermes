@@ -418,7 +418,7 @@ def test_builtin_rows_expand_to_exact_sets():
         }
     )
     assert store.expand_bundle("post") == frozenset(
-        {"post_message", "reply_in_thread", "react", "unreact", "quote"}
+        {"post_message", "reply_in_thread", "react", "unreact", "quote", "rechat"}
     )
     assert store.expand_bundle("directory") == frozenset(
         {"get_user_profile", "search_members"}
@@ -470,7 +470,7 @@ def test_deprecated_aliases_expand_to_exact_original_sets():
 # quote a message and read reaction activity, so the fail-closed DEFAULT
 # profile must be able to as well (the same argument that put download_media
 # in the alias). Mirrors _RESTORED_TO_DEFAULT in the server's test suite.
-_RESTORED_TO_DEFAULT = frozenset({"quote", "list_reactions"})
+_RESTORED_TO_DEFAULT = frozenset({"quote", "rechat", "list_reactions"})
 
 
 def test_new_default_matches_old_messaging_escalate_default():

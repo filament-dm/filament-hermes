@@ -670,8 +670,11 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
         "reply_in_thread",
         "react",
         "unreact",
-        # A quote is a message that re-surfaces another one — posting.
+        # A quote re-surfaces a message in place; a rechat carries one into
+        # another channel. Both are posting, and rechat is gated on the
+        # channel it lands in.
         "quote",
+        "rechat",
     ],
     # Look up who people are.
     "directory": [
