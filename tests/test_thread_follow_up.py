@@ -137,8 +137,17 @@ def _thread_with(sender: str, event_id: str, is_agent: bool) -> dict:
     }
 
 
+class _NoopServerConfig:
+    """Server-config sync stub: the turn path awaits sync() before reading the
+    stores fresh; these tests exercise the thread-wake rule only."""
+
+    async def sync(self, *, force=False):
+        return None
+
+
 def _make_adapter(tmp: Path, thread: dict | None):
     a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)
+    a._server_config = _NoopServerConfig()
     a._user_id = _AGENT
     a._cc_room_id = None
     a._wake_policy = reactive.WakePolicyStore(tmp / "wake.json")
