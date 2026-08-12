@@ -249,6 +249,20 @@ def test_breadcrumb_consults_cursor_only_under_shared_sessions():
 
 
 
+def test_decoupled_keying_engages_cursor_on_default_style():
+    # The phase-2 chain: with shared keying effective, a top-level wake on
+    # a default ("thread") channel keys to the channel conversation, so
+    # the cursor may record — the engagement condition is gone.
+    keying, anchor = reactive.keying_and_reply(None, "$trig", "thread", True)
+    assert keying is None and anchor == "$trig"
+    assert reactive.conversation_key("!r:s", keying) == ("channel", "!r:s")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a = _make(tmp, extra={}, pinned_by_operator=False)
+        _enable(tmp, True)
+        assert a._cursor_channel_for_turn("!r:s", keying) == "!r:s"
+
+
 def test_cursor_recording_scoped_to_shared_session_turns():
     # A cursor asserts "the CHANNEL's conversation has read up to here";
     # only a data turn that IS the channel's shared session may record one.

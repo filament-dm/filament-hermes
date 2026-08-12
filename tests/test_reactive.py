@@ -169,6 +169,41 @@ def _msg(event_id, sender="@x:s", is_from_self=False, type="m.room.message"):
             "type": type}
 
 
+def test_keying_and_reply_decouples_identity_from_placement():
+    kar = reactive.keying_and_reply
+    # A real thread reply: identity and placement are the thread, always.
+    for style in ("thread", "channel"):
+        for shared in (False, True):
+            assert kar("$t", "$trig", style, shared) == ("$t", "$t")
+    # Top-level, "thread" style, shared OFF: the legacy fold — the invented
+    # reply root is also the conversation. Byte-identical to old behavior.
+    assert kar(None, "$trig", "thread", False) == ("$trig", "$trig")
+    # Top-level, "thread" style, shared ON: the decouple. The reply still
+    # threads under the trigger, but the turn joins the CHANNEL
+    # conversation (keying None).
+    assert kar(None, "$trig", "thread", True) == (None, "$trig")
+    # Top-level, "channel" style: reply posts top-level, channel keying,
+    # with or without shared keying.
+    assert kar(None, "$trig", "channel", False) == (None, None)
+    assert kar(None, "$trig", "channel", True) == (None, None)
+
+
+def test_reply_thread_for_send_routing():
+    rtfs = reactive.reply_thread_for_send
+    # Explicit metadata thread always wins.
+    assert rtfs("$meta", ("!r:s", "$anchor"), "!r:s") == "$meta"
+    # No metadata: the turn's anchor applies, but only for its own room.
+    assert rtfs(None, ("!r:s", "$anchor"), "!r:s") == "$anchor"
+    assert rtfs(None, ("!other:s", "$anchor"), "!r:s") is None
+    # Nothing at all → top-level post.
+    assert rtfs(None, None, "!r:s") is None
+
+
+def test_reply_anchor_defaults_to_none():
+    # Outside a data turn nothing may thread a send implicitly.
+    assert reactive.current_reply_anchor.get() is None
+
+
 def test_conversation_key_rule():
     # The session-scope rule: a thread turn joins the thread (root +
     # replies); a top-level turn joins the channel (top-level messages).

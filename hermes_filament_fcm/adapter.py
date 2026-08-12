@@ -77,6 +77,9 @@ from .reactive import (
     principal_note,
     sender_is_agent_in_thread,
     conversation_key,
+    current_reply_anchor,
+    keying_and_reply,
+    reply_thread_for_send,
 )
 from .server_config import ServerConfigSync
 from .update_check import UpdateChecker, build_reminder, update_check_disabled
@@ -1338,7 +1341,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             call_origin="adapter_send",
         ):
             try:
-                thread_id = (metadata or {}).get("thread_id") if metadata else None
+                thread_id = reply_thread_for_send(
+                    (metadata or {}).get("thread_id") if metadata else None,
+                    current_reply_anchor.get(),
+                    chat_id,
+                )
                 slog.info(
                     "filament_fcm.send.start",
                     installation_id=self._installation_id,
@@ -1746,10 +1753,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # an existing thread stays threaded. Resolving to None here (rather than
         # coaxing the model to call post_message) is what makes main-timeline
         # replies reliable: send() already routes None → post_message.
-        if self._wake_policy.reply_style(msg.room_id) == "channel":
-            thread_id = msg.thread_id
-        else:
-            thread_id = msg.thread_id or msg.event_id
+        keying_thread, reply_anchor = keying_and_reply(
+            msg.thread_id,
+            msg.event_id,
+            self._wake_policy.reply_style(msg.room_id),
+            self._shared_sessions_effective(),
+        )
         await self._wake(
             channel=msg.room_id,
             channel_name=msg.room_name,
@@ -1760,7 +1769,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # mention-only one — is never mistaken for a reaction in _wake.
             data=data,
             target_event_id=msg.event_id,
-            thread_id=thread_id,
+            thread_id=keying_thread,
+            reply_anchor=reply_anchor,
             raw=msg.raw,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
@@ -1955,6 +1965,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # A backchannel turn is never a channel's shared session: its reads
         # must not mark any channel's conversation as caught up.
         current_cursor_channel.set(None)
+        current_reply_anchor.set(None)
         # Applied synchronously right before dispatch: the base adapter
         # derives the session key at handle_message entry, so no await can
         # interleave a flag toggle between decision and use — and the
@@ -2245,6 +2256,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             trigger="reaction",
             key=reaction.key,
         )
+        # A reaction's reply always anchors to the reacted message.
+        keying_thread, reply_anchor = keying_and_reply(
+            reaction.thread_id,
+            reaction.target_event_id,
+            "thread",
+            self._shared_sessions_effective(),
+        )
         await self._wake(
             channel=reaction.room_id,
             channel_name=reaction.room_name,
@@ -2253,7 +2271,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             trigger=f"{reaction.key} reaction",
             data=None,
             target_event_id=reaction.target_event_id,
-            thread_id=reaction.thread_id or reaction.target_event_id,
+            thread_id=keying_thread,
+            reply_anchor=reply_anchor,
             raw=reaction.raw,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
@@ -2270,6 +2289,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         target_event_id: str,
         thread_id: str | None,
         raw: dict | None,
+        reply_anchor: str | None = None,
     ) -> None:
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + any per-channel guidance + the event data,
@@ -2417,6 +2437,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # session that never saw the messages.
         current_cursor_channel.set(
             self._cursor_channel_for_turn(channel, thread_id)
+        )
+        # send() threads the reply under the anchor; the session key never
+        # sees it.
+        current_reply_anchor.set(
+            (channel, reply_anchor)
+            if reply_anchor and reply_anchor != thread_id
+            else None
         )
         # Same last-moment keying application as the control path.
         self._apply_session_keying()

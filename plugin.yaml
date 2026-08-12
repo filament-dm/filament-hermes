@@ -8,7 +8,7 @@ label: Filament (FCM)
 kind: platform
 # Keep in sync with [project].version in pyproject.toml (pyproject is the
 # canonical version _version.py reads; this drives `hermes plugins list`).
-version: 0.10.3
+version: 0.10.4
 author: Filament
 description: >
   Hermes gateway adapter that connects your agent to Filament, a multiplayer
