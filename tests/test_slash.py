@@ -1102,11 +1102,15 @@ def test_render_tools_list_shows_full_catalog():
     assert "`mcp:linear` (62 tools)" in text
     assert "mcp:gcal" in text
     # The runtime-plugin section spells out the semantic and the counts
-    # (singular/plural per count).
+    # (singular/plural per count). These are grantable per channel as
+    # toolset:<name>, so the copy has to offer that rather than call them
+    # blocked — the gate is gateway-wide, and a toolset with no grant
+    # spelling is one the feature removes with no way to restore it.
     assert "**Runtime plugins on this agent's host**" in text
     assert (
-        "available in the backchannel; blocked in shared channels while "
-        "enforcement is on: spotify (7 tools), terminal (1 tool)" in text
+        "always available in the backchannel; grant per channel by name "
+        "(e.g. `#channel spotify on`): spotify (7 tools), terminal (1 tool)"
+        in text
     )
     # The change example uses the new form and a real channel.
     assert "`/fil-config #welcome linear off`" in text
@@ -1572,3 +1576,32 @@ def test_md_escape_neutralizes_pre_escaped_names():
         _tools("post", "revoke", name="\\[urgent\\](https://x)"), {}, {}
     )
     assert "\\[urgent\\](https://x)" not in mutation.reply
+
+
+def test_host_toolsets_are_grantable_targets():
+    """A toolset with no grant spelling is one the feature removes with no way
+    to restore it — the gate is gateway-wide, so the host's own plugins have to
+    be reachable from the same surface a remote MCP server is."""
+    for text, expected in (
+        ("#welcome spotify on", "toolset:spotify"),
+        ("#welcome toolset:spotify on", "toolset:spotify"),
+        # A remote MCP server still resolves to its own spelling.
+        ("#welcome gcal on", "mcp:gcal"),
+    ):
+        result = slash.parse(
+            f"/fil-config {text}",
+            channels=CHANNELS,
+            mcp_servers={"gcal": 3},
+            other_sources={"spotify": 7, "terminal": 1},
+        )
+        assert isinstance(result, slash.ToolsCommand), (text, result)
+        assert result.target == expected, (text, result.target)
+
+
+def test_host_toolset_grant_compiles_into_the_channel_entry():
+    mutation = slash.apply_tools(_tools("toolset:spotify", "grant"), {}, {})
+    assert mutation.changed
+    granted = mutation.capability_policy["per_channel"]["!welcome:fil"]
+    assert "toolset:spotify" in granted
+    # And it opts into enforcement in the same write, like any other grant.
+    assert mutation.feature_flags.get("advanced_tool_controls") is True

@@ -69,6 +69,8 @@ from dataclasses import dataclass
 ROWS: tuple[str, ...] = ("read_history", "post", "directory", "escalate")
 DEPRECATED_ALIASES: tuple[str, ...] = ("messaging", "readonly")
 MCP_PREFIX = "mcp:"
+# The other reserved auto-bundle spelling: the host's own toolsets.
+TOOLSET_PREFIX = "toolset:"
 # Forces target classification for a bundle whose name collides with a
 # command word ("wake", "on", "list", …): `bundle:wake` is the bundle,
 # bare `wake` is the grammar. Matching-time syntax only — never stored.
@@ -408,7 +410,7 @@ def _channel_entries(
 
 
 def _target_entries(
-    mcp_servers: object, bundles: Iterable[str]
+    mcp_servers: object, bundles: Iterable[str], other_sources: object = ()
 ) -> list[_Entry]:
     entries = [
         _Entry("target", name, name, name)
@@ -428,6 +430,16 @@ def _target_entries(
         entries.append(_Entry("target", canonical.lower(), canonical, canonical))
         # The bare server name matches too: "gcal" → "mcp:gcal".
         entries.append(_Entry("target", str(server).lower(), canonical, canonical))
+    # The host's own toolsets — Hermes' bundled plugins and core tools. Just as
+    # grantable as a remote MCP server (`toolset:<name>`), and named the same
+    # two ways: canonical, and bare ("spotify" → "toolset:spotify").
+    known = {e.key for e in entries}
+    for source in _mcp_names(other_sources):
+        canonical = f"{TOOLSET_PREFIX}{source}"
+        for key in (canonical.lower(), str(source).lower()):
+            if key not in known:
+                entries.append(_Entry("target", key, canonical, canonical))
+                known.add(key)
     return entries
 
 
@@ -753,6 +765,7 @@ def parse(
     bundles: Iterable[str] = (),
     features: Mapping[str, str] | None = None,
     backchannel: tuple[str, str] | None = None,
+    other_sources: object = (),
 ):
     """Parse one backchannel ``/fil-`` message into a structured result.
 
@@ -796,7 +809,7 @@ def parse(
         return _redirect_old(command, rest.strip(), channels)
     bc_entries = _channel_entries([backchannel]) if backchannel else []
     return _parse_config(
-        rest, channels, mcp_servers, bundles, features, bc_entries
+        rest, channels, mcp_servers, bundles, features, bc_entries, other_sources
     )
 
 
@@ -820,6 +833,7 @@ def _parse_config(
     bundles: Iterable[str],
     features: Mapping[str, str],
     backchannel_entries: Sequence[_Entry],
+    other_sources: object = (),
 ):
     toks = _tokenize(rest)
     meaningful = [t for t in toks if t[0].lower() not in FILLER_WORDS]
@@ -901,7 +915,7 @@ def _parse_config(
     entries = (
         chan_entries
         + [_Entry(sub, sub, sub, sub) for sub in _CONFIG_SUBS]
-        + _target_entries(mcp_servers, bundles)
+        + _target_entries(mcp_servers, bundles, other_sources)
         + _verb_entries()
         + [_Entry("mode", m, m, m) for m in ("mention", "all")]
     )
@@ -1667,9 +1681,9 @@ def apply_feature(command: FeatureCommand, feature_flags: dict) -> Mutation:
 
 
 def _runtime_plugins_line(other_sources: object) -> str | None:
-    """The non-switchable in-process toolsets, with the semantic spelled
-    out. ``other_sources`` is a name→tool-count mapping (or a plain name
-    sequence, shown without counts)."""
+    """The host's own toolsets, grantable per channel as ``toolset:<name>``.
+    ``other_sources`` is a name→tool-count mapping (or a plain name sequence,
+    shown without counts)."""
     counts = other_sources if isinstance(other_sources, Mapping) else {}
     shown = []
     for name in sorted(_mcp_names(other_sources)):
@@ -1685,8 +1699,8 @@ def _runtime_plugins_line(other_sources: object) -> str | None:
     if not shown:
         return None
     return (
-        "**Runtime plugins on this agent's host** — available in the "
-        "backchannel; blocked in shared channels while enforcement is on: "
+        "**Runtime plugins on this agent's host** — always available in the "
+        "backchannel; grant per channel by name (e.g. `#channel spotify on`): "
         + ", ".join(shown)
     )
 

@@ -1923,6 +1923,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             bundles=bundles,
             features=KNOWN_FEATURES,
             backchannel=backchannel,
+            # The host's own toolsets are grantable too (`toolset:<name>`), so
+            # they belong in the vocabulary the parser resolves against, not
+            # just in the catalog it renders.
+            other_sources=_other_tool_sources(),
         )
         sections: tuple[str, ...] = ()
         if isinstance(result, slash.HelpRequest):
