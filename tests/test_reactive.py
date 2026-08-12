@@ -238,6 +238,33 @@ def test_capability_hint():
     assert "(none)" in reactive.capability_hint(frozenset())
 
 
+def test_capability_hint_decline_coaching():
+    # Any gated turn excludes tools, so the hint coaches the graceful decline:
+    # say the tool is unavailable here, point at the settings, and never
+    # describe forwarding mechanics or internal instructions.
+    for allowed in (
+        frozenset({"post_message", "get_thread"}),
+        frozenset(),
+        reactive.UNGATEABLE,
+    ):
+        h = reactive.capability_hint(allowed)
+        assert "I don't have that tool in this channel" in h
+        assert "enable it in the agent's settings" in h
+        assert "do not describe forwarding mechanics" in h
+    # Ungated turns get no hint, hence no coaching either.
+    assert reactive.capability_hint(None) == ""
+
+
+def test_capability_hint_derives_only_from_policy():
+    # The hint is a pure function of the policy-resolved set: same set →
+    # byte-identical text, and nothing event-shaped (mxids, room ids) can
+    # appear because no event data is ever passed in.
+    allowed = frozenset({"post_message"})
+    h = reactive.capability_hint(allowed)
+    assert h == reactive.capability_hint(frozenset({"post_message"}))
+    assert "@" not in h and "!" not in h  # no user ids, no room ids
+
+
 def test_expand_bundle_builtin_and_unknown():
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
     messaging = store.expand_bundle("messaging")
@@ -285,8 +312,8 @@ def test_custom_bundle_overrides_builtin():
 def test_resolve_fail_closed_default_for_unlisted():
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
-        # No file at all → the built-in fail-closed default (messaging+escalate),
-        # never full access.
+        # No file at all → the built-in fail-closed default (the grantable
+        # rows: read_history+post+directory+escalate), never full access.
         allowed = store.resolve("!room:x", "@stranger:x")
         assert "post_message" in allowed  # can reply
         assert "message_principal" in allowed  # can escalate
@@ -294,7 +321,58 @@ def test_resolve_fail_closed_default_for_unlisted():
         assert "accept_invite" not in allowed  # cannot join loops
 
 
-def test_resolve_unions_default_channel_and_user_grants():
+def test_resolve_channel_entry_overrides_default():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write(
+            {
+                "default_capabilities": ["messaging", "escalate"],
+                "bundles": {"calendar": ["list_events", "get_event"]},
+                # Narrow one channel, widen another.
+                "per_channel": {
+                    "!quiet:x": ["readonly"],
+                    "!busy:x": ["messaging", "escalate", "calendar"],
+                },
+            }
+        )
+        # Unlisted channel → exactly the default.
+        base = store.resolve("!other:x", "@nobody:x")
+        assert "post_message" in base and "message_principal" in base
+        assert "list_events" not in base
+        # NARROWING — the deterministic proof of override: the channel entry
+        # resolves to strictly LESS than the default. Under union these
+        # default-granted tools could never disappear.
+        quiet = store.resolve("!quiet:x", "@nobody:x")
+        assert "get_thread" in quiet  # readonly can still read
+        assert "post_message" not in quiet  # messaging default is GONE
+        assert "message_principal" not in quiet  # escalate default is GONE
+        # Widening still works: the entry replaces the default with a superset.
+        busy = store.resolve("!busy:x", "@nobody:x")
+        assert "list_events" in busy and "post_message" in busy
+
+
+def test_resolve_empty_channel_entry_narrows_to_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write(
+            {
+                "default_capabilities": ["messaging"],
+                "per_channel": {"!silent:x": []},
+            }
+        )
+        # A present-but-empty entry is a deliberate override to nothing (a
+        # silent-observer channel), not a fall-through to the default — only
+        # the always-kept baseline self-context tools remain.
+        assert store.resolve("!silent:x", "@u:x") == reactive.UNGATEABLE
+        # The default is untouched elsewhere.
+        assert "post_message" in store.resolve("!other:x", "@u:x")
+
+
+def test_resolve_ignores_per_user_grants():
+    # The headline regression test for channel-scoped resolution: a sender
+    # with a personal grant gets exactly the channel resolution — per_user
+    # stays in the document (set_capabilities may still write it) but it
+    # never changes what a turn may call.
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
         store.write(
@@ -308,27 +386,317 @@ def test_resolve_unions_default_channel_and_user_grants():
                 "per_user": {"@vip:x": ["notes"]},
             }
         )
-        # Unlisted channel/user → only the default (readonly), no calendar.
-        base = store.resolve("!other:x", "@nobody:x")
-        assert "get_thread" in base and "list_events" not in base
-        # Channel grant adds calendar (union with default).
-        in_room = store.resolve("!room:x", "@nobody:x")
-        assert "list_events" in in_room and "get_thread" in in_room
-        assert "write_note" not in in_room
-        # A VIP user in that same room gets default + channel + user (union).
+        # In the listed channel, VIP and nobody resolve identically.
         vip = store.resolve("!room:x", "@vip:x")
-        assert {"get_thread", "list_events", "write_note"}.issubset(vip)
+        nobody = store.resolve("!room:x", "@nobody:x")
+        assert vip == nobody
+        assert "list_events" in vip and "write_note" not in vip
+        # In an unlisted channel too: default only, no personal grant.
+        vip_elsewhere = store.resolve("!other:x", "@vip:x")
+        assert "get_thread" in vip_elsewhere and "write_note" not in vip_elsewhere
+        # The map itself is preserved on disk — deferred, not removed.
+        assert store.read()["per_user"] == {"@vip:x": ["notes"]}
+
+
+def test_resolve_unknown_bundle_in_channel_entry_grants_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write(
+            {
+                "default_capabilities": ["messaging"],
+                "per_channel": {"!room:x": ["no_such_bundle"]},
+            }
+        )
+        # The entry overrides the default, and its unknown bundle expands to
+        # nothing — fail closed, never a fall-back to the wider default. Only
+        # the baseline rides along.
+        assert store.resolve("!room:x", "@u:x") == reactive.UNGATEABLE
 
 
 def test_resolve_empty_default_is_silent_observer():
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
         store.write({"default_capabilities": []})
-        # Principal chose a pure observer posture: no tools at all for unlisted
-        # turns. capability_denies then blocks every call.
+        # Principal chose a pure observer posture: nothing beyond the baseline
+        # self-context tools for unlisted turns. capability_denies then blocks
+        # every channel-action call.
         allowed = store.resolve("!room:x", "@x:x")
-        assert allowed == frozenset()
+        assert allowed == reactive.UNGATEABLE
         assert reactive.capability_denies(allowed, "get_thread") is True
+        assert reactive.capability_denies(allowed, "post_message") is True
+
+
+# ── Bundle recut: rows, aliases, baseline, auto-bundles ──────────────
+
+
+def test_builtin_rows_expand_to_exact_sets():
+    # Each grantable builtin bundle is one row in the Filament app's
+    # capability UI — its membership is a user-facing contract, pinned
+    # literally so a drive-by edit can't silently change what a row grants.
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    assert store.expand_bundle("read_history") == frozenset(
+        {
+            "get_recent_messages",
+            "get_thread",
+            "search_messages",
+            "list_mentions",
+            "download_media",
+            "list_reactions",
+        }
+    )
+    assert store.expand_bundle("post") == frozenset(
+        {"post_message", "reply_in_thread", "react", "unreact", "quote", "rechat"}
+    )
+    assert store.expand_bundle("directory") == frozenset(
+        {"get_user_profile", "search_members"}
+    )
+    assert store.expand_bundle("escalate") == frozenset({"message_principal"})
+
+
+def test_deprecated_aliases_expand_to_exact_original_sets():
+    # Server-held policy documents still grant these names, so the literal
+    # sets below — their original member lists — must never drift, and must
+    # never be redefined via @includes of the row bundles.
+    #
+    # One exception, already taken: the directory search was listed under the
+    # legacy "search_user_profiles" spelling, which no tool is registered
+    # under, so it granted nothing on either enforcer. Correcting it to
+    # "search_members" changes what the alias ENFORCES, not what it meant.
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    assert store.expand_bundle("messaging") == frozenset(
+        {
+            "get_self",
+            "get_recent_messages",
+            "get_thread",
+            "get_user_profile",
+            "search_messages",
+            "search_members",
+            "list_mentions",
+            "react",
+            "unreact",
+            "mark_read",
+            "post_message",
+            "reply_in_thread",
+            "download_media",
+        }
+    )
+    assert store.expand_bundle("readonly") == frozenset(
+        {
+            "get_self",
+            "get_recent_messages",
+            "get_thread",
+            "get_user_profile",
+            "search_messages",
+            "list_mentions",
+        }
+    )
+
+
+# Tools the frozen "messaging" alias never named, restored to the rows because
+# the feature was silently taking them away: an ungated agent could always
+# quote a message and read reaction activity, so the fail-closed DEFAULT
+# profile must be able to as well (the same argument that put download_media
+# in the alias). Mirrors _RESTORED_TO_DEFAULT in the server's test suite.
+_RESTORED_TO_DEFAULT = frozenset({"quote", "rechat", "list_reactions"})
+
+
+def test_new_default_matches_old_messaging_escalate_default():
+    # The no-silent-drift proof for the bundle recut: the new default rows
+    # grant everything ["messaging", "escalate"] granted — nothing was lost —
+    # plus exactly the deliberately restored pair. Asserting both directions
+    # means any OTHER addition fails here.
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    # Unioned on both sides because the frozen alias still names get_self and
+    # mark_read, which the rows deliberately left to the floor — the
+    # comparison is about what a turn can CALL, not which list names it.
+    new = (
+        store.expand_capabilities(list(reactive.DEFAULT_CAPABILITIES))
+        | reactive.UNGATEABLE
+    )
+    old = store.expand_capabilities(["messaging", "escalate"]) | reactive.UNGATEABLE
+    assert not (old - new), "the recut default lost a tool"
+    assert new - old == _RESTORED_TO_DEFAULT
+
+
+def test_resolve_always_includes_baseline():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        # Defaults (no file at all): the baseline rides along.
+        assert store.resolve("!room:x", "@u:x") >= reactive.ALWAYS_GRANTED
+        store.write(
+            {
+                "default_capabilities": ["escalate"],
+                "per_channel": {"!narrow:x": [], "!granted:x": ["post"]},
+            }
+        )
+        # An explicit channel grant: the baseline is unioned in, not replaced.
+        granted = store.resolve("!granted:x", "@u:x")
+        assert granted >= reactive.ALWAYS_GRANTED
+        assert "post_message" in granted
+        # A channel narrowed to an empty grant keeps exactly the baseline —
+        # a gated turn never loses its identity/self-context tools.
+        assert store.resolve("!narrow:x", "@u:x") == reactive.UNGATEABLE
+        # And so does a narrowed global default.
+        assert store.resolve("!other:x", "@u:x") >= reactive.ALWAYS_GRANTED
+
+
+def test_capability_hint_baseline_only():
+    # A channel granted nothing still resolves to the baseline; the hint must
+    # say plainly that the agent can orient itself but take no channel action,
+    # while still naming exactly the permitted tools (hint == gate).
+    h = reactive.capability_hint(reactive.UNGATEABLE)
+    assert "no capabilities beyond" in h
+    # hint == gate: every always-granted name is listed, so the agent is never
+    # steered away from a tool it is in fact allowed to use.
+    for tool in reactive.UNGATEABLE:
+        assert tool in h
+    assert "will be refused" in h
+
+
+def test_core_and_bridge_tools_survive_every_grant():
+    """No policy can revoke orientation or the deferred-tool bridge.
+
+    The regression this pins: `list_channels` belongs to no builtin bundle, so
+    before this floor a channel granted EVERY row the app offers still had
+    it refused by the gate — an agent that cannot enumerate its own channels
+    cannot act in any of them, and no grant the UI can express fixed it.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        for policy in (
+            {},                                                   # unauthored
+            {"default_capabilities": []},                         # empty default
+            {"default_capabilities": list(reactive.DEFAULT_CAPABILITIES)},
+            {"default_capabilities": ["typo_bundle"]},            # unknown name
+            {                                                     # narrowed channel
+                "default_capabilities": ["read_history", "post"],
+                "per_channel": {"!room:x": []},
+            },
+            {                                                     # custom bundle
+                "bundles": {"list_channels": ["nothing"]},        # shadowing attempt
+                "default_capabilities": ["list_channels"],
+            },
+        ):
+            store.write(policy)
+            allowed = store.resolve("!room:x", "@u:x")
+            missing = reactive.UNGATEABLE - allowed
+            assert not missing, f"{policy} dropped {sorted(missing)}"
+            # And the gate agrees, since it is a pure function of that set.
+            for tool in reactive.UNGATEABLE:
+                assert not reactive.capability_denies(allowed, tool)
+
+
+def test_the_gates_floor_is_the_mirrored_set_plus_the_bridge():
+    # ALWAYS_GRANTED is the Filament floor the server mirrors byte for byte;
+    # BRIDGE_TOOLS is this process's own machinery, which the server never
+    # sees. They stay separate so the two vocabularies can be compared.
+    assert reactive.UNGATEABLE == reactive.ALWAYS_GRANTED | reactive.BRIDGE_TOOLS
+    assert not (reactive.ALWAYS_GRANTED & reactive.BRIDGE_TOOLS)
+    # Nothing on the floor may also be a grantable ROW: a row is a switch, and
+    # that switch could never turn it off. (The deprecated aliases are exempt —
+    # frozen historical names with no switch, and they have always named
+    # get_self and mark_read.)
+    rows = {
+        m
+        for name in reactive.DEFAULT_CAPABILITIES
+        for m in reactive.BUILTIN_BUNDLES[name]
+    }
+    assert not (reactive.UNGATEABLE & rows)
+
+
+def test_mcp_auto_bundle_expands_via_injected_lookup():
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    seen: list[str] = []
+
+    def lookup(toolset):
+        seen.append(toolset)
+        return ["create_issue", "list_issues"] if toolset == "mcp-linear" else []
+
+    assert store.expand_bundle("mcp:linear", toolset_tools=lookup) == frozenset(
+        {"create_issue", "list_issues"}
+    )
+    # The grant spelling maps onto Hermes toolset naming: mcp:<server> asks
+    # the lookup for toolset "mcp-<server>".
+    assert seen == ["mcp-linear"]
+    # @include composes an auto-bundle into a custom bundle too.
+    policy = {"bundles": {"pm": ["@mcp:linear", "post_message"]}}
+    pm = store.expand_bundle("pm", policy, toolset_tools=lookup)
+    assert "create_issue" in pm and "post_message" in pm
+
+
+def test_toolset_auto_bundle_grants_any_registered_toolset():
+    """The gate is gateway-wide, so a grant spelling has to exist for every
+    toolset the engine registers — not just remote MCP servers. Hermes'
+    bundled plugins (spotify, web) and its core tools (terminal) had none, so
+    enabling the feature removed them with no way to grant them back.
+    """
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    calls = []
+
+    def lookup(toolset):
+        calls.append(toolset)
+        return {"spotify": ["spotify_search", "spotify_playback"]}.get(toolset, [])
+
+    assert store.expand_bundle("toolset:spotify", toolset_tools=lookup) == frozenset(
+        {"spotify_search", "spotify_playback"}
+    )
+    # toolset:<name> asks for exactly that toolset; mcp:<server> still asks for
+    # "mcp-<server>", so the two spellings stay distinguishable.
+    assert calls == ["spotify"]
+    assert reactive.auto_bundle_toolset("mcp:linear") == "mcp-linear"
+    assert reactive.auto_bundle_toolset("toolset:spotify") == "spotify"
+    assert reactive.auto_bundle_toolset("read_history") is None
+    # A prefix with nothing after it is not a lookup for the empty toolset.
+    assert reactive.auto_bundle_toolset("toolset:") is None
+    assert reactive.is_auto_bundle_name("toolset:") is True
+
+
+def test_toolset_auto_bundle_fails_closed():
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    # No lookup at all (a non-Hermes context) grants nothing.
+    assert store.expand_bundle("toolset:spotify") == frozenset()
+    # Unknown toolset grants nothing rather than everything.
+    assert (
+        store.expand_bundle("toolset:nope", toolset_tools=lambda ts: [])
+        == frozenset()
+    )
+
+    def boom(_ts):
+        raise RuntimeError("registry down")
+
+    assert store.expand_bundle("toolset:spotify", toolset_tools=boom) == frozenset()
+
+
+def test_mcp_auto_bundle_fails_closed():
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    # No lookup injected (a non-Hermes caller) → nothing.
+    assert store.expand_bundle("mcp:linear") == frozenset()
+    # Unknown server (lookup finds no such toolset) → nothing.
+    assert store.expand_bundle("mcp:nope", toolset_tools=lambda ts: []) == frozenset()
+
+    # A lookup that raises → nothing, never a crash into the turn.
+    def boom(toolset):
+        raise RuntimeError("registry unavailable")
+
+    assert store.expand_bundle("mcp:linear", toolset_tools=boom) == frozenset()
+
+
+def test_resolve_expands_mcp_grants_alongside_bundles():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
+        store.write({"per_channel": {"!room:x": ["post", "mcp:linear"]}})
+
+        def lookup(toolset):
+            return ["create_issue"] if toolset == "mcp-linear" else []
+
+        allowed = store.resolve("!room:x", "@u:x", toolset_tools=lookup)
+        assert "create_issue" in allowed and "post_message" in allowed
+        # Without a lookup the auto-bundle contributes nothing — the rest of
+        # the grant (and the baseline) still stands.
+        without = store.resolve("!room:x", "@u:x")
+        assert "create_issue" not in without
+        assert "post_message" in without
+        assert without >= reactive.ALWAYS_GRANTED
 
 
 # ── Feature flags ────────────────────────────────────────────────────
@@ -363,7 +731,10 @@ def test_feature_flag_set_preserves_other_flags():
 def test_messaging_bundle_includes_download_media():
     # The fail-closed default must be able to fetch attachments, or enabling the
     # feature would regress media handling vs an ungated (flag-off) agent.
+    # read_history carries it for the current default rows; the deprecated
+    # messaging alias keeps it for old server-held documents.
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    assert "download_media" in store.expand_bundle("read_history")
     assert "download_media" in store.expand_bundle("messaging")
 
 
@@ -380,7 +751,16 @@ def test_resolve_survives_malformed_policy():
             }
         )
         allowed = store.resolve("!room:x", "@u:x")  # must not raise
-        assert allowed == frozenset()
+        assert allowed == reactive.UNGATEABLE
+        # A malformed (non-list) channel entry reads as absent — the default
+        # still applies rather than the turn crashing or the entry "winning".
+        store.write(
+            {
+                "default_capabilities": ["messaging"],
+                "per_channel": {"!room:x": 42},
+            }
+        )
+        assert "post_message" in store.resolve("!room:x", "@u:x")
 
 
 def test_deep_acyclic_bundle_chain_not_truncated():
@@ -399,6 +779,28 @@ def test_deep_acyclic_bundle_chain_not_truncated():
 def test_advanced_tool_controls_is_a_known_feature():
     # The tool layer offers exactly the flags the code checks.
     assert reactive.FEATURE_ADVANCED_TOOL_CONTROLS in reactive.KNOWN_FEATURES
+
+
+def test_principal_note_exact_server_id_match_only():
+    note = reactive.principal_note("@irena:filament.dm", "@irena:filament.dm")
+    assert note == "Note: the sender of this message is your principal."
+    # Any other sender → no note.
+    assert reactive.principal_note("@mallory:filament.dm", "@irena:filament.dm") == ""
+    # A display name equal to the owner's id must NOT match — the comparison
+    # is server-attributed ids only, or anyone could rename themselves into
+    # the principal line.
+    assert reactive.principal_note("Irena Wang", "@irena:filament.dm") == ""
+    # Near-miss ids (case, whitespace) are not the principal either.
+    assert reactive.principal_note("@Irena:filament.dm", "@irena:filament.dm") == ""
+    assert reactive.principal_note("@irena:filament.dm ", "@irena:filament.dm") == ""
+
+
+def test_principal_note_fails_closed_when_ids_unknown():
+    # Unknown owner (get_self not completed) or missing sender → never a note.
+    assert reactive.principal_note("@irena:filament.dm", None) == ""
+    assert reactive.principal_note(None, "@irena:filament.dm") == ""
+    assert reactive.principal_note("", "") == ""
+    assert reactive.principal_note(None, None) == ""
 
 
 # ── Engaged-thread wake (ENG-724) ───────────────────────────────────
@@ -511,6 +913,65 @@ def test_sender_is_agent_in_thread_unknown_is_none():
     )
 
 
+def test_flag_off_turn_stays_ungated():
+    # With the feature flag off the adapter never calls resolve: it leaves
+    # current_capabilities None, and None never denies — a fresh install
+    # behaves identically regardless of what the policy file says.
+    with tempfile.TemporaryDirectory() as d:
+        flags = reactive.FeatureFlagStore(Path(d) / "feature_flags.json")
+        assert flags.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
+        assert reactive.capability_denies(None, "set_profile") is False
+        assert reactive.capability_hint(None) == ""
+
+
+def test_channel_instructions_missing_file_reads_empty():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelInstructionsStore(Path(d) / "channel_instructions.json")
+        # No file → no guidance for any channel, never an exception.
+        assert store.read() == {}
+        assert store.get("!room:example.org") == ""
+        assert store.get(None) == ""
+
+
+def test_channel_instructions_roundtrip_and_per_channel_lookup():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "channel_instructions.json"
+        store = reactive.ChannelInstructionsStore(path)
+        store.write({"!a:x": "Answer in French.", "!b:x": "Be terse."})
+        # Written atomically as JSON; a fresh store reads the same mapping.
+        store2 = reactive.ChannelInstructionsStore(path)
+        assert store2.get("!a:x") == "Answer in French."
+        assert store2.get("!b:x") == "Be terse."
+        assert store2.get("!other:x") == ""
+        # No temp-file droppings from the atomic write.
+        assert [p.name for p in Path(d).iterdir()] == ["channel_instructions.json"]
+
+
+def test_channel_instructions_malformed_file_fails_closed():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "channel_instructions.json"
+        store = reactive.ChannelInstructionsStore(path)
+        # Not JSON at all → empty, no raise.
+        path.write_text("{not json")
+        assert store.get("!a:x") == ""
+        # JSON but not an object → empty.
+        path.write_text('["!a:x"]')
+        assert store.read() == {}
+        # An object with a non-string value → that channel reads as absent.
+        path.write_text('{"!a:x": 42, "!b:x": "real guidance"}')
+        assert store.get("!a:x") == ""
+        assert store.get("!b:x") == "real guidance"
+
+
+def test_guidance_block_empty_and_verbatim():
+    # Empty guidance → no block at all (no empty header in the envelope).
+    assert reactive.guidance_block("") == ""
+    block = reactive.guidance_block("Answer in French.\nKeep replies short.")
+    assert block.startswith("[YOUR GUIDANCE FOR THIS CHANNEL]\n")
+    # The principal's text rides verbatim — no reformatting, no interpolation.
+    assert block.endswith("Answer in French.\nKeep replies short.")
+
+
 def _run() -> None:
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
@@ -521,3 +982,47 @@ def _run() -> None:
 
 if __name__ == "__main__":
     _run()
+
+
+def test_capability_hint_principal_aware_decline():
+    allowed = frozenset({"get_recent_messages"}) | reactive.UNGATEABLE
+    third = reactive.capability_hint(allowed)
+    second = reactive.capability_hint(allowed, sender_is_principal=True)
+    assert "only your principal can enable it" in third
+    assert "never tell them 'you can enable it'" in third
+    # Direct second-person coaching toward the principal: a complete
+    # sentence, no third-person "they can".
+    assert (
+        'tell them plainly: "you can enable it for this channel '
+        'in my settings"' in second
+    )
+    assert "that they can enable" not in second
+    assert "your principal can enable it" not in second
+    # Ungated turns still produce no hint regardless of the flag.
+    assert reactive.capability_hint(None, sender_is_principal=True) == ""
+
+
+def test_expand_bundle_deep_chain_no_recursion_error():
+    depth = 5000
+    bundles = {f"b{i}": [f"@b{i + 1}"] for i in range(depth)}
+    bundles[f"b{depth}"] = ["leaf_tool"]
+    store = reactive.CapabilityPolicyStore(Path("/nonexistent"))
+    policy = {"bundles": bundles}
+    tools = store.expand_bundle("b0", policy)
+    assert tools == frozenset({"leaf_tool"})
+
+
+def test_expand_bundle_diamond_expands_once_cycle_still_nothing():
+    store = reactive.CapabilityPolicyStore(Path("/nonexistent"))
+    policy = {
+        "bundles": {
+            "top": ["@left", "@right"],
+            "left": ["@base", "l"],
+            "right": ["@base", "r"],
+            "base": ["deep"],
+            "loop": ["@loop", "x"],
+        }
+    }
+    assert store.expand_bundle("top", policy) == frozenset({"l", "r", "deep"})
+    # A self-cycle still grants only its non-cyclic members.
+    assert store.expand_bundle("loop", policy) == frozenset({"x"})

@@ -45,13 +45,16 @@ from .reactive import (
     FEATURE_ADVANCED_TOOL_CONTROLS,
     KNOWN_FEATURES,
     CapabilityPolicyStore,
+    ChannelInstructionsStore,
     FeatureFlagStore,
     InstructionsStore,
     WakePolicyStore,
     capability_denies,
     current_capabilities,
     current_zone,
+    is_auto_bundle_name,
 )
+from .server_config import ServerConfigSync, derive_tool_health
 from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
 
 logger = logging.getLogger("gateway.filament_fcm")
@@ -243,10 +246,25 @@ def register(ctx: Any) -> None:
     # established later in adapter.connect().
     api = FilamentAPI(mcp_url, mcp_token)
 
+    # Descriptions of every tool this plugin registers, collected as they are
+    # registered below. Feeds the tool-inventory report to the server (the
+    # registry knows only names) and the registry-less fallback inventory.
+    tool_descriptions: dict[str, str] = {}
+
+    # Server-held config document sync: ONE instance shared by the adapter
+    # (fetch-and-apply per wake, seed at startup) and the set_* tool handlers
+    # (write-back after a local edit), so the remembered document revision and
+    # the once-only failure warnings are process-wide. No network calls here.
+    server_sync = ServerConfigSync(
+        api, inventory_provider=lambda: _tool_inventory(tool_descriptions, api)
+    )
+
     ctx.register_platform(
         name="filament-fcm",
         label="Filament (FCM)",
-        adapter_factory=lambda cfg: FCMFilamentAdapter(cfg, filament_api=api),
+        adapter_factory=lambda cfg: FCMFilamentAdapter(
+            cfg, filament_api=api, server_sync=server_sync
+        ),
         check_fn=check_requirements,
         setup_fn=interactive_setup,
         plugin_name=PLUGIN_ID,
@@ -366,6 +384,7 @@ def register(ctx: Any) -> None:
             is_async=True,
             description=tool.get("description", ""),
         )
+        tool_descriptions[name] = tool.get("description", "")
         registered += 1
 
     logger.info(
@@ -387,10 +406,86 @@ def register(ctx: Any) -> None:
             is_async=True,
             description=DOWNLOAD_MEDIA_SCHEMA["description"],
         )
+        tool_descriptions["download_media"] = DOWNLOAD_MEDIA_SCHEMA["description"]
 
-    _register_reactive_tools(ctx)
+    _register_reactive_tools(ctx, server_sync, tool_descriptions)
     _register_capability_gate(ctx)
     register_cli(ctx)
+
+
+def _tool_inventory(
+    descriptions: dict[str, str], api: "FilamentAPI | None" = None
+) -> list[dict]:
+    """The registered-tool inventory to report to the server.
+
+    Enumerates every tool name the process has registered via the same
+    registry read ``get_capabilities`` uses — Filament tools and any other
+    plugin's alike. Origin is "filament" for this plugin's own toolset, the
+    toolset name otherwise; descriptions ride along where this plugin knows
+    them (the registry itself stores only names per toolset). Connector-backed
+    tools also carry ``health`` (see ``derive_tool_health``): the Filament
+    toolset from this plugin's own session state, MCP toolsets from Hermes'
+    per-server status. If the registry is unreadable, fall back to the tools
+    this plugin registered itself.
+    """
+    filament_connected: bool | None = None
+    if api is not None:
+        try:
+            filament_connected = bool(api.is_connected)
+        except Exception:
+            filament_connected = None
+    statuses = _mcp_server_statuses()
+
+    try:
+        from tools.registry import registry  # noqa: PLC0415
+
+        entries: list[dict] = []
+        for ts in sorted(registry.get_registered_toolset_names()):
+            origin = "filament" if ts == "filament" else str(ts)
+            for name in sorted(registry.get_tool_names_for_toolset(ts)):
+                entry: dict = {"name": name, "origin": origin}
+                desc = descriptions.get(name)
+                if desc:
+                    entry["description"] = desc
+                health = derive_tool_health(str(ts), statuses, filament_connected)
+                if health is not None:
+                    entry["health"] = health
+                entries.append(entry)
+        return entries
+    except Exception:
+        logger.debug(
+            "filament-fcm: tool registry unavailable — reporting own tools only",
+            exc_info=True,
+        )
+        fallback_health = derive_tool_health("filament", {}, filament_connected)
+        entries = []
+        for name, desc in sorted(descriptions.items()):
+            entry = {"name": name, "origin": "filament"}
+            if desc:
+                entry["description"] = desc
+            if fallback_health is not None:
+                entry["health"] = fallback_health
+            entries.append(entry)
+        return entries
+
+
+def _mcp_server_statuses() -> dict[str, Any]:
+    """Per-server MCP connection status keyed by server name; ``{}`` if none.
+
+    ``get_mcp_status`` is Hermes-core banner plumbing — treat it as optional.
+    A Hermes without it (or with no MCP servers configured) just produces
+    health-less entries for foreign toolsets.
+    """
+    try:
+        from tools.mcp_tool import get_mcp_status  # noqa: PLC0415
+
+        return {
+            str(row.get("name")): row
+            for row in get_mcp_status()
+            if isinstance(row, dict) and row.get("name")
+        }
+    except Exception:
+        return {}
 
 
 def _register_capability_gate(ctx: Any) -> None:
@@ -503,6 +598,17 @@ def _capability_policy_error(policy: dict) -> str | None:
     if not isinstance(bundles, dict):
         return "bundles must be an object mapping bundle name → list of tool names."
     for name, entries in bundles.items():
+        if is_auto_bundle_name(str(name)):
+            # These prefixes are reserved for the automatic toolset bundles
+            # ('mcp:<server>' / 'toolset:<name>' grant that toolset's live
+            # tools at resolve time) — a custom definition would shadow the
+            # expansion.
+            return (
+                f"bundles[{name}]: the 'mcp:' and 'toolset:' prefixes are "
+                "reserved for automatic toolset bundles and cannot name a "
+                "custom bundle. Grant 'mcp:<server>' or 'toolset:<name>' "
+                "directly instead."
+            )
         if not _str_list(entries):
             return f"bundles[{name}] must be a list of tool-name / '@bundle' strings."
 
@@ -513,6 +619,11 @@ def _capability_policy_error(policy: dict) -> str | None:
         if not _str_list(names):
             return f"{where} must be a list of capability/bundle names."
         for n in names:
+            if is_auto_bundle_name(n):
+                # Auto-bundle reference — resolved against the live registry
+                # at turn time (an unavailable toolset just grants nothing),
+                # so there is no name list to validate it against here.
+                continue
             if n not in known:
                 return (
                     f"{where} references unknown capability {n!r}. "
@@ -535,15 +646,25 @@ def _capability_policy_error(policy: dict) -> str | None:
             if err:
                 return err
 
-    # References inside a custom bundle's own @includes must resolve too.
+    # References inside a custom bundle's own @includes must resolve too
+    # ('@mcp:<server>' / '@toolset:<name>' pass — they resolve against the
+    # live registry).
     for name in bundles:
         for entry in bundles[name]:
-            if entry.startswith("@") and entry[1:] not in known:
+            if (
+                entry.startswith("@")
+                and not is_auto_bundle_name(entry[1:])
+                and entry[1:] not in known
+            ):
                 return f"bundles[{name}] includes unknown bundle {entry!r}."
     return None
 
 
-def _register_reactive_tools(ctx: Any) -> None:
+def _register_reactive_tools(
+    ctx: Any,
+    server_sync: ServerConfigSync,
+    tool_descriptions: dict[str, str] | None = None,
+) -> None:
     """Register the reactive-plane management tools (control-plane only).
 
     ``set_instructions`` / ``set_wake_policy`` let the principal retune the
@@ -554,11 +675,16 @@ def _register_reactive_tools(ctx: Any) -> None:
     (``current_zone`` == "control"), so a shared-channel participant can never
     rewrite the agent's instructions. The stores are file-backed (same paths the
     adapter reads), so writes take effect on the next event with no restart.
+
+    Every successful ``set_*`` write is followed by ``server_sync.write_back()``
+    — the local files stay the working copy, and the server document mirrors
+    them so other readers (the app, a future gateway) see the same config.
     """
     instructions_store = InstructionsStore()
     wake_store = WakePolicyStore()
     capability_store = CapabilityPolicyStore()
     feature_flags = FeatureFlagStore()
+    channel_instructions_store = ChannelInstructionsStore()
 
     def _deny(tool: str) -> str:
         logger.info(
@@ -576,6 +702,10 @@ def _register_reactive_tools(ctx: Any) -> None:
             return _deny("set_instructions")
         text = args.get("instructions", "") or ""
         instructions_store.write(text)
+        # Mirror the local edit to the server document, rebased on the
+        # server copy so only this section changes (never raises; on failure
+        # the local change stands and reconciliation happens later).
+        await server_sync.write_back("instructions")
         return json.dumps({"ok": True, "bytes": len(text)})
 
     async def _get_instructions(args: dict, **kwargs: Any) -> str:
@@ -600,6 +730,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         if err:
             return json.dumps({"error": err})
         wake_store.write(policy)
+        await server_sync.write_back("wake_policy")
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_wake_policy(args: dict, **kwargs: Any) -> str:
@@ -679,6 +810,7 @@ def _register_reactive_tools(ctx: Any) -> None:
         if err:
             return json.dumps({"error": err})
         capability_store.write(policy)
+        await server_sync.write_back("capability_policy")
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_features(args: dict, **kwargs: Any) -> str:
@@ -712,8 +844,131 @@ def _register_reactive_tools(ctx: Any) -> None:
         if not isinstance(enabled, bool):
             return json.dumps({"error": "enabled must be true or false."})
         flags = feature_flags.set(name, enabled)
+        await server_sync.write_back("feature_flags")
         return json.dumps(
             {"ok": True, "feature": name, "enabled": enabled, "flags": flags}
+        )
+
+    # ── Generic section-scoped config access ────────────────────────
+    #
+    # One tool per direction over the whole server-config document, keyed by
+    # section name — the same five sections ServerConfigSync syncs. The typed
+    # set_*/get_* tools above remain the primary conversational surface; these
+    # exist so new sections (channel_instructions today) and future ones need
+    # no bespoke tool, and so the slash layer, the app, and the LLM path all
+    # converge on the same store-write + write_back(section) shape.
+
+    def _config_document() -> dict:
+        return {
+            "capability_policy": capability_store.read(),
+            "wake_policy": wake_store.read(),
+            "instructions": instructions_store.read(),
+            "channel_instructions": channel_instructions_store.read(),
+            "feature_flags": feature_flags.read(),
+        }
+
+    _CONFIG_SECTIONS = (
+        "capability_policy",
+        "wake_policy",
+        "instructions",
+        "channel_instructions",
+        "feature_flags",
+    )
+
+    def _section_error(section: str, value: Any) -> str | None:
+        """Validate *value* for *section* with the same rules the typed
+        tools enforce, so the generic path can't store what the typed path
+        would reject. Returns an error message, or None when valid."""
+        if section == "capability_policy":
+            if not isinstance(value, dict):
+                return "capability_policy must be an object."
+            return _capability_policy_error(value)
+        if section == "wake_policy":
+            if not isinstance(value, dict):
+                return "wake_policy must be an object."
+            return _wake_policy_error(value)
+        if section == "instructions":
+            if not isinstance(value, str):
+                return "instructions must be a string."
+            return None
+        if section == "channel_instructions":
+            if not isinstance(value, dict) or not all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in value.items()
+            ):
+                return (
+                    "channel_instructions must be an object mapping room id "
+                    "→ guidance string."
+                )
+            return None
+        # feature_flags
+        if not isinstance(value, dict):
+            return "feature_flags must be an object of feature → boolean."
+        for name, enabled in value.items():
+            if name not in KNOWN_FEATURES:
+                return (
+                    f"Unknown feature {name!r}. "
+                    f"Known: {', '.join(sorted(KNOWN_FEATURES))}."
+                )
+            if not isinstance(enabled, bool):
+                return f"feature_flags[{name}] must be true or false."
+        return None
+
+    def _apply_section(section: str, value: Any) -> None:
+        if section == "capability_policy":
+            capability_store.write(value)
+        elif section == "wake_policy":
+            wake_store.write(value)
+        elif section == "instructions":
+            instructions_store.write(value)
+        elif section == "channel_instructions":
+            channel_instructions_store.write(value)
+        else:
+            feature_flags.write(value)
+
+    async def _set_agent_config(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: set_agent_config (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("set_agent_config")
+        section = args.get("section")
+        if section not in _CONFIG_SECTIONS:
+            return json.dumps(
+                {
+                    "error": f"Unknown section {section!r}.",
+                    "sections": list(_CONFIG_SECTIONS),
+                }
+            )
+        # Same opt-in coupling as set_capabilities: the capability policy is
+        # inert until the feature is on, so writing it dark is a foot-gun.
+        if section == "capability_policy" and not feature_flags.is_enabled(
+            FEATURE_ADVANCED_TOOL_CONTROLS
+        ):
+            return _feature_off_notice()
+        value = args.get("value")
+        err = _section_error(section, value)
+        if err:
+            return json.dumps({"error": err})
+        _apply_section(section, value)
+        await server_sync.write_back(section)
+        return json.dumps({"ok": True, "section": section})
+
+    async def _get_agent_config(args: dict, **kwargs: Any) -> str:
+        logger.info("filament-fcm: get_agent_config (zone=%s)", current_zone.get())
+        if current_zone.get() != "control":
+            return _deny("get_agent_config")
+        section = args.get("section")
+        if section is None:
+            return json.dumps({"config": _config_document()}, indent=2)
+        if section not in _CONFIG_SECTIONS:
+            return json.dumps(
+                {
+                    "error": f"Unknown section {section!r}.",
+                    "sections": list(_CONFIG_SECTIONS),
+                }
+            )
+        return json.dumps(
+            {"section": section, "value": _config_document()[section]},
+            indent=2,
         )
 
     def _reg(name: str, desc: str, params: dict, handler: Any) -> None:
@@ -725,6 +980,8 @@ def _register_reactive_tools(ctx: Any) -> None:
             is_async=True,
             description=desc,
         )
+        if tool_descriptions is not None:
+            tool_descriptions[name] = desc
 
     _empty = {"type": "object", "properties": {}}
     _reg(
@@ -785,11 +1042,17 @@ def _register_reactive_tools(ctx: Any) -> None:
         "principal edits this CONVERSATIONALLY: read get_capabilities, apply "
         "their request, and save the full result here. 'policy' is an object "
         "with: default_capabilities (bundles granted to any unlisted "
-        "channel/user — fail-closed baseline), bundles (custom name → list of "
-        "tool names, where '@name' includes another bundle), per_channel and "
-        "per_user (id → list of granted bundle names). A turn's allowed tools "
-        "are the UNION of the default, its channel grant, and its sender grant. "
-        "Backchannel/owner only.",
+        "channel — fail-closed default), bundles (custom name → list of "
+        "tool names, where '@name' includes another bundle; names starting "
+        "'mcp:' are reserved), per_channel and per_user (id → list of granted "
+        "bundle names). Grantable builtin bundles: read_history, post, "
+        "directory, escalate; a grant of 'mcp:<server>' gives that MCP "
+        "server's live tools. A channel's per_channel entry REPLACES "
+        "default_capabilities for that channel (override, not union — it can "
+        "narrow a channel below the default, down to the always-kept baseline "
+        "self-context tools). per_user may be stored but is currently IGNORED "
+        "by resolution: grants are channel-scoped only. Backchannel/owner "
+        "only.",
         {
             "type": "object",
             "properties": {"policy": {"type": "object"}},
@@ -823,4 +1086,50 @@ def _register_reactive_tools(ctx: Any) -> None:
         "whether it's currently enabled. Backchannel/owner only.",
         _empty,
         _get_features,
+    )
+    _reg(
+        "set_agent_config",
+        "Write one section of the agent's config document by name — the "
+        "generic form of the typed set_* tools. 'section' is one of "
+        "capability_policy, wake_policy, instructions, channel_instructions, "
+        "feature_flags; 'value' is the full new section content (an object, "
+        "or the instructions string), validated with the same rules as the "
+        "typed tool for that section and mirrored to the server document. "
+        "Prefer the typed tools where one exists; this is the only writer "
+        "for channel_instructions (per-channel guidance, room id → text). "
+        "Backchannel/owner only.",
+        {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "enum": [
+                        "capability_policy",
+                        "wake_policy",
+                        "instructions",
+                        "channel_instructions",
+                        "feature_flags",
+                    ],
+                },
+                "value": {
+                    "description": "The full new content for the section: an "
+                    "object for every section except 'instructions', which "
+                    "is a string."
+                },
+            },
+            "required": ["section", "value"],
+        },
+        _set_agent_config,
+    )
+    _reg(
+        "get_agent_config",
+        "Read the agent's config document: pass 'section' "
+        "(capability_policy, wake_policy, instructions, "
+        "channel_instructions, feature_flags) for one section, or omit it "
+        "for the whole document. Backchannel/owner only.",
+        {
+            "type": "object",
+            "properties": {"section": {"type": "string"}},
+        },
+        _get_agent_config,
     )

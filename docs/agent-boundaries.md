@@ -118,12 +118,14 @@ same shape as Claude Code's `PreToolUse` hook that §8 holds up as the gold stan
 `current_capabilities` ContextVar the adapter pins in `_wake`, and denies any tool not in the
 turn's allowed set. Because the hook fires for *every* tool, this gates tools the plugin
 doesn't even own (a separate calendar/web MCP plugin) — capability, not identity, is the axis.
-The policy is `reactive.py:CapabilityPolicyStore` (per-channel / per-user grants of named tool
-*bundles*), fail-closed (an unlisted channel/user gets only a minimal default profile), read
+The policy is `reactive.py:CapabilityPolicyStore` (channel-scoped grants of named tool
+*bundles*), fail-closed (an unlisted channel gets only a minimal default profile), read
 fresh per event, and retuned from the backchannel with `set_capabilities` / `get_capabilities`.
 This upgrades the Warden's **capability boundary from soft to hard** while cognition stays
-unified — the stronger Warden §8 says Hermes "can't offer today." (Open follow-up: grants are
-additive/union, so restricting one user *below* a channel grant needs a deny-list.)
+unified — the stronger Warden §8 says Hermes "can't offer today." (Resolution: a channel's
+`per_channel` entry *replaces* `default_capabilities` — override, not union — so a channel can
+be narrowed below the default without a deny-list. `per_user` remains in the schema but is
+deferred: stored, never resolved.)
 
 **Opt-in (default OFF).** The whole hard layer ships behind the `advanced_tool_controls`
 feature flag (`reactive.py:FeatureFlagStore`, default OFF): installing the plugin changes
