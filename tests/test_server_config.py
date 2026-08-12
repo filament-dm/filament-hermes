@@ -652,3 +652,58 @@ def test_health_unknown_server_and_inprocess_toolsets_have_no_signal():
     # In-process toolsets (builtins, other plugins' local tools) carry no health.
     assert server_config.derive_tool_health("memory", {}, True) is None
     assert server_config.derive_tool_health("hermes", {}, False) is None
+
+
+def test_write_back_batches_multiple_sections_in_one_put(tmp_path):
+    # A mutation that edits two sections pushes them in ONE rebased PUT.
+    # Pushed separately, the first push's rebase would overwrite the second
+    # section's fresh local edit with the server's stale copy (the
+    # slash-command grant + advanced_tool_controls enable pair).
+    server_doc = dict(_CONFIG)
+    server_doc["feature_flags"] = {"advanced_tool_controls": False}
+    (tmp_path / "capability_policy.json").write_text(
+        '{"per_channel": {"!x": ["post"]}}'
+    )
+    (tmp_path / "feature_flags.json").write_text(
+        '{"advanced_tool_controls": true}'
+    )
+    api = FakeAPI(
+        get_results=[(200, {"config": server_doc, "revision": 3})],
+        put_results=[(200, {"revision": 4})],
+    )
+    sync, _stores = _make_sync(tmp_path, api)
+    asyncio.run(sync.write_back("capability_policy", "feature_flags"))
+
+    assert len(api.put_bodies) == 1
+    cfg = api.put_bodies[0]["config"]
+    assert cfg["capability_policy"] == {"per_channel": {"!x": ["post"]}}
+    assert cfg["feature_flags"] == {"advanced_tool_controls": True}
+    # The local flag file was NOT reverted to the server's stale copy.
+    assert json.loads((tmp_path / "feature_flags.json").read_text()) == {
+        "advanced_tool_controls": True
+    }
+
+
+def test_pending_write_back_rides_along_with_the_next_push(tmp_path):
+    # A failed section push retries as part of the next write-back's batch —
+    # one PUT carries both, and neither local edit is clobbered.
+    (tmp_path / "instructions.md").write_text("Local truth.")
+    (tmp_path / "feature_flags.json").write_text(
+        '{"advanced_tool_controls": true}'
+    )
+    api = FakeAPI(
+        get_results=[
+            Exception("network down"),
+            (200, {"config": dict(_CONFIG), "revision": 3}),
+        ],
+        put_results=[(200, {"revision": 4})],
+    )
+    sync, _stores = _make_sync(tmp_path, api)
+    asyncio.run(sync.write_back("instructions"))  # fetch fails → pending
+    asyncio.run(sync.write_back("feature_flags"))  # batches the pending one
+
+    assert len(api.put_bodies) == 1
+    cfg = api.put_bodies[0]["config"]
+    assert cfg["instructions"] == "Local truth."
+    assert cfg["feature_flags"] == {"advanced_tool_controls": True}
+    assert (tmp_path / "instructions.md").read_text() == "Local truth."
