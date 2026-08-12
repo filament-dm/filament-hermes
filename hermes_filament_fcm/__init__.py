@@ -44,7 +44,6 @@ from .reactive import (
     BUILTIN_BUNDLES,
     FEATURE_ADVANCED_TOOL_CONTROLS,
     KNOWN_FEATURES,
-    MCP_BUNDLE_PREFIX,
     CapabilityPolicyStore,
     FeatureFlagStore,
     InstructionsStore,
@@ -52,6 +51,7 @@ from .reactive import (
     capability_denies,
     current_capabilities,
     current_zone,
+    is_auto_bundle_name,
 )
 from .server_config import ServerConfigSync, derive_tool_health
 from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
@@ -597,14 +597,16 @@ def _capability_policy_error(policy: dict) -> str | None:
     if not isinstance(bundles, dict):
         return "bundles must be an object mapping bundle name → list of tool names."
     for name, entries in bundles.items():
-        if str(name).startswith(MCP_BUNDLE_PREFIX):
-            # The prefix is reserved for the automatic per-server bundles
-            # ('mcp:<server>' grants that MCP server's live tools at resolve
-            # time) — a custom definition would shadow that expansion.
+        if is_auto_bundle_name(str(name)):
+            # These prefixes are reserved for the automatic toolset bundles
+            # ('mcp:<server>' / 'toolset:<name>' grant that toolset's live
+            # tools at resolve time) — a custom definition would shadow the
+            # expansion.
             return (
-                f"bundles[{name}]: the {MCP_BUNDLE_PREFIX!r} prefix is reserved "
-                "for automatic MCP-server bundles and cannot name a custom "
-                "bundle. Grant 'mcp:<server>' directly instead."
+                f"bundles[{name}]: the 'mcp:' and 'toolset:' prefixes are "
+                "reserved for automatic toolset bundles and cannot name a "
+                "custom bundle. Grant 'mcp:<server>' or 'toolset:<name>' "
+                "directly instead."
             )
         if not _str_list(entries):
             return f"bundles[{name}] must be a list of tool-name / '@bundle' strings."
@@ -616,9 +618,9 @@ def _capability_policy_error(policy: dict) -> str | None:
         if not _str_list(names):
             return f"{where} must be a list of capability/bundle names."
         for n in names:
-            if n.startswith(MCP_BUNDLE_PREFIX):
+            if is_auto_bundle_name(n):
                 # Auto-bundle reference — resolved against the live registry
-                # at turn time (an unavailable server just grants nothing),
+                # at turn time (an unavailable toolset just grants nothing),
                 # so there is no name list to validate it against here.
                 continue
             if n not in known:
@@ -644,12 +646,13 @@ def _capability_policy_error(policy: dict) -> str | None:
                 return err
 
     # References inside a custom bundle's own @includes must resolve too
-    # ('@mcp:<server>' passes — it resolves against the live registry).
+    # ('@mcp:<server>' / '@toolset:<name>' pass — they resolve against the
+    # live registry).
     for name in bundles:
         for entry in bundles[name]:
             if (
                 entry.startswith("@")
-                and not entry[1:].startswith(MCP_BUNDLE_PREFIX)
+                and not is_auto_bundle_name(entry[1:])
                 and entry[1:] not in known
             ):
                 return f"bundles[{name}] includes unknown bundle {entry!r}."

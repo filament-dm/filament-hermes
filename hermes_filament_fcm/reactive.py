@@ -716,13 +716,49 @@ BUILTIN_BUNDLES: dict[str, list[str]] = {
     ],
 }
 
-# Reserved auto-bundle prefix: a grant (or @include) of ``mcp:<server>``
-# expands at resolution time to the live tool names of Hermes toolset
-# ``mcp-<server>`` — see ``CapabilityPolicyStore.expand_bundle``. Because the
-# expansion is live, a custom bundle may never be *named* with this prefix
-# (the set_capabilities validator rejects it), while grant lists may
-# reference ``mcp:<server>`` freely.
+# Reserved auto-bundle prefixes. A grant (or @include) of one of these expands
+# at resolution time to the live tool names of a Hermes toolset, so a principal
+# grants "that whole toolset" without the document having to list — and keep up
+# with — its individual tools. Because the expansion is live, a custom bundle
+# may never be *named* with either prefix (the set_capabilities validator
+# rejects it), while grant lists may reference them freely.
+#
+#   mcp:<server>    -> toolset "mcp-<server>", a remote MCP server
+#   toolset:<name>  -> toolset "<name>", anything else the engine registered
+#
+# The second exists because the first only ever covered remote MCP servers,
+# while this gate is gateway-wide: Hermes' own bundled plugins (spotify, web,
+# kanban…) and its core tools (terminal, code_execution…) are just as gated and
+# had no grantable spelling at all, so enabling the feature took them away with
+# no way to give them back.
 MCP_BUNDLE_PREFIX = "mcp:"
+TOOLSET_BUNDLE_PREFIX = "toolset:"
+
+# Every reserved prefix, and how each maps a grant name to the Hermes toolset
+# whose live tools it expands to.
+AUTO_BUNDLE_PREFIXES: dict[str, "Callable[[str], str]"] = {
+    MCP_BUNDLE_PREFIX: lambda server: f"mcp-{server}",
+    TOOLSET_BUNDLE_PREFIX: lambda name: name,
+}
+
+
+def auto_bundle_toolset(name: str) -> str | None:
+    """The Hermes toolset a reserved grant name refers to, or ``None`` when the
+    name is an ordinary bundle. Empty suffixes ("mcp:") read as ordinary so a
+    malformed grant fails the unknown-bundle path rather than looking up "".
+    """
+    for prefix, to_toolset in AUTO_BUNDLE_PREFIXES.items():
+        if name.startswith(prefix):
+            suffix = name[len(prefix) :]
+            return to_toolset(suffix) if suffix else None
+    return None
+
+
+def is_auto_bundle_name(name: str) -> bool:
+    """Whether a name is spelled with a reserved prefix — including a malformed
+    one. Used by validation, which must reject `mcp:` as a custom bundle name
+    even though it resolves to nothing."""
+    return any(name.startswith(p) for p in AUTO_BUNDLE_PREFIXES)
 
 # What no grant can remove. One flat set, not named sub-groups: the *reasons*
 # an entry is here differ, but the rule is identical for all of them — none is
@@ -773,20 +809,21 @@ UNGATEABLE: frozenset[str] = ALWAYS_GRANTED | BRIDGE_TOOLS
 DEFAULT_CAPABILITIES: list[str] = ["read_history", "post", "directory", "escalate"]
 
 
-def _expand_mcp_bundle(
+def _expand_auto_bundle(
     name: str, toolset_tools: "Callable[[str], list[str]] | None"
 ) -> frozenset[str]:
-    """Expand the reserved ``mcp:<server>`` auto-bundle to the live tool names
-    of Hermes toolset ``mcp-<server>``, via the injected ``toolset_tools``
-    lookup. Fail closed, never raise: no lookup (a non-Hermes context), an
-    empty/unknown server, or a lookup error all expand to nothing — logged
-    like an unknown bundle, so a granted-but-unavailable server is visible
-    per resolve instead of silently widening or crashing the turn."""
-    server = name[len(MCP_BUNDLE_PREFIX) :]
+    """Expand a reserved auto-bundle to the live tool names of the Hermes
+    toolset it names (see ``AUTO_BUNDLE_PREFIXES``), via the injected
+    ``toolset_tools`` lookup. Fail closed, never raise: no lookup (a
+    non-Hermes context), an empty/unknown toolset, or a lookup error all
+    expand to nothing — logged like an unknown bundle, so a
+    granted-but-unavailable toolset is visible per resolve instead of
+    silently widening or crashing the turn."""
+    toolset = auto_bundle_toolset(name)
     tools: list[str] = []
-    if toolset_tools is not None and server:
+    if toolset_tools is not None and toolset:
         try:
-            tools = [str(t) for t in (toolset_tools(f"mcp-{server}") or []) if t]
+            tools = [str(t) for t in (toolset_tools(toolset) or []) if t]
         except Exception:
             logger.warning(
                 "filament-fcm: auto-bundle %r lookup failed (granting nothing)",
@@ -926,8 +963,8 @@ class CapabilityPolicyStore:
         arbitrary depth cap that would silently drop its terminal tools) while a
         self- or mutually-recursive chain terminates the moment a name repeats.
         A ``list`` entry that isn't a ``list`` is ignored (malformed policy)."""
-        if name.startswith(MCP_BUNDLE_PREFIX):
-            return _expand_mcp_bundle(name, toolset_tools)
+        if is_auto_bundle_name(name):
+            return _expand_auto_bundle(name, toolset_tools)
         defs = _defs if _defs is not None else self.bundles(policy)
         seen = _seen if _seen is not None else frozenset()
         if name in seen:

@@ -120,6 +120,30 @@ def test_mcp_prefix_rejected_as_custom_bundle_name():
     assert err is not None and "reserved" in err
 
 
+def test_toolset_prefix_rejected_as_custom_bundle_name():
+    # Same rule for the other reserved spelling.
+    err = plugin._capability_policy_error(
+        {"bundles": {"toolset:spotify": ["spotify_search"]}}
+    )
+    assert err is not None and "reserved" in err
+
+
+def test_toolset_grants_pass_validation_without_being_defined():
+    # Auto-bundles resolve against the live registry at turn time, so there is
+    # no name list to validate them against — an undefined-looking grant is
+    # legal exactly like 'mcp:<server>'.
+    assert (
+        plugin._capability_policy_error(
+            {
+                "default_capabilities": ["read_history", "toolset:spotify"],
+                "bundles": {"media": ["@toolset:spotify", "post_message"]},
+                "per_channel": {"!room:x": ["toolset:web"]},
+            }
+        )
+        is None
+    )
+
+
 def test_mcp_grants_accepted_in_grant_lists():
     # Grant lists (and @includes) may reference auto-bundles freely: they are
     # resolved against the live registry at turn time, so there is no name

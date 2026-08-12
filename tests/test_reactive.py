@@ -597,6 +597,49 @@ def test_mcp_auto_bundle_expands_via_injected_lookup():
     assert "create_issue" in pm and "post_message" in pm
 
 
+def test_toolset_auto_bundle_grants_any_registered_toolset():
+    """The gate is gateway-wide, so a grant spelling has to exist for every
+    toolset the engine registers — not just remote MCP servers. Hermes'
+    bundled plugins (spotify, web) and its core tools (terminal) had none, so
+    enabling the feature removed them with no way to grant them back.
+    """
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    calls = []
+
+    def lookup(toolset):
+        calls.append(toolset)
+        return {"spotify": ["spotify_search", "spotify_playback"]}.get(toolset, [])
+
+    assert store.expand_bundle("toolset:spotify", toolset_tools=lookup) == frozenset(
+        {"spotify_search", "spotify_playback"}
+    )
+    # toolset:<name> asks for exactly that toolset; mcp:<server> still asks for
+    # "mcp-<server>", so the two spellings stay distinguishable.
+    assert calls == ["spotify"]
+    assert reactive.auto_bundle_toolset("mcp:linear") == "mcp-linear"
+    assert reactive.auto_bundle_toolset("toolset:spotify") == "spotify"
+    assert reactive.auto_bundle_toolset("read_history") is None
+    # A prefix with nothing after it is not a lookup for the empty toolset.
+    assert reactive.auto_bundle_toolset("toolset:") is None
+    assert reactive.is_auto_bundle_name("toolset:") is True
+
+
+def test_toolset_auto_bundle_fails_closed():
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    # No lookup at all (a non-Hermes context) grants nothing.
+    assert store.expand_bundle("toolset:spotify") == frozenset()
+    # Unknown toolset grants nothing rather than everything.
+    assert (
+        store.expand_bundle("toolset:nope", toolset_tools=lambda ts: [])
+        == frozenset()
+    )
+
+    def boom(_ts):
+        raise RuntimeError("registry down")
+
+    assert store.expand_bundle("toolset:spotify", toolset_tools=boom) == frozenset()
+
+
 def test_mcp_auto_bundle_fails_closed():
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
     # No lookup injected (a non-Hermes caller) → nothing.
