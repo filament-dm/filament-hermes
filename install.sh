@@ -348,13 +348,18 @@ ${PLUGIN_REF:-main}/install.sh | CONNECT_TOKEN=... bash"
 # update` only pulls code, so this installer is the dependency-refresh path.
 info "Installing/upgrading plugin dependencies ..."
 FCM_DEPS=()
-while IFS= read -r _dep; do
-  [ -n "$_dep" ] && FCM_DEPS+=("$_dep")
-done < <("$PY" - "$CLONE_TMP/pyproject.toml" <<'PYEOF'
+# Extraction writes to a temp file rather than a process substitution: bash 3.2
+# (the system bash on macOS) scans <( ... ) for its closing paren while
+# tracking quotes, so an apostrophe anywhere in the here-doc body makes it
+# consume past the paren and fail with "bad substitution". Redirection is also
+# POSIX, so the script survives being run by sh.
+_DEP_LIST="$(mktemp "${TMPDIR:-/tmp}/filament-deps.XXXXXX")" \
+  || err "could not create a temp file for dependency extraction."
+"$PY" - "$CLONE_TMP/pyproject.toml" > "$_DEP_LIST" <<'PYEOF'
 import sys
 
 # Parse pyproject.toml properly so requirement extras (e.g. "httpx[socks]") and
-# other bracket content inside requirement strings don't confuse extraction.
+# other bracket content inside requirement strings does not confuse extraction.
 # tomllib is stdlib on 3.11+; fall back to tomli, then to nothing (the bash
 # caller substitutes a safe built-in dependency set when this prints empty).
 try:
@@ -374,7 +379,10 @@ if tomllib is not None:
         deps = []
 print("\n".join(d for d in deps if isinstance(d, str)))
 PYEOF
-)
+while IFS= read -r _dep; do
+  [ -n "$_dep" ] && FCM_DEPS+=("$_dep")
+done < "$_DEP_LIST"
+rm -f "$_DEP_LIST"
 if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
   # A pyproject parse hiccup must never leave the plugin without its hard
   # dependency — fall back to the essential set.
