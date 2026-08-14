@@ -75,7 +75,10 @@ def sanitize_meta(value: str, limit: int = 80) -> str:
     """
     if not value:
         return ""
-    flat = re.sub(r"\s+", " ", value).strip()
+    # Coerced, not assumed: every field here comes from the push payload, so a
+    # truthy non-string (a number, a populated list) would otherwise raise
+    # inside re.sub and take the whole wake down with it.
+    flat = re.sub(r"\s+", " ", str(value)).strip()
     flat = "".join(ch for ch in flat if ch.isprintable())
     return flat[:limit]
 

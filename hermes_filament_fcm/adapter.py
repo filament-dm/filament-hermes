@@ -329,6 +329,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._greet_pending: bool = False
         self._cc_room_id: str | None = None
 
+        # Whether the filament-links skill is on disk and current for the
+        # server we are connected to. Set by _initialize_api on every connect;
+        # gates the one-line pointer in the turn envelope. Lives as long as the
+        # connection: the guide is static for it, and every reactive turn after
+        # the first needs the pointer just as much as the first did.
+        self._server_guide_ready: bool = False
+
         # ENG-429 two-phase: the connect token is valid before the agent account
         # exists ("reserved"). While reserved, every tool returns -32002 and
         # there's nothing to connect to, so connect() fails *retryably* and we
@@ -661,9 +668,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # One-shot within this process; the server's gate covers reconnects.
         self._greet_pending = False
-        # The server's self-description from the MCP handshake, composed into
-        # every reactive turn's framing (see _server_guidance).
-        self._server_guide_ready = False
 
         try:
             # Deterministic, not a model turn: the hello is the connect flow's
@@ -2622,7 +2626,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         framed so the data is acted upon per the instructions but never
         treated as instructions to the agent."""
         instructions = self._instructions_store.read_effective(
-            SERVER_GUIDE_POINTER if getattr(self, "_server_guide_ready", False) else ""
+            SERVER_GUIDE_POINTER if self._server_guide_ready else ""
         )
         # Trusted framing line, present only when the waking sender IS the
         # principal. Both ids are server-attributed (sender from the push

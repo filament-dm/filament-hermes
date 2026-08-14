@@ -604,6 +604,28 @@ SERVER_GUIDE_POINTER = (
 )
 
 
+def _is_our_skill(path: Path) -> bool:
+    """Whether the skill file at *path* is one this plugin wrote.
+
+    The skills directory is the principal's, and this is the only file in it
+    the plugin claims. A file it did not author is left alone rather than
+    overwritten or deleted: the frontmatter it writes is the ownership mark,
+    and anything else at that name belongs to whoever put it there.
+    """
+    try:
+        with path.open(encoding="utf-8") as f:
+            # A bounded read: the marker is in the frontmatter, and this runs
+            # on a path someone else may own and may have made arbitrarily
+            # large.
+            head = f.read(400)
+    except (OSError, UnicodeError):
+        # Undecodable or unreadable is not ours, and not ours to destroy.
+        # UnicodeDecodeError is a ValueError, so OSError alone would let it
+        # escape into connect and abort initialization.
+        return False
+    return f"name: {SERVER_GUIDE_SKILL}" in head and "author: Filament" in head
+
+
 def write_server_guide_skill(text: str, hermes_home: Path | None = None) -> bool:
     """Write the server's self-description as a Hermes skill.
 
@@ -616,12 +638,28 @@ def write_server_guide_skill(text: str, hermes_home: Path | None = None) -> bool
     Returns True when the skill was written.
     """
     body = (text or "").strip()
-    if not body:
-        return False
     home = hermes_home or Path(
         os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
     )
     skill_dir = home / "skills" / SERVER_GUIDE_SKILL
+    skill_file = skill_dir / "SKILL.md"
+    if skill_file.exists() and not _is_our_skill(skill_file):
+        # Someone else's skill sits at this name. Neither the rewrite nor the
+        # cleanup below is ours to perform on it.
+        logger.warning(
+            "filament-fcm: %s exists and was not written by this plugin — "
+            "leaving it alone",
+            skill_file,
+        )
+        return False
+    if not body:
+        # The skill is a cache of this server's guidance, and the skills index
+        # in the system prompt lists it whether or not the envelope points at
+        # it. Leaving a file behind that this server did not send would offer
+        # another server's syntax as if it were current, so remove it.
+        with contextlib.suppress(OSError):
+            skill_file.unlink()
+        return False
     front = (
         "---\n"
         f"name: {SERVER_GUIDE_SKILL}\n"
@@ -635,10 +673,11 @@ def write_server_guide_skill(text: str, hermes_home: Path | None = None) -> bool
     )
     try:
         skill_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(skill_dir / "SKILL.md", front + body + "\n")
+        _atomic_write_text(skill_file, front + body + "\n")
     except OSError:
         logger.warning(
-            "filament-fcm: could not write the %s skill", SERVER_GUIDE_SKILL,
+            "filament-fcm: could not write the %s skill",
+            SERVER_GUIDE_SKILL,
             exc_info=True,
         )
         return False
