@@ -168,6 +168,13 @@ class PushMessage:
     persistent_id: str | None = None
     push_receive_id: str | None = None
     fcm_client_id: str | None = None
+    # The server's own answer to "is this addressed to us": a reply to one
+    # of the agent's messages. Distinct from is_mention (an explicit
+    # @-mention) and from the engaged-thread record (a thread it was
+    # mentioned in).
+    is_reply_to_me: bool = False
+    # The group (loop) the channel belongs to, when the server knows it.
+    loop_name: str | None = None
 
 
 @dataclass
@@ -324,6 +331,8 @@ def _build_push_message(env: Envelope) -> PushMessage | None:
         thread_id=branch.get("thread_id"),
         is_mention=bool(branch.get("is_mention_of_recipient", False)),
         is_everyone_mention=bool(branch.get("is_everyone_mention", False)),
+        is_reply_to_me=bool(branch.get("is_reply_to_recipient", False)),
+        loop_name=branch.get("loop_name"),
         raw=env.payload,
         has_content=has_content,
     )

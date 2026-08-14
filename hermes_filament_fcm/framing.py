@@ -153,6 +153,7 @@ def wake_signal(
     *,
     channel: str,
     channel_name: str,
+    group_name: str | None = None,
     sender: str,
     sender_name: str,
     trigger: str,
@@ -185,7 +186,8 @@ def wake_signal(
     return (
         "[WAKE-UP SIGNAL]\n"
         f"channel: {sanitize_meta(channel_name)} ({channel})\n"
-        f"sender: {sanitize_meta(sender_name)} ({sender})  tier: data\n"
+        + (f"group: {sanitize_meta(group_name)}\n" if group_name else "")
+        + f"sender: {sanitize_meta(sender_name)} ({sender})  tier: data\n"
         + f"trigger: {sanitize_meta(trigger)}"
         + (f" on message {target_event_id}" if target_event_id else "")
         + (f"\n{sender_note}" if sender_note else "")
