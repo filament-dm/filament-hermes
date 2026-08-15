@@ -129,3 +129,28 @@ class TestBinding:
         pub.on_tool_call("web_search", {"query": "x"}, "sess1")
         _run(pub.end_turn("$m"))
         _run(pub.end_turn("$m"))
+
+
+class TestMcpAndScopePhrases:
+    def test_mcp_tools_read_as_actions(self):
+        assert phrase_for("mcp_linear_list_issues", {}) == "listing issues in Linear"
+        assert phrase_for("mcp_linear_get_issue", {}) == "fetching issue in Linear"
+        assert (
+            phrase_for("mcp_linear_create_attachment_from_upload", {})
+            == "creating attachment from upload in Linear"
+        )
+
+    def test_mcp_unknown_verb_falls_back_to_server(self):
+        assert phrase_for("mcp_linear_frobnicate_widget", {}) == "using Linear"
+
+    def test_reading_own_room_is_catching_up(self):
+        line = phrase_for(
+            "get_recent_messages", {"channel": "!cc:hs"}, scope_room="!cc:hs"
+        )
+        assert line == "catching up on the conversation"
+
+    def test_reading_another_room_stays_generic(self):
+        line = phrase_for(
+            "get_recent_messages", {"channel": "!other:hs"}, scope_room="!cc:hs"
+        )
+        assert line == "reading the channel"

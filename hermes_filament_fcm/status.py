@@ -155,12 +155,58 @@ _SILENT = frozenset(
 )
 
 
-def phrase_for(tool_name: str, args: dict | None) -> str | None:
+# Leading verbs of MCP tool names, turned into present tense.
+_VERBS = {
+    "list": "listing",
+    "get": "fetching",
+    "search": "searching",
+    "create": "creating",
+    "save": "saving",
+    "update": "updating",
+    "delete": "deleting",
+    "add": "adding",
+    "remove": "removing",
+    "merge": "merging",
+    "resolve": "resolving",
+    "submit": "submitting",
+    "prepare": "preparing",
+    "extract": "extracting",
+}
+
+
+def _mcp_phrase(tool_name: str) -> str | None:
+    """"mcp_linear_list_issues" -> "listing issues in Linear"."""
+    parts = tool_name.split("_")
+    if len(parts) < 3 or parts[0] != "mcp":
+        return None
+    server = parts[1].title()
+    verb, rest = parts[2], " ".join(parts[3:])
+    doing = _VERBS.get(verb)
+    if doing is None:
+        return _clip(f"using {server}", _MAX_LINE_CHARS)
+    subject = f"{doing} {rest}".strip()
+    return _clip(f"{subject} in {server}", _MAX_LINE_CHARS)
+
+
+def phrase_for(
+    tool_name: str, args: dict | None, scope_room: str | None = None
+) -> str | None:
     """The status line for a tool call, or None when it should not publish."""
     if tool_name in _SILENT:
         return None
+    # Reading the room the turn is answering in is catching up on the
+    # conversation, not visiting some other channel.
+    if (
+        tool_name == "get_recent_messages"
+        and scope_room is not None
+        and (args or {}).get("channel") == scope_room
+    ):
+        return "catching up on the conversation"
     entry = _PHRASES.get(tool_name)
     if entry is None:
+        mcp = _mcp_phrase(tool_name)
+        if mcp is not None:
+            return mcp
         # e.g. "browser_click" -> "using browser click"
         return _clip("using " + tool_name.replace("_", " "), _MAX_LINE_CHARS)
     template, render = entry
@@ -272,7 +318,7 @@ class StatusPublisher:
             entry = self._claim(session_id)
         if entry is None:
             return
-        phrase = phrase_for(tool_name, args)
+        phrase = phrase_for(tool_name, args, scope_room=entry.scope.room_id)
         if phrase is None:
             return
         now = time.monotonic()
