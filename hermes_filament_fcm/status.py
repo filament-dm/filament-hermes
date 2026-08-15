@@ -22,6 +22,7 @@ Set ``FILAMENT_STATUS_UPDATES=0`` to disable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -309,6 +310,10 @@ class StatusPublisher:
     def begin_turn(self, trigger_event_id: str, scope: TurnScope) -> None:
         if not enabled() or not hasattr(self._api, "set_status"):
             return
+        # Dispatch runs on the gateway loop; capture it here rather than at
+        # construction, which may happen before the loop exists.
+        with contextlib.suppress(RuntimeError):
+            self._loop = asyncio.get_running_loop()
         self._prune()
         entry = _Pending(scope=scope, created=time.monotonic())
         self._pending[trigger_event_id] = entry
