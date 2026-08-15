@@ -154,3 +154,16 @@ class TestMcpAndScopePhrases:
             "get_recent_messages", {"channel": "!other:hs"}, scope_room="!cc:hs"
         )
         assert line == "reading the channel"
+
+
+class TestGenericMcp:
+    def test_any_server_any_verb(self):
+        assert phrase_for("mcp_notion_search_pages", {"query": "roadmap"}) == (
+            'searching pages "roadmap" in Notion'
+        )
+        assert phrase_for("mcp_github_create_pull_request", {}) == (
+            "creating pull request in Github"
+        )
+
+    def test_unknown_verb_names_the_server(self):
+        assert phrase_for("mcp_notion_frobnicate", {}) == "using Notion"

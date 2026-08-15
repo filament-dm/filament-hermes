@@ -159,22 +159,59 @@ _SILENT = frozenset(
 _VERBS = {
     "list": "listing",
     "get": "fetching",
+    "fetch": "fetching",
+    "read": "reading",
     "search": "searching",
+    "query": "querying",
+    "find": "finding",
     "create": "creating",
     "save": "saving",
     "update": "updating",
+    "edit": "editing",
+    "write": "writing",
     "delete": "deleting",
     "add": "adding",
     "remove": "removing",
+    "send": "sending",
+    "post": "posting",
+    "reply": "replying",
     "merge": "merging",
     "resolve": "resolving",
     "submit": "submitting",
     "prepare": "preparing",
     "extract": "extracting",
+    "download": "downloading",
+    "upload": "uploading",
+    "run": "running",
+    "execute": "running",
+    "mark": "marking",
+    "set": "setting",
+    "apply": "applying",
+    "move": "moving",
+    "copy": "copying",
+    "duplicate": "duplicating",
+    "convert": "converting",
+    "respond": "responding",
+    "suggest": "suggesting",
+    "complete": "completing",
+    "cancel": "cancelling",
+    "check": "checking",
 }
 
+# For unmapped tools, the first of these args present is worth quoting.
+_GENERIC_QUOTABLE_ARGS = ("query", "search", "title", "name", "goal", "question")
 
-def _mcp_phrase(tool_name: str) -> str | None:
+
+def _generic_arg(args: dict | None) -> str:
+    """A quoted rendering of the first recognizable primary argument."""
+    for key in _GENERIC_QUOTABLE_ARGS:
+        value = (args or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            return ' "' + _clip(value, _MAX_ARG_CHARS) + '"'
+    return ""
+
+
+def _mcp_phrase(tool_name: str, args: dict | None) -> str | None:
     """"mcp_linear_list_issues" -> "listing issues in Linear"."""
     parts = tool_name.split("_")
     if len(parts) < 3 or parts[0] != "mcp":
@@ -184,7 +221,7 @@ def _mcp_phrase(tool_name: str) -> str | None:
     doing = _VERBS.get(verb)
     if doing is None:
         return _clip(f"using {server}", _MAX_LINE_CHARS)
-    subject = f"{doing} {rest}".strip()
+    subject = f"{doing} {rest}".strip() + _generic_arg(args)
     return _clip(f"{subject} in {server}", _MAX_LINE_CHARS)
 
 
@@ -204,7 +241,7 @@ def phrase_for(
         return "catching up on the conversation"
     entry = _PHRASES.get(tool_name)
     if entry is None:
-        mcp = _mcp_phrase(tool_name)
+        mcp = _mcp_phrase(tool_name, args)
         if mcp is not None:
             return mcp
         # e.g. "browser_click" -> "using browser click"
