@@ -107,6 +107,7 @@ class TestBinding:
         pub.begin_turn("$m", status.TurnScope(room_id="!r"))
         _run(pub.end_turn("$m"))
         assert "$m" in pub._pending
+        assert pub._pending["$m"].completed_early
 
     def test_completion_after_grace_clears_unclaimed_turn(self):
         pub = self._publisher()
@@ -167,3 +168,139 @@ class TestGenericMcp:
 
     def test_unknown_verb_names_the_server(self):
         assert phrase_for("mcp_notion_frobnicate", {}) == "using Notion"
+
+
+class TestUrlPrivacy:
+    def test_domain_strips_userinfo(self):
+        line = phrase_for(
+            "browser_navigate", {"url": "https://user:secret@example.com/x"}
+        )
+        assert line == "reading example.com"
+        assert "secret" not in line
+
+
+class TestClaimSafety:
+    def _publisher(self):
+        pub = status.StatusPublisher()
+        pub.set_api(_FakeAPI())
+        return pub
+
+    def test_ambiguous_claim_narrates_nothing(self):
+        pub = self._publisher()
+        pub.begin_turn("$a", status.TurnScope(room_id="!A"))
+        pub.begin_turn("$b", status.TurnScope(room_id="!B"))
+        pub.on_tool_call("web_search", {"query": "x"}, "snew")
+        assert "snew" not in pub._bound
+        assert "$a" in pub._pending and "$b" in pub._pending
+
+    def test_known_session_claims_only_its_room(self):
+        pub = self._publisher()
+        pub.begin_turn("$a1", status.TurnScope(room_id="!A"))
+        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+        _run(pub.end_turn("$a1"))
+        pub.begin_turn("$b", status.TurnScope(room_id="!B"))
+        pub.begin_turn("$a2", status.TurnScope(room_id="!A"))
+        pub.on_tool_call("web_search", {"query": "y"}, "sess1")
+        assert pub._bound["sess1"].scope.room_id == "!A"
+        assert "$b" in pub._pending
+
+    def test_known_session_never_steals_another_room(self):
+        pub = self._publisher()
+        pub.begin_turn("$a1", status.TurnScope(room_id="!A"))
+        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+        _run(pub.end_turn("$a1"))
+        pub.begin_turn("$b", status.TurnScope(room_id="!B"))
+        pub.on_tool_call("web_search", {"query": "y"}, "sess1")
+        assert "sess1" not in pub._bound
+        assert "$b" in pub._pending
+
+
+class TestEarlyCompletion:
+    def _publisher(self):
+        api = _FakeAPI()
+        pub = status.StatusPublisher()
+        pub.set_api(api)
+        return pub, api
+
+    def test_spurious_completion_still_claimable_within_grace(self):
+        pub, _ = self._publisher()
+        pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+        _run(pub.end_turn("$m"))
+        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+        assert pub._bound["sess1"].completed_early is False
+
+    def test_early_completed_turn_not_claimable_past_grace(self):
+        pub, _ = self._publisher()
+        pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+        _run(pub.end_turn("$m"))
+        pub._pending["$m"].created -= status.COMPLETION_GRACE_SECONDS + 1
+        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+        assert "sess1" not in pub._bound
+
+    def test_early_completed_turn_is_finalized_by_next_prune(self):
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            await pub.end_turn("$m")
+            pub._pending["$m"].created -= status.COMPLETION_GRACE_SECONDS + 1
+            pub.begin_turn("$n", status.TurnScope(room_id="!r2"))
+            assert "$m" not in pub._pending
+            await asyncio.sleep(0.05)
+            clears = [
+                c
+                for c in api.calls
+                if c.get("channel") == "!r" and "status_text" not in c
+            ]
+            assert clears
+            await pub.end_turn("$n")
+
+        asyncio.run(go())
+
+
+class TestPublishLifecycle:
+    def test_end_turn_cancels_inflight_publishes(self):
+        class SlowAPI:
+            def __init__(self):
+                self.calls = []
+
+            async def set_status(self, **kwargs):
+                if kwargs.get("status_text"):
+                    await asyncio.sleep(0.5)
+                self.calls.append(kwargs)
+
+        async def go():
+            api = SlowAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+            await asyncio.sleep(0.01)
+            await pub.end_turn("$m")
+            await asyncio.sleep(0.1)
+            assert not [c for c in api.calls if c.get("status_text")]
+            assert api.calls and "status_text" not in api.calls[-1]
+
+        asyncio.run(go())
+
+    def test_refresh_republishes_during_long_gaps(self, monkeypatch):
+        monkeypatch.setattr(status, "REFRESH_SECONDS", 0.04)
+
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            await asyncio.sleep(0.15)
+            entry = pub._pending["$m"]
+            entry.created -= status.COMPLETION_GRACE_SECONDS + 1
+            await pub.end_turn("$m")
+            texted = [c for c in api.calls if c.get("status_text")]
+            assert len(texted) >= 2
+            assert all(
+                c["status_text"] == "reading the conversation" for c in texted
+            )
+            assert entry.ended and entry.refresh_task.cancelled
+
+        asyncio.run(go())

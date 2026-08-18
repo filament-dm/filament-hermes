@@ -27,7 +27,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 logger = logging.getLogger("gateway.filament_fcm")
@@ -80,7 +80,7 @@ def _basename(path: Any) -> str:
 
 
 def _domain(url: Any) -> str:
-    m = re.match(r"^\w+://([^/]+)", str(url))
+    m = re.match(r"^\w+://(?:[^/@]*@)?([^/]+)", str(url))
     return _clip(m.group(1) if m else str(url), _MAX_ARG_CHARS)
 
 
@@ -280,6 +280,14 @@ class _Pending:
     created: float
     last_phrase: str | None = None
     last_ts: float = 0.0
+    # The gateway emits a completion ~immediately after dispatch for a message
+    # queued into an active session; a completion inside the grace window only
+    # marks the entry, and the mark is resolved later: a tool call proves the
+    # turn is live (spurious completion), the grace expiring proves it ended.
+    completed_early: bool = False
+    ended: bool = False
+    publishes: set = field(default_factory=set)
+    refresh_task: Any = None
 
 
 class StatusPublisher:
@@ -293,13 +301,15 @@ class StatusPublisher:
         # hermes session id -> claimed turn; trigger id -> session id.
         self._bound: dict[str, _Pending] = {}
         self._trigger_session: dict[str, str] = {}
+        # Sessions are per-chat, so a session's first claim fixes which room
+        # its later claims may bind to.
+        self._session_room: dict[str, str] = {}
         self._tasks: set = set()
 
     def set_api(self, api: Any) -> None:
         self._api = api
-        # Tool hooks fire outside the gateway loop (the engine's thread has
-        # no running loop here), so publishes are scheduled onto the loop
-        # captured at connect time.
+        # Earliest chance to capture the gateway loop; begin_turn re-captures
+        # on every dispatch, which covers construction before the loop exists.
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -321,6 +331,12 @@ class StatusPublisher:
         # The opening line must not delay the first real phrase: a
         # single-tool turn's only narratable call lands within the floor.
         entry.last_ts = time.monotonic() - MIN_INTERVAL_SECONDS
+        # The server expires a status after TIMEOUT_MS; the refresh keeps the
+        # line alive across long gaps between tool calls.
+        with contextlib.suppress(RuntimeError):
+            entry.refresh_task = asyncio.get_running_loop().create_task(
+                self._refresh(entry)
+            )
 
     async def end_turn(self, trigger_event_id: str) -> None:
         if not hasattr(self._api, "set_status"):
@@ -334,19 +350,13 @@ class StatusPublisher:
             if pending is None:
                 return
             if time.monotonic() - pending.created < COMPLETION_GRACE_SECONDS:
-                # The gateway's early completion for a queued message; the
-                # turn has not actually run yet.
+                pending.completed_early = True
                 return
             entry = self._pending.pop(trigger_event_id)
         if entry is None:
             return
-        try:
-            await self._api.set_status(
-                channel=entry.scope.room_id,
-                thread_id=entry.scope.thread_id,
-            )
-        except Exception:
-            logger.debug("filament-fcm: status clear failed", exc_info=True)
+        self._halt(entry)
+        await self._clear(entry)
 
     # -- per-tool-call (called from the pre_tool_call hook) --
 
@@ -371,28 +381,65 @@ class StatusPublisher:
     # -- internals --
 
     def _claim(self, session_id: str) -> _Pending | None:
-        """Bind the oldest pending turn to this session.
+        """Bind a pending turn to this session.
 
-        Concurrent turns that both reach their first tool before either
-        claims could bind to each other's scope; the statuses would swap
-        rooms until their clears, which the timeout also backstops.
+        A claim must never narrate into the wrong room: a session with a
+        known room only takes turns for that room, and an unknown session
+        only claims when a single turn is pending. Concurrent turns that
+        would be ambiguous stay unclaimed and simply go un-narrated.
         """
         if not session_id or not self._pending:
             return None
-        trigger_event_id = next(iter(self._pending))
+        known_room = self._session_room.get(session_id)
+        if known_room is not None:
+            candidates = [
+                key
+                for key, entry in self._pending.items()
+                if entry.scope.room_id == known_room and self._claimable(entry)
+            ]
+        else:
+            candidates = [
+                key
+                for key, entry in self._pending.items()
+                if self._claimable(entry)
+            ]
+            if len(candidates) != 1:
+                return None
+        if not candidates:
+            return None
+        trigger_event_id = candidates[0]
         entry = self._pending.pop(trigger_event_id)
+        entry.completed_early = False
         self._bound[session_id] = entry
         self._trigger_session[trigger_event_id] = session_id
+        self._session_room[session_id] = entry.scope.room_id
         return entry
 
+    @staticmethod
+    def _claimable(entry: _Pending) -> bool:
+        # An early-completed turn is claimable only inside the grace window,
+        # where the completion may have been the gateway's spurious one.
+        if not entry.completed_early:
+            return True
+        return time.monotonic() - entry.created < COMPLETION_GRACE_SECONDS
+
     def _prune(self) -> None:
-        cutoff = time.monotonic() - STALE_SECONDS
-        for key in [k for k, v in self._pending.items() if v.created < cutoff]:
-            del self._pending[key]
+        now = time.monotonic()
+        cutoff = now - STALE_SECONDS
+        for key, entry in list(self._pending.items()):
+            finished = entry.completed_early and (
+                now - entry.created >= COMPLETION_GRACE_SECONDS
+            )
+            if entry.created < cutoff or finished:
+                del self._pending[key]
+                self._halt(entry)
+                if finished:
+                    self._schedule(self._clear(entry))
         stale_sessions = {
             sid for sid, v in self._bound.items() if v.created < cutoff
         }
         for sid in stale_sessions:
+            self._halt(self._bound[sid])
             del self._bound[sid]
         for key in [
             k for k, sid in self._trigger_session.items() if sid in stale_sessions
@@ -402,30 +449,81 @@ class StatusPublisher:
     def _publish(self, entry: _Pending, phrase: str) -> None:
         entry.last_phrase = phrase
         entry.last_ts = time.monotonic()
-        coro = self._api.set_status(
-            channel=entry.scope.room_id,
-            status_text=phrase,
-            about_message_id=entry.scope.prompt_event_id,
-            thread_id=entry.scope.thread_id,
-            timeout_ms=TIMEOUT_MS,
+        handle = self._schedule(
+            self._api.set_status(
+                channel=entry.scope.room_id,
+                status_text=phrase,
+                about_message_id=entry.scope.prompt_event_id,
+                thread_id=entry.scope.thread_id,
+                timeout_ms=TIMEOUT_MS,
+            )
         )
+        if handle is not None:
+            entry.publishes.add(handle)
+            handle.add_done_callback(entry.publishes.discard)
+
+    def _halt(self, entry: _Pending) -> None:
+        """Stop everything still in flight for a turn, so nothing can land
+        after (and undo) the clear."""
+        entry.ended = True
+        if entry.refresh_task is not None:
+            entry.refresh_task.cancel()
+        for handle in list(entry.publishes):
+            handle.cancel()
+
+    async def _clear(self, entry: _Pending) -> None:
+        try:
+            await self._api.set_status(
+                channel=entry.scope.room_id,
+                thread_id=entry.scope.thread_id,
+            )
+        except Exception:
+            logger.debug("filament-fcm: status clear failed", exc_info=True)
+
+    async def _refresh(self, entry: _Pending) -> None:
+        while not entry.ended:
+            await asyncio.sleep(REFRESH_SECONDS / 2)
+            if entry.ended or time.monotonic() - entry.created > STALE_SECONDS:
+                return
+            if entry.last_phrase is None:
+                continue
+            if time.monotonic() - entry.last_ts >= REFRESH_SECONDS:
+                self._publish(entry, entry.last_phrase)
+
+    def _schedule(self, coro: Any) -> Any:
+        """Run a status coroutine on the gateway loop from any context.
+
+        Tool hooks fire on the engine's thread, which has no running loop;
+        their calls are handed to the loop captured at dispatch.
+        """
 
         async def _run() -> None:
             try:
                 await coro
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                logger.debug("filament-fcm: status publish failed", exc_info=True)
+                logger.debug("filament-fcm: status call failed", exc_info=True)
+
+        def _closed_if_cancelled(handle: Any) -> None:
+            self._tasks.discard(handle)
+            # A handle cancelled before _run started leaves coro unawaited.
+            if handle.cancelled():
+                with contextlib.suppress(Exception):
+                    coro.close()
 
         try:
             task = asyncio.get_running_loop().create_task(_run())
         except RuntimeError:
             if self._loop is not None and not self._loop.is_closed():
-                asyncio.run_coroutine_threadsafe(_run(), self._loop)
-            else:
-                coro.close()
-            return
+                future = asyncio.run_coroutine_threadsafe(_run(), self._loop)
+                future.add_done_callback(_closed_if_cancelled)
+                return future
+            coro.close()
+            return None
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(_closed_if_cancelled)
+        return task
 
 
 publisher = StatusPublisher()
