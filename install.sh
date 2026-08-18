@@ -10,10 +10,19 @@
 # (Equivalently, to keep your terminal attached for the prompts:
 #   CONNECT_TOKEN=fmcp_... bash <(curl -fsSL https://raw.githubusercontent.com/filament-dm/filament-hermes/main/install.sh)  )
 #
+# Options (with `curl | bash`, flags need `bash -s --`):
+#
+#   curl -fsSL https://raw.githubusercontent.com/filament-dm/filament-hermes/main/install.sh | CONNECT_TOKEN=fmcp_... bash -s -- --dev
+#
+#   --dev    clone the plugin from filament-hermes-dev — the staging fork that
+#            carries pending PRs — instead of filament-hermes. `hermes plugins
+#            update` on the agent then pulls from the dev fork too.
+#
 # Optional environment overrides:
 #   FILAMENT_MCP_URL     point at staging/local instead of production
 #   FILAMENT_FCM_REPO    clone the plugin from a different repo URL
-#                        (default: https github main)
+#                        (default: https github main; takes precedence
+#                        over --dev)
 #   FILAMENT_FCM_REF     clone a specific branch/tag/commit (default: repo's
 #                        default branch — used to test unreleased plugin changes)
 #   VIRTUAL_ENV          Hermes venv (default: auto-detected, see below)
@@ -30,12 +39,28 @@ set -euo pipefail
 # ([project.dependencies]) — the single source of truth — so a dependency added
 # there is never silently missed by this installer.
 
+DEV_INSTALL=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --dev) DEV_INSTALL=1 ;;
+    *)
+      printf '\033[31merror:\033[0m unknown option: %s (supported: --dev)\n' "$_arg" >&2
+      exit 1
+      ;;
+  esac
+done
+
+_default_repo="https://github.com/filament-dm/filament-hermes.git"
+if [ "$DEV_INSTALL" = 1 ]; then
+  _default_repo="https://github.com/filament-dm/filament-hermes-dev.git"
+fi
+
 # Where to clone the plugin from. FILAMENT_FCM_REPO accepts either a plain git
 # URL or a pip-style "git+<url>[@<ref>]" requirement — the Filament app and some
 # tooling set it in the pip form. Strip a leading git+, and (unless
 # FILAMENT_FCM_REF is set) treat a trailing "@<ref>" as the branch/tag/commit —
 # whether or not the URL carries the optional ".git" suffix.
-_repo_spec="${FILAMENT_FCM_REPO:-https://github.com/filament-dm/filament-hermes.git}"
+_repo_spec="${FILAMENT_FCM_REPO:-$_default_repo}"
 _repo_spec="${_repo_spec#git+}"
 PLUGIN_REF="${FILAMENT_FCM_REF:-}"
 # Only URLs with a scheme (https://, ssh://, ...) can carry a "@<ref>" suffix we
@@ -59,6 +84,10 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+
+if [ "$DEV_INSTALL" = 1 ] && [ -n "${FILAMENT_FCM_REPO:-}" ]; then
+  warn "--dev ignored: FILAMENT_FCM_REPO is set ($FILAMENT_FCM_REPO)"
+fi
 
 [ -n "${CONNECT_TOKEN:-}" ] || err \
   "CONNECT_TOKEN is not set. Use the connect command shown in the Filament app."
