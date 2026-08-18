@@ -63,18 +63,17 @@ fi
 _repo_spec="${FILAMENT_FCM_REPO:-$_default_repo}"
 _repo_spec="${_repo_spec#git+}"
 PLUGIN_REF="${FILAMENT_FCM_REF:-}"
-# Only URLs with a scheme (https://, ssh://, ...) can carry a "@<ref>" suffix we
-# split on; the "@" then reliably sits after "://host/path", not in a
-# scp-style "git@host:owner/repo" address (which has no scheme and is left
-# whole). The ref may itself contain "/" (e.g. a "user/branch" name), so split
-# on the LAST "@".
+# Only URLs with a scheme (https://, ssh://, ...) can carry a "@<ref>" suffix
+# we split on, and only an "@" in the *path* — after "://host/" — is a ref
+# marker: an "@" in the authority is userinfo (credentials, ssh usernames),
+# part of the URL itself. Scp-style "git@host:owner/repo" addresses have no
+# scheme and are left whole. The ref may itself contain "/" (e.g. a
+# "user/branch" name), so split on the LAST "@".
+PLUGIN_REPO_URL="$_repo_spec"
 case "$_repo_spec" in
-  *://*@*)
+  *://*/*@*)
     [ -n "$PLUGIN_REF" ] || PLUGIN_REF="${_repo_spec##*@}"
     PLUGIN_REPO_URL="${_repo_spec%@*}"
-    ;;
-  *)
-    PLUGIN_REPO_URL="$_repo_spec"
     ;;
 esac
 HERMES_HOME_DEFAULTED=0
@@ -85,8 +84,27 @@ err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
 
+# A repo URL may carry embedded credentials (https://user:token@host/...);
+# mask the userinfo before putting it in any log line.
+redact_url() {
+  case "$1" in
+    *://*)
+      _ru_scheme="${1%%://*}"
+      _ru_rest="${1#*://}"
+      _ru_auth="${_ru_rest%%/*}"
+      case "$_ru_auth" in
+        *@*)
+          printf '%s://***@%s%s' "$_ru_scheme" "${_ru_auth##*@}" "${_ru_rest#"$_ru_auth"}"
+          return
+          ;;
+      esac
+      ;;
+  esac
+  printf '%s' "$1"
+}
+
 if [ "$DEV_INSTALL" = 1 ] && [ -n "${FILAMENT_FCM_REPO:-}" ]; then
-  warn "--dev ignored: FILAMENT_FCM_REPO is set ($FILAMENT_FCM_REPO)"
+  warn "--dev ignored: FILAMENT_FCM_REPO is set"
 fi
 
 [ -n "${CONNECT_TOKEN:-}" ] || err \
@@ -270,7 +288,7 @@ CLONE_TMP="$(mktemp -d "$HERMES_HOME/plugins/.$PLUGIN_ID.XXXXXX")" \
 cleanup_clone_tmp() { rm -rf "$CLONE_TMP" 2>/dev/null || true; }
 trap cleanup_clone_tmp EXIT
 
-info "Cloning plugin from $PLUGIN_REPO_URL${PLUGIN_REF:+ (ref: $PLUGIN_REF)} ..."
+info "Cloning plugin from $(redact_url "$PLUGIN_REPO_URL")${PLUGIN_REF:+ (ref: $PLUGIN_REF)} ..."
 if [ -z "$PLUGIN_REF" ]; then
   "$GIT" clone --depth 1 "$PLUGIN_REPO_URL" "$CLONE_TMP" || err "git clone failed."
 elif "$GIT" clone --depth 1 --branch "$PLUGIN_REF" "$PLUGIN_REPO_URL" "$CLONE_TMP" 2>/dev/null; then
@@ -283,7 +301,7 @@ else
   "$GIT" -C "$CLONE_TMP" init -q || err "git init failed."
   "$GIT" -C "$CLONE_TMP" remote add origin "$PLUGIN_REPO_URL" || err "git remote add failed."
   "$GIT" -C "$CLONE_TMP" fetch --depth 1 origin "$PLUGIN_REF" \
-    || err "could not fetch ref '$PLUGIN_REF' from $PLUGIN_REPO_URL (branch, tag, or commit)."
+    || err "could not fetch ref '$PLUGIN_REF' from $(redact_url "$PLUGIN_REPO_URL") (branch, tag, or commit)."
   "$GIT" -C "$CLONE_TMP" checkout -q --detach FETCH_HEAD || err "git checkout of '$PLUGIN_REF' failed."
 fi
 
