@@ -5,16 +5,16 @@ thread) it is answering in — "searching the web for \"deploy failures\"" —
 composed deterministically from each tool call's name and primary argument.
 No model call is involved.
 
-Lifecycle: the dispatch site parks a :class:`TurnScope` (room, thread, the
-prompting message) in a pending queue and publishes the opening line. The
-turn's first tool call claims the oldest pending scope and binds it to the
-hook's ``session_id``; later calls in the turn follow the binding. (Turns
-run inside long-lived session tasks, so neither ContextVars set at dispatch
-nor the dispatch task itself reach tool execution.) Completion — including
-the error path — clears the status explicitly, except within a short grace
-period after dispatch: the gateway emits a spurious early completion when a
-message enters an already-active session. The server timeout is the crash
-backstop for anything that leaks.
+Lifecycle: dispatch parks a :class:`TurnScope` (room, thread, prompting
+message) in a pending queue and publishes the opening line. The turn's
+first tool call claims a pending scope and binds it to the hook's
+``session_id``; later calls follow the binding. (Turns run inside
+long-lived session tasks, so ContextVars set at dispatch do not reach tool
+execution.) Completion clears the status, on the error path too. The one
+exception: the gateway emits a spurious completion right after dispatch
+for a message queued into an active session, so a completion inside the
+grace window is held until the window closes. The server timeout backstops
+anything that leaks.
 
 Set ``FILAMENT_STATUS_UPDATES=0`` to disable.
 """
@@ -138,8 +138,7 @@ _PHRASES: dict[str, tuple[str, Callable[[dict], str] | None]] = {
     "process": ("planning", None),
 }
 
-# Tools whose activity is not worth narrating (sub-second, or the turn's own
-# plumbing) — publishing these would churn the line without informing anyone.
+# Tools not worth narrating: sub-second reads and the turn's own plumbing.
 _SILENT = frozenset(
     {
         "get_self",
@@ -280,14 +279,14 @@ class _Pending:
     created: float
     last_phrase: str | None = None
     last_ts: float = 0.0
-    # The gateway emits a completion ~immediately after dispatch for a message
-    # queued into an active session; a completion inside the grace window only
-    # marks the entry, and the mark is resolved later: a tool call proves the
-    # turn is live (spurious completion), the grace expiring proves it ended.
+    # Set by a completion inside the grace window. A tool call afterward
+    # means it was the gateway's spurious completion for a queued message;
+    # the grace expiring means the turn really finished.
     completed_early: bool = False
     ended: bool = False
     publishes: set = field(default_factory=set)
     refresh_task: Any = None
+    finalize_task: Any = None
 
 
 class StatusPublisher:
@@ -308,8 +307,8 @@ class StatusPublisher:
 
     def set_api(self, api: Any) -> None:
         self._api = api
-        # Earliest chance to capture the gateway loop; begin_turn re-captures
-        # on every dispatch, which covers construction before the loop exists.
+        # May run before the gateway loop exists; begin_turn re-captures
+        # the loop on every dispatch.
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -320,19 +319,19 @@ class StatusPublisher:
     def begin_turn(self, trigger_event_id: str, scope: TurnScope) -> None:
         if not enabled() or not hasattr(self._api, "set_status"):
             return
-        # Dispatch runs on the gateway loop; capture it here rather than at
-        # construction, which may happen before the loop exists.
+        # Dispatch runs on the gateway loop; hook-thread publishes are
+        # scheduled onto it.
         with contextlib.suppress(RuntimeError):
             self._loop = asyncio.get_running_loop()
         self._prune()
         entry = _Pending(scope=scope, created=time.monotonic())
         self._pending[trigger_event_id] = entry
         self._publish(entry, "reading the conversation")
-        # The opening line must not delay the first real phrase: a
-        # single-tool turn's only narratable call lands within the floor.
+        # Exempt the first real phrase from the floor, or a single-tool
+        # turn's only phrase would be suppressed.
         entry.last_ts = time.monotonic() - MIN_INTERVAL_SECONDS
-        # The server expires a status after TIMEOUT_MS; the refresh keeps the
-        # line alive across long gaps between tool calls.
+        # The refresh keeps the line alive past the server timeout during
+        # long gaps between tool calls.
         with contextlib.suppress(RuntimeError):
             entry.refresh_task = asyncio.get_running_loop().create_task(
                 self._refresh(entry)
@@ -351,6 +350,10 @@ class StatusPublisher:
                 return
             if time.monotonic() - pending.created < COMPLETION_GRACE_SECONDS:
                 pending.completed_early = True
+                if pending.finalize_task is None:
+                    pending.finalize_task = asyncio.get_running_loop().create_task(
+                        self._finalize_after_grace(trigger_event_id)
+                    )
                 return
             entry = self._pending.pop(trigger_event_id)
         if entry is None:
@@ -383,10 +386,9 @@ class StatusPublisher:
     def _claim(self, session_id: str) -> _Pending | None:
         """Bind a pending turn to this session.
 
-        A claim must never narrate into the wrong room: a session with a
-        known room only takes turns for that room, and an unknown session
-        only claims when a single turn is pending. Concurrent turns that
-        would be ambiguous stay unclaimed and simply go un-narrated.
+        Never claim into the wrong room: a session with a known room takes
+        only that room's turns, and an unknown session claims only when a
+        single turn is pending. Ambiguous turns stay un-narrated.
         """
         if not session_id or not self._pending:
             return None
@@ -417,8 +419,8 @@ class StatusPublisher:
 
     @staticmethod
     def _claimable(entry: _Pending) -> bool:
-        # An early-completed turn is claimable only inside the grace window,
-        # where the completion may have been the gateway's spurious one.
+        # Claimable only inside the grace window, where the completion may
+        # have been the gateway's spurious one.
         if not entry.completed_early:
             return True
         return time.monotonic() - entry.created < COMPLETION_GRACE_SECONDS
@@ -463,13 +465,26 @@ class StatusPublisher:
             handle.add_done_callback(entry.publishes.discard)
 
     def _halt(self, entry: _Pending) -> None:
-        """Stop everything still in flight for a turn, so nothing can land
-        after (and undo) the clear."""
+        """Stop a turn's in-flight work so nothing lands after the clear."""
         entry.ended = True
         if entry.refresh_task is not None:
             entry.refresh_task.cancel()
+        if entry.finalize_task is not None:
+            entry.finalize_task.cancel()
         for handle in list(entry.publishes):
             handle.cancel()
+
+    async def _finalize_after_grace(self, trigger_event_id: str) -> None:
+        """Clear a turn whose completion arrived inside the grace window,
+        once the window closes with no claim."""
+        await asyncio.sleep(COMPLETION_GRACE_SECONDS)
+        entry = self._pending.get(trigger_event_id)
+        if entry is None or not entry.completed_early:
+            return
+        del self._pending[trigger_event_id]
+        entry.finalize_task = None
+        self._halt(entry)
+        await self._clear(entry)
 
     async def _clear(self, entry: _Pending) -> None:
         try:

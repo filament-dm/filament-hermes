@@ -103,11 +103,16 @@ class TestBinding:
         assert "$m" not in pub._pending
 
     def test_early_completion_within_grace_is_ignored(self):
-        pub = self._publisher()
-        pub.begin_turn("$m", status.TurnScope(room_id="!r"))
-        _run(pub.end_turn("$m"))
-        assert "$m" in pub._pending
-        assert pub._pending["$m"].completed_early
+        async def go():
+            pub = self._publisher()
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            await pub.end_turn("$m")
+            assert "$m" in pub._pending
+            entry = pub._pending["$m"]
+            assert entry.completed_early
+            entry.finalize_task.cancel()
+
+        asyncio.run(go())
 
     def test_completion_after_grace_clears_unclaimed_turn(self):
         pub = self._publisher()
@@ -223,19 +228,29 @@ class TestEarlyCompletion:
         return pub, api
 
     def test_spurious_completion_still_claimable_within_grace(self):
-        pub, _ = self._publisher()
-        pub.begin_turn("$m", status.TurnScope(room_id="!r"))
-        _run(pub.end_turn("$m"))
-        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
-        assert pub._bound["sess1"].completed_early is False
+        async def go():
+            pub, _ = self._publisher()
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            await pub.end_turn("$m")
+            pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+            entry = pub._bound["sess1"]
+            assert entry.completed_early is False
+            entry.finalize_task.cancel()
+
+        asyncio.run(go())
 
     def test_early_completed_turn_not_claimable_past_grace(self):
-        pub, _ = self._publisher()
-        pub.begin_turn("$m", status.TurnScope(room_id="!r"))
-        _run(pub.end_turn("$m"))
-        pub._pending["$m"].created -= status.COMPLETION_GRACE_SECONDS + 1
-        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
-        assert "sess1" not in pub._bound
+        async def go():
+            pub, _ = self._publisher()
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            await pub.end_turn("$m")
+            entry = pub._pending["$m"]
+            entry.created -= status.COMPLETION_GRACE_SECONDS + 1
+            pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+            assert "sess1" not in pub._bound
+            entry.finalize_task.cancel()
+
+        asyncio.run(go())
 
     def test_early_completed_turn_is_finalized_by_next_prune(self):
         async def go():
@@ -302,5 +317,26 @@ class TestPublishLifecycle:
                 c["status_text"] == "reading the conversation" for c in texted
             )
             assert entry.ended and entry.refresh_task.cancelled
+
+        asyncio.run(go())
+
+    def test_fast_toolless_turn_is_cleared_when_grace_expires(self, monkeypatch):
+        monkeypatch.setattr(status, "COMPLETION_GRACE_SECONDS", 0.05)
+
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            await pub.end_turn("$m")
+            assert "$m" in pub._pending
+            await asyncio.sleep(0.15)
+            assert "$m" not in pub._pending
+            clears = [
+                c
+                for c in api.calls
+                if c.get("channel") == "!r" and "status_text" not in c
+            ]
+            assert clears
 
         asyncio.run(go())
