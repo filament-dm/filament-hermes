@@ -535,8 +535,14 @@ def connect(
         return 2
 
     resolved = (
-        url or get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents"
-    ).strip().rstrip("/")
+        (
+            url
+            or get_env_value("FILAMENT_MCP_URL")
+            or "https://api.filament.dm/mcp/agents"
+        )
+        .strip()
+        .rstrip("/")
+    )
 
     print_header("Filament (FCM)")
 

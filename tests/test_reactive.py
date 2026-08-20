@@ -165,8 +165,12 @@ def test_current_zone_default_is_data():
 
 # ── context_breadcrumb ────────────────────────────────────────────────
 def _msg(event_id, sender="@x:s", is_from_self=False, type="m.room.message"):
-    return {"event_id": event_id, "sender": sender, "is_from_self": is_from_self,
-            "type": type}
+    return {
+        "event_id": event_id,
+        "sender": sender,
+        "is_from_self": is_from_self,
+        "type": type,
+    }
 
 
 def test_breadcrumb_none_when_empty():
@@ -185,11 +189,11 @@ def test_breadcrumb_none_when_only_self():
 
 def test_breadcrumb_counts_others_excluding_self_and_trigger():
     msgs = [
-        _msg("$t"),                       # the trigger — excluded
-        _msg("$self", is_from_self=True), # our own post — excluded
-        _msg("$a"),                       # counts
-        _msg("$b"),                       # counts
-        _msg("$r", type="m.reaction"),    # not a message — excluded
+        _msg("$t"),  # the trigger — excluded
+        _msg("$self", is_from_self=True),  # our own post — excluded
+        _msg("$a"),  # counts
+        _msg("$b"),  # counts
+        _msg("$r", type="m.reaction"),  # not a message — excluded
     ]
     out = reactive.context_breadcrumb(msgs, trigger_event_id="$t")
     assert out is not None
@@ -564,16 +568,16 @@ def test_core_and_bridge_tools_survive_every_grant():
     with tempfile.TemporaryDirectory() as d:
         store = reactive.CapabilityPolicyStore(Path(d) / "capability_policy.json")
         for policy in (
-            {},                                                   # unauthored
-            {"default_capabilities": []},                         # empty default
+            {},  # unauthored
+            {"default_capabilities": []},  # empty default
             {"default_capabilities": list(reactive.DEFAULT_CAPABILITIES)},
-            {"default_capabilities": ["typo_bundle"]},            # unknown name
-            {                                                     # narrowed channel
+            {"default_capabilities": ["typo_bundle"]},  # unknown name
+            {  # narrowed channel
                 "default_capabilities": ["read_history", "post"],
                 "per_channel": {"!room:x": []},
             },
-            {                                                     # custom bundle
-                "bundles": {"list_channels": ["nothing"]},        # shadowing attempt
+            {  # custom bundle
+                "bundles": {"list_channels": ["nothing"]},  # shadowing attempt
                 "default_capabilities": ["list_channels"],
             },
         ):
@@ -657,8 +661,7 @@ def test_toolset_auto_bundle_fails_closed():
     assert store.expand_bundle("toolset:spotify") == frozenset()
     # Unknown toolset grants nothing rather than everything.
     assert (
-        store.expand_bundle("toolset:nope", toolset_tools=lambda ts: [])
-        == frozenset()
+        store.expand_bundle("toolset:nope", toolset_tools=lambda ts: []) == frozenset()
     )
 
     def boom(_ts):

@@ -402,9 +402,7 @@ def _channel_entries(
                 _Entry("channel", clean.lower(), canonical, display, label=label)
             )
         entries.append(
-            _Entry(
-                "channel", str(room_id).lower(), canonical, display, True, label
-            )
+            _Entry("channel", str(room_id).lower(), canonical, display, True, label)
         )
     return entries
 
@@ -412,18 +410,17 @@ def _channel_entries(
 def _target_entries(
     mcp_servers: object, bundles: Iterable[str], other_sources: object = ()
 ) -> list[_Entry]:
-    entries = [
-        _Entry("target", name, name, name)
-        for name in ROWS + DEPRECATED_ALIASES
-    ]
+    entries = [_Entry("target", name, name, name) for name in ROWS + DEPRECATED_ALIASES]
     for bundle in bundles or ():
         text = str(bundle)
         # mcp:-prefixed names can't name custom bundles (reserved); rows and
         # aliases are already present.
         low = text.lower()
-        if text and not low.startswith(MCP_PREFIX) and low not in {
-            e.key for e in entries
-        }:
+        if (
+            text
+            and not low.startswith(MCP_PREFIX)
+            and low not in {e.key for e in entries}
+        ):
             entries.append(_Entry("target", low, text, text))
     for server in _mcp_names(mcp_servers):
         canonical = f"{MCP_PREFIX}{server}"
@@ -514,13 +511,9 @@ def _score(
     return None, tuple(e.display for e in tied)
 
 
-def _match_word(
-    word: str, vocab: Sequence[str]
-) -> tuple[str | None, tuple[str, ...]]:
+def _match_word(word: str, vocab: Sequence[str]) -> tuple[str | None, tuple[str, ...]]:
     """``_score`` for a flat word list (command and keyword words)."""
-    entry, candidates = _score(
-        word, [_Entry("word", v.lower(), v, v) for v in vocab]
-    )
+    entry, candidates = _score(word, [_Entry("word", v.lower(), v, v) for v in vocab])
     return (str(entry.canonical) if entry else None), candidates
 
 
@@ -600,9 +593,7 @@ def _fuzzy_channel_ngram(
     ambiguity instead of a guess. ``min_n`` is 2 in slot classification
     (single tokens are the ordinary classifier's job) and 1 where the caller
     has no single-token pass of its own."""
-    channel_entries = [
-        e for e in entries if e.slot == "channel" and not e.exact_only
-    ]
+    channel_entries = [e for e in entries if e.slot == "channel" and not e.exact_only]
     if not channel_entries:
         return None, 0, ()
     best_by: dict[object, tuple[float, _Entry, int]] = {}
@@ -659,9 +650,7 @@ def _fill_slots(
     while i < len(toks):
         text = toks[i][0]
         open_entries = [e for e in entries if e.slot not in slots]
-        entry, consumed, candidates = _exact_channel_ngram(
-            toks, i, open_entries
-        )
+        entry, consumed, candidates = _exact_channel_ngram(toks, i, open_entries)
         if candidates:
             joined = " ".join(t[0] for t in toks[i : i + consumed])
             return None, Ambiguous(
@@ -714,9 +703,7 @@ def _fill_slots(
             slots[entry.slot] = entry
             i += 1
             continue
-        entry, consumed, candidates = _fuzzy_channel_ngram(
-            toks, i, open_entries
-        )
+        entry, consumed, candidates = _fuzzy_channel_ngram(toks, i, open_entries)
         if candidates:
             return None, Ambiguous(
                 command=command, token=_sanitize(text), candidates=candidates
@@ -732,9 +719,7 @@ def _fill_slots(
                 joined = " ".join(t[0] for t in toks[i : i + n])
                 bc_entry, bc_candidates = _score(joined, backchannel_entries)
                 if bc_entry is not None or bc_candidates:
-                    return None, Unparsed(
-                        command=command, problem=BACKCHANNEL_NOTE
-                    )
+                    return None, Unparsed(command=command, problem=BACKCHANNEL_NOTE)
         return None, Unparsed(
             command=command,
             problem=f'I couldn\'t match "{_sanitize(text)}" to {expects}.',
@@ -743,9 +728,7 @@ def _fill_slots(
         return slots, HelpRequest(command)
     missing = [s for s in required if s not in slots]
     if missing:
-        got = ", ".join(
-            f"{labels[s]} {slots[s].prose}" for s in required if s in slots
-        )
+        got = ", ".join(f"{labels[s]} {slots[s].prose}" for s in required if s in slots)
         need = " and ".join(labels[s] for s in missing)
         return None, Unparsed(
             command=command,
@@ -784,9 +767,7 @@ def parse(
     text = (body or "").strip()
     match = re.match(re.escape(PREFIX) + r"(\S*)", text, re.IGNORECASE)
     if not match:
-        return Unparsed(
-            command=None, problem=f"That isn't a {PREFIX} command."
-        )
+        return Unparsed(command=None, problem=f"That isn't a {PREFIX} command.")
     word = match.group(1)
     rest = text[match.end() :]
     if not word:
@@ -813,9 +794,7 @@ def parse(
     )
 
 
-def _unknown_channel(
-    command: str, token: str, backchannel_entries: Sequence[_Entry]
-):
+def _unknown_channel(command: str, token: str, backchannel_entries: Sequence[_Entry]):
     if backchannel_entries:
         bc_entry, bc_candidates = _score(token, backchannel_entries)
         if bc_entry is not None or bc_candidates:
@@ -885,9 +864,7 @@ def _parse_config(
     # scan looks at them — a channel named "Guidance Team" must not have
     # its first word read as the guidance keyword. (Exact matches only:
     # a fuzzy leading span must not steal the keyword.)
-    lead_entry, lead_consumed, _lead_cands = _exact_channel_ngram(
-        toks, 0, chan_entries
-    )
+    lead_entry, lead_consumed, _lead_cands = _exact_channel_ngram(toks, 0, chan_entries)
     skip_before = lead_consumed if lead_entry is not None else 0
     scan = [
         idx
@@ -909,9 +886,7 @@ def _parse_config(
                 clash = _keyword_channel_clash(tok, "guidance")
                 if clash is not None:
                     return clash
-            return _config_guidance(
-                rest, toks, pos, channels, backchannel_entries
-            )
+            return _config_guidance(rest, toks, pos, channels, backchannel_entries)
     entries = (
         chan_entries
         + [_Entry(sub, sub, sub, sub) for sub in _CONFIG_SUBS]
@@ -947,9 +922,7 @@ def _route_config_slots(slots: Mapping[str, _Entry]):
         return ChannelsOverview()
     if keys == {"show"}:
         # The retired whole-document form.
-        return Redirect(
-            f"`{PREFIX}config show` is now `{PREFIX}config list`."
-        )
+        return Redirect(f"`{PREFIX}config show` is now `{PREFIX}config list`.")
     if keys == {"tools", "list"}:
         return ToolsList()
     if keys == {"tools"}:
@@ -965,14 +938,12 @@ def _route_config_slots(slots: Mapping[str, _Entry]):
             ]
             return Unparsed(
                 command="tools",
-                problem=f"I understood {', '.join(got)}, but still need "
-                "the channel.",
+                problem=f"I understood {', '.join(got)}, but still need the channel.",
             )
         if "mode" in keys:
             return Unparsed(
                 command="wake",
-                problem="I understood the wake mode, but still need "
-                "the channel.",
+                problem="I understood the wake mode, but still need the channel.",
             )
         return Unparsed(
             command="config", problem="I couldn't work out which form that is."
@@ -997,11 +968,7 @@ def _route_config_slots(slots: Mapping[str, _Entry]):
                 command="wake",
                 problem="Wake takes just a channel and a mode.",
             )
-        if (
-            "mode" in keys
-            and "verb" in keys
-            and slots["verb"].canonical == "revoke"
-        ):
+        if "mode" in keys and "verb" in keys and slots["verb"].canonical == "revoke":
             # "wake all off" names two modes ("off" is the off mode in a
             # wake context) — ask, never pick one.
             mode_word = str(slots["mode"].canonical)
@@ -1027,17 +994,14 @@ def _route_config_slots(slots: Mapping[str, _Entry]):
                 problem=f"I understood channel {label}, but still need "
                 "mention, all, or off.",
             )
-        return WakeCommand(
-            room_id=room_id, channel_name=channel_name, mode=mode
-        )
+        return WakeCommand(room_id=room_id, channel_name=channel_name, mode=mode)
     if "mode" in keys:
         # A wake mode without the wake keyword: point at the exact spelling
         # rather than mutating on a guess.
         mode = str(slots["mode"].canonical)
         return Unparsed(
             command="wake",
-            problem="To set the wake mode, say "
-            f"`{PREFIX}config {ref} wake {mode}`.",
+            problem=f"To set the wake mode, say `{PREFIX}config {ref} wake {mode}`.",
         )
     if "target" in keys and "verb" in keys:
         return ToolsCommand(
@@ -1130,9 +1094,7 @@ def _config_guidance(
                 channel_entry, consumed_end = entry, head[n - 1][2]
                 break
         if channel_entry is None:
-            entry, n, candidates = _fuzzy_channel_ngram(
-                head, 0, entries, min_n=1
-            )
+            entry, n, candidates = _fuzzy_channel_ngram(head, 0, entries, min_n=1)
             if candidates:
                 return Ambiguous(
                     command="guidance",
@@ -1142,37 +1104,30 @@ def _config_guidance(
             if entry is not None:
                 channel_entry, consumed_end = entry, head[n - 1][2]
         if channel_entry is None:
-            return _unknown_channel(
-                "guidance", head[0][0], backchannel_entries
-            )
+            return _unknown_channel("guidance", head[0][0], backchannel_entries)
         text = text[consumed_end:].strip()
     room_id, channel_name = channel_entry.canonical
     if not text:
         # No text is a question: show the current guidance there.
         return GuidanceShow(room_id=room_id, channel_name=channel_name)
     if text.lower() == "clear":
-        return GuidanceCommand(
-            room_id=room_id, channel_name=channel_name, text=None
-        )
-    return GuidanceCommand(
-        room_id=room_id, channel_name=channel_name, text=text
-    )
+        return GuidanceCommand(room_id=room_id, channel_name=channel_name, text=None)
+    return GuidanceCommand(room_id=room_id, channel_name=channel_name, text=text)
 
 
 def _parse_feature(
     tokens: Sequence[tuple[str, int, int]],
     features: Mapping[str, str],
 ):
-    entries = [
-        _Entry("feature", str(name).lower(), str(name), str(name))
-        for name in features
-    ] + [
-        _Entry("state", w, True, w) for w in GRANT_WORDS
-    ] + [
-        _Entry("state", w, False, w) for w in REVOKE_WORDS
-    ] + [
-        _Entry("list", LIST_WORD, LIST_WORD, LIST_WORD)
-    ]
+    entries = (
+        [
+            _Entry("feature", str(name).lower(), str(name), str(name))
+            for name in features
+        ]
+        + [_Entry("state", w, True, w) for w in GRANT_WORDS]
+        + [_Entry("state", w, False, w) for w in REVOKE_WORDS]
+        + [_Entry("list", LIST_WORD, LIST_WORD, LIST_WORD)]
+    )
     slots, result = _fill_slots(
         tokens,
         entries,
@@ -1191,8 +1146,7 @@ def _parse_feature(
     if "list" in keys:
         return Unparsed(
             command="feature",
-            problem='"list" stands alone — say '
-            f"`{PREFIX}config feature list`.",
+            problem=f'"list" stands alone — say `{PREFIX}config feature list`.',
         )
     if keys == {"feature"}:
         # A feature with no on/off is a question: show its state.
@@ -1252,15 +1206,12 @@ def _redirect_old(
                 if word:
                     mode = word
         new = (
-            f"{PREFIX}config {label or '<channel>'} wake "
-            f"{mode or '<mention|all|off>'}"
+            f"{PREFIX}config {label or '<channel>'} wake {mode or '<mention|all|off>'}"
         )
     else:  # guidance
         label = None
         text = ""
-        tokens = [
-            t for t in _tokenize(rest) if t[0].lower() not in FILLER_WORDS
-        ]
+        tokens = [t for t in _tokenize(rest) if t[0].lower() not in FILLER_WORDS]
         if tokens and tokens[0][0].lower() != "help":
             entry, _cands = _score(tokens[0][0], _channel_entries(channels))
             if entry is not None:
@@ -1270,8 +1221,7 @@ def _redirect_old(
         tail = _sanitize(text, 60) if text and len(text) <= 60 else "<text…|clear>"
         new = f"{PREFIX}config {label or '<channel>'} guidance {tail}"
     return Redirect(
-        reply=f"`{PREFIX}{command}` moved under `{PREFIX}config` — "
-        f"say `{new}`."
+        reply=f"`{PREFIX}{command}` moved under `{PREFIX}config` — say `{new}`."
     )
 
 
@@ -1353,8 +1303,7 @@ def help_config(channels: Sequence[tuple[str, str]] = ()) -> str:
             "- `/fil-config <channel>` — that channel's full config",
             "- `/fil-config <channel> <tool> <on|off>` — grant/revoke tools "
             f"there (e.g. `/fil-config {example} linear off`)",
-            "- `/fil-config <channel> wake <mention|all|off>` — when it "
-            "wakes me",
+            "- `/fil-config <channel> wake <mention|all|off>` — when it wakes me",
             "- `/fil-config <channel> guidance <text…|clear>` — my standing "
             "guidance there (leave the text off to show it)",
             "- `/fil-config tools list` — the full tool catalog",
@@ -1375,8 +1324,7 @@ def help_tools(channels: Sequence[tuple[str, str]] = ()) -> str:
             f"(e.g. `/fil-config {example} linear off`).",
             "- `/fil-config tools list` — the full tool catalog",
             "- `/fil-config <channel>` — what's enabled there",
-            "A bundle named like a command word? Prefix it: "
-            "`bundle:wake on`.",
+            "A bundle named like a command word? Prefix it: `bundle:wake on`.",
             "Typos are fine — I'll confirm what I understood.",
         ]
     )
@@ -1421,17 +1369,13 @@ def _feature_summary(description: str) -> str:
 
 
 def help_feature(features: Mapping[str, str] | None = None) -> str:
-    lines = [
-        "`/fil-config feature <name> <on|off>` — toggle a runtime feature."
-    ]
+    lines = ["`/fil-config feature <name> <on|off>` — toggle a runtime feature."]
     features = dict(features or {})
     if features:
         lines.append("**Known features:**")
         for name in sorted(features):
             lines.append(f"- **{name}** — {_feature_summary(features[name])}.")
-    lines.append(
-        f"Example: `/fil-config feature {FEATURE_ADVANCED_TOOL_CONTROLS} on`"
-    )
+    lines.append(f"Example: `/fil-config feature {FEATURE_ADVANCED_TOOL_CONTROLS} on`")
     return "\n".join(lines)
 
 
@@ -1521,8 +1465,7 @@ def _tools_state_matches(
     if feature_flags.get(FEATURE_ADVANCED_TOOL_CONTROLS):
         return Mutation(
             changed=False,
-            reply=f"**{friendly}** {state_phrase} in **{label}** "
-            f"(tools: {listed}).",
+            reply=f"**{friendly}** {state_phrase} in **{label}** (tools: {listed}).",
         )
     flags = dict(feature_flags)
     flags[FEATURE_ADVANCED_TOOL_CONTROLS] = True
@@ -1556,11 +1499,7 @@ def apply_tools(
         grants = [str(g) for g in current]
     else:
         default = policy.get("default_capabilities")
-        grants = (
-            [str(g) for g in default]
-            if isinstance(default, list)
-            else list(ROWS)
-        )
+        grants = [str(g) for g in default] if isinstance(default, list) else list(ROWS)
     listed = ", ".join(grants) or "none (baseline only)"
     if command.verb == "grant":
         if command.target in grants:
@@ -1590,8 +1529,7 @@ def apply_tools(
     )
     return Mutation(
         changed=True,
-        reply=f"✓ {verbed} **{friendly}** in **{label}** (tools now: {now})"
-        f"{flag_note}",
+        reply=f"✓ {verbed} **{friendly}** in **{label}** (tools now: {now}){flag_note}",
         capability_policy=policy,
         feature_flags=new_flags,
         sections=sections,
@@ -1616,8 +1554,7 @@ def apply_wake(command: WakeCommand, wake_policy: dict) -> Mutation:
     if entry.get("reactive_wake") == command.mode:
         return Mutation(
             changed=False,
-            reply=f"Wake mode for **{label}** is already "
-            f"**{command.mode}** — {gloss}.",
+            reply=f"Wake mode for **{label}** is already **{command.mode}** — {gloss}.",
         )
     entry["reactive_wake"] = command.mode
     per[command.room_id] = entry
@@ -1630,16 +1567,12 @@ def apply_wake(command: WakeCommand, wake_policy: dict) -> Mutation:
     )
 
 
-def apply_guidance(
-    command: GuidanceCommand, channel_instructions: dict
-) -> Mutation:
+def apply_guidance(command: GuidanceCommand, channel_instructions: dict) -> Mutation:
     label = _channel_label(command.room_id, command.channel_name)
     mapping = dict(channel_instructions)
     if command.text is None:
         if command.room_id not in mapping:
-            return Mutation(
-                changed=False, reply=f"No guidance is set for **{label}**."
-            )
+            return Mutation(changed=False, reply=f"No guidance is set for **{label}**.")
         del mapping[command.room_id]
         return Mutation(
             changed=True,
@@ -1653,8 +1586,7 @@ def apply_guidance(
     shown = command.text if len(command.text) <= 120 else command.text[:117] + "…"
     return Mutation(
         changed=True,
-        reply=f"✓ Guidance for **{label}** set ({len(command.text)} chars): "
-        f"{shown}",
+        reply=f"✓ Guidance for **{label}** set ({len(command.text)} chars): {shown}",
         channel_instructions=mapping,
         sections=("channel_instructions",),
     )
@@ -1738,9 +1670,7 @@ def render_config_list(
             parts = ["tools: default"]
         wake_entry = wake_per.get(room_id)
         pinned = (
-            wake_entry.get("reactive_wake")
-            if isinstance(wake_entry, dict)
-            else None
+            wake_entry.get("reactive_wake") if isinstance(wake_entry, dict) else None
         )
         if pinned and pinned != default_mode:
             parts.append(f"wake: {pinned}")
@@ -1758,9 +1688,7 @@ def render_config_list(
 _EXHAUSTED = object()
 
 
-def _expand_grant(
-    name: str, custom: Mapping[str, object]
-) -> tuple[set[str], set[str]]:
+def _expand_grant(name: str, custom: Mapping[str, object]) -> tuple[set[str], set[str]]:
     """One grant's ``(names, tools)`` expansion, mirroring
     ``reactive.expand_bundle``: builtin bundles by member list, custom
     bundles by ``@name`` includes (cycle-guarded, custom wins on name
@@ -1826,11 +1754,7 @@ def _tools_status_lines(
         origin = "channel override"
     else:
         default = capability_policy.get("default_capabilities")
-        grants = (
-            [str(g) for g in default]
-            if isinstance(default, list)
-            else list(ROWS)
-        )
+        grants = [str(g) for g in default] if isinstance(default, list) else list(ROWS)
         origin = "default grant — no channel override"
     servers = _mcp_names(mcp_servers)
     counts = mcp_servers if isinstance(mcp_servers, Mapping) else {}
@@ -1900,8 +1824,7 @@ def _tools_status_lines(
             # Fail-closed expansion grants nothing for unknown names; say
             # so instead of dressing a typo up as a working bundle.
             lines.append(
-                f"- **{grant}** — unrecognized (grants nothing — "
-                "check the spelling)"
+                f"- **{grant}** — unrecognized (grants nothing — check the spelling)"
             )
     if not grants:
         lines.append("- none (baseline only)")
@@ -1953,11 +1876,7 @@ def render_channel_show(
     raw_wake_per = wake_policy.get("per_channel")
     wake_per = raw_wake_per if isinstance(raw_wake_per, dict) else {}
     wake_entry = wake_per.get(room_id)
-    pinned = (
-        wake_entry.get("reactive_wake")
-        if isinstance(wake_entry, dict)
-        else None
-    )
+    pinned = wake_entry.get("reactive_wake") if isinstance(wake_entry, dict) else None
     mode = str(pinned) if pinned else default_mode
     gloss = _WAKE_GLOSS.get(mode)
     suffix = "" if pinned else " (default)"
@@ -1999,15 +1918,12 @@ def render_tools_list(
         "",
         "**Built-in bundles:**",
     ]
-    lines += [
-        f"- **{name}** — {ROW_DESCRIPTIONS[name]}" for name in ROWS
-    ]
+    lines += [f"- **{name}** — {ROW_DESCRIPTIONS[name]}" for name in ROWS]
     lines.append("")
     names = _mcp_names(mcp_servers)
     if names:
         lines.append(
-            "**Connected MCP servers** (grant with or without the `mcp:` "
-            "prefix):"
+            "**Connected MCP servers** (grant with or without the `mcp:` prefix):"
         )
         counts = mcp_servers if isinstance(mcp_servers, Mapping) else {}
         for server in sorted(names):

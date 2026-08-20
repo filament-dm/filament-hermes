@@ -217,9 +217,7 @@ def test_apply_writes_channel_instructions_file(tmp_path):
 
 def test_seed_puts_local_files_with_base_revision_zero(tmp_path):
     local_policy = {"default_capabilities": ["messaging", "escalate"], "bundles": {}}
-    (tmp_path / "capability_policy.json").write_text(
-        json.dumps(local_policy, indent=2)
-    )
+    (tmp_path / "capability_policy.json").write_text(json.dumps(local_policy, indent=2))
     (tmp_path / "instructions.md").write_text("be nice")
     api = FakeAPI(
         get_results=[(200, {"config": None, "revision": 0})],
@@ -664,9 +662,7 @@ def test_write_back_batches_multiple_sections_in_one_put(tmp_path):
     (tmp_path / "capability_policy.json").write_text(
         '{"per_channel": {"!x": ["post"]}}'
     )
-    (tmp_path / "feature_flags.json").write_text(
-        '{"advanced_tool_controls": true}'
-    )
+    (tmp_path / "feature_flags.json").write_text('{"advanced_tool_controls": true}')
     api = FakeAPI(
         get_results=[(200, {"config": server_doc, "revision": 3})],
         put_results=[(200, {"revision": 4})],
@@ -688,9 +684,7 @@ def test_pending_write_back_rides_along_with_the_next_push(tmp_path):
     # A failed section push retries as part of the next write-back's batch —
     # one PUT carries both, and neither local edit is clobbered.
     (tmp_path / "instructions.md").write_text("Local truth.")
-    (tmp_path / "feature_flags.json").write_text(
-        '{"advanced_tool_controls": true}'
-    )
+    (tmp_path / "feature_flags.json").write_text('{"advanced_tool_controls": true}')
     api = FakeAPI(
         get_results=[
             Exception("network down"),

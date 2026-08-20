@@ -1,8 +1,9 @@
 """Installs the ``hermes filament`` top-level CLI command.
 
-    hermes plugins install filament-dm/filament-hermes --enable --force
-    hermes filament connect fmcp_YOURTOKEN
+hermes plugins install filament-dm/filament-hermes --enable --force
+hermes filament connect fmcp_YOURTOKEN
 """
+
 from __future__ import annotations
 
 import logging
