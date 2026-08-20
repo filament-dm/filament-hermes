@@ -114,9 +114,7 @@ def test_valid_policy_passes():
 def test_mcp_prefix_rejected_as_custom_bundle_name():
     # 'mcp:' names are reserved for the automatic per-server bundles — a
     # custom definition would shadow the live expansion.
-    err = plugin._capability_policy_error(
-        {"bundles": {"mcp:linear": ["create_issue"]}}
-    )
+    err = plugin._capability_policy_error({"bundles": {"mcp:linear": ["create_issue"]}})
     assert err is not None and "reserved" in err
 
 

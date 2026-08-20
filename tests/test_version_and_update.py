@@ -200,9 +200,7 @@ def _fetch_with_fake_httpx(monkeypatch):
 def test_fetch_latest_version_env_url_override(monkeypatch):
     # The env var is read per call, after module load — a harness that sets
     # it before starting the gateway redirects the check to its own server.
-    monkeypatch.setenv(
-        "FILAMENT_UPDATE_CHECK_URL", "http://127.0.0.1:9/pyproject.toml"
-    )
+    monkeypatch.setenv("FILAMENT_UPDATE_CHECK_URL", "http://127.0.0.1:9/pyproject.toml")
     assert _fetch_with_fake_httpx(monkeypatch) == "http://127.0.0.1:9/pyproject.toml"
 
 
@@ -326,7 +324,8 @@ def test_adapter_imports_what_the_reminder_delivery_uses():
     adapter_src = (_PKG_DIR / "adapter.py").read_text()
     if "build_reminder(" in adapter_src:
         import_line = next(
-            line for line in adapter_src.splitlines()
+            line
+            for line in adapter_src.splitlines()
             if line.startswith("from .update_check import")
         )
         assert "build_reminder" in import_line

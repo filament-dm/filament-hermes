@@ -55,8 +55,7 @@ def test_aliases_match_reactive_builtin_bundles():
 def test_constants_match_reactive():
     assert slash.MCP_PREFIX == reactive.MCP_BUNDLE_PREFIX
     assert (
-        slash.FEATURE_ADVANCED_TOOL_CONTROLS
-        == reactive.FEATURE_ADVANCED_TOOL_CONTROLS
+        slash.FEATURE_ADVANCED_TOOL_CONTROLS == reactive.FEATURE_ADVANCED_TOOL_CONTROLS
     )
     assert slash.FEATURE_ADVANCED_TOOL_CONTROLS in reactive.KNOWN_FEATURES
 
@@ -265,9 +264,7 @@ MW_CHANNELS = [
 
 def test_multiword_channel_exact_show_and_mutation():
     result = parse("/fil-config #General Chat show", channels=MW_CHANNELS)
-    assert result == slash.ChannelShow(
-        room_id="!gc:fil", channel_name="General Chat"
-    )
+    assert result == slash.ChannelShow(room_id="!gc:fil", channel_name="General Chat")
     result = parse("/fil-config General Chat linear off", channels=MW_CHANNELS)
     assert result == slash.ToolsCommand(
         room_id="!gc:fil",
@@ -307,9 +304,7 @@ def test_multiword_channel_near_tie_still_asks():
 
 
 def test_multiword_channel_guidance_and_example_roundtrip():
-    result = parse(
-        "/fil-config General Chat guidance be nice", channels=MW_CHANNELS
-    )
+    result = parse("/fil-config General Chat guidance be nice", channels=MW_CHANNELS)
     assert result == slash.GuidanceCommand(
         room_id="!gc:fil", channel_name="General Chat", text="be nice"
     )
@@ -472,9 +467,7 @@ def test_guidance_clear_is_case_insensitive():
 
 def test_guidance_channel_without_text_is_a_show_query():
     result = parse("/fil-config #welcome guidance")
-    assert result == slash.GuidanceShow(
-        room_id="!welcome:fil", channel_name="welcome"
-    )
+    assert result == slash.GuidanceShow(room_id="!welcome:fil", channel_name="welcome")
 
 
 def test_guidance_keyword_alone_routes_to_contextual_help():
@@ -502,9 +495,7 @@ def test_feature_on_off_and_typo():
     assert result == slash.FeatureCommand(
         feature="advanced_tool_controls", enabled=True
     )
-    result = parse(
-        "/fil-config feature advnced_tool_controls off", features=features
-    )
+    result = parse("/fil-config feature advnced_tool_controls off", features=features)
     assert result == slash.FeatureCommand(
         feature="advanced_tool_controls", enabled=False
     )
@@ -522,15 +513,9 @@ def test_feature_unknown_name_is_unparsed():
 def test_feature_bare_and_list_render_the_feature_list():
     features = dict(reactive.KNOWN_FEATURES)
     assert parse("/fil-config feature", features=features) == slash.FeatureList()
-    assert (
-        parse("/fil-config feature list", features=features)
-        == slash.FeatureList()
-    )
+    assert parse("/fil-config feature list", features=features) == slash.FeatureList()
     # Fuzzy like any other token.
-    assert (
-        parse("/fil-config feature lst", features=features)
-        == slash.FeatureList()
-    )
+    assert parse("/fil-config feature lst", features=features) == slash.FeatureList()
 
 
 def test_feature_name_without_verb_is_a_show_query():
@@ -538,16 +523,12 @@ def test_feature_name_without_verb_is_a_show_query():
     result = parse("/fil-config feature slash_commands", features=features)
     assert result == slash.FeatureShow(feature="slash_commands")
     # Typos resolve the same way as in the mutation form.
-    result = parse(
-        "/fil-config feature advnced_tool_controls", features=features
-    )
+    result = parse("/fil-config feature advnced_tool_controls", features=features)
     assert result == slash.FeatureShow(feature="advanced_tool_controls")
 
 
 def test_feature_state_without_name_still_asks():
-    result = parse(
-        "/fil-config feature on", features=dict(reactive.KNOWN_FEATURES)
-    )
+    result = parse("/fil-config feature on", features=dict(reactive.KNOWN_FEATURES))
     assert isinstance(result, slash.Unparsed)
     assert "feature name" in result.problem
 
@@ -694,12 +675,8 @@ def test_help_feature_lists_known_features():
 
 def test_help_for_dispatches():
     assert slash.help_for(None) == slash.help_index()
-    assert slash.help_for("config", channels=CHANNELS) == slash.help_config(
-        CHANNELS
-    )
-    assert slash.help_for("tools", channels=CHANNELS) == slash.help_tools(
-        CHANNELS
-    )
+    assert slash.help_for("config", channels=CHANNELS) == slash.help_config(CHANNELS)
+    assert slash.help_for("tools", channels=CHANNELS) == slash.help_tools(CHANNELS)
 
 
 def test_example_channel_placeholder_when_no_shared_channels():
@@ -790,9 +767,7 @@ def test_apply_tools_revoke_row_from_default():
 
 
 def test_apply_tools_echo_matches_product_copy():
-    policy = {
-        "per_channel": {"!welcome:fil": [*slash.ROWS, "mcp:linear"]}
-    }
+    policy = {"per_channel": {"!welcome:fil": [*slash.ROWS, "mcp:linear"]}}
     mutation = slash.apply_tools(
         _tools("mcp:linear", "revoke"), policy, {"advanced_tool_controls": True}
     )
@@ -1045,9 +1020,7 @@ def test_render_channel_show_override_wake_pin_and_guidance():
         mcp_servers={"linear": 62, "gcal": None},
     )
     assert "**Tools** (channel override):" in text
-    assert (
-        f"- **read_history** — {slash.ROW_DESCRIPTIONS['read_history']}" in text
-    )
+    assert f"- **read_history** — {slash.ROW_DESCRIPTIONS['read_history']}" in text
     assert "- **mcp:linear** — MCP server (62 tools)" in text
     assert "**Off:** post, directory, escalate, mcp:gcal" in text
     # Gate already on → no "not enforced" note.
@@ -1073,9 +1046,7 @@ def test_render_channel_show_empty_override_and_unknown_grants():
     text = slash.render_channel_show(
         room_id="!welcome:fil",
         channel_name="welcome",
-        capability_policy={
-            "per_channel": {"!welcome:fil": ["calendar", "mcp:gone"]}
-        },
+        capability_policy={"per_channel": {"!welcome:fil": ["calendar", "mcp:gone"]}},
         feature_flags={"advanced_tool_controls": True},
         wake_policy={},
         channel_instructions={},
@@ -1109,8 +1080,7 @@ def test_render_tools_list_shows_full_catalog():
     assert "**Runtime plugins on this agent's host**" in text
     assert (
         "always available in the backchannel; grant per channel by name "
-        "(e.g. `#channel spotify on`): spotify (7 tools), terminal (1 tool)"
-        in text
+        "(e.g. `#channel spotify on`): spotify (7 tools), terminal (1 tool)" in text
     )
     # The change example uses the new form and a real channel.
     assert "`/fil-config #welcome linear off`" in text
@@ -1258,10 +1228,7 @@ def test_channel_show_custom_bundle_expansion_covers_rows_and_mcp():
         channel_instructions={},
         mcp_servers={"linear": 62, "gcal": None},
     )
-    assert (
-        f"- **escalate** — {slash.ROW_DESCRIPTIONS['escalate']} (via combo)"
-        in text
-    )
+    assert f"- **escalate** — {slash.ROW_DESCRIPTIONS['escalate']} (via combo)" in text
     assert "- **combo** — custom bundle" in text
     # mcp:linear is covered through the bundle → not in the Off list.
     assert "**Off:** read_history, post, directory, mcp:gcal" in text
@@ -1274,9 +1241,7 @@ def test_four_word_channel_resolves():
     # The n-gram width follows the longest known name, so no real channel
     # is out of reach.
     channels = [*CHANNELS, ("!csw:fil", "customer success west coast")]
-    res = parse(
-        "/fil-config customer success west coast show", channels=channels
-    )
+    res = parse("/fil-config customer success west coast show", channels=channels)
     assert isinstance(res, slash.ChannelShow)
     assert res.room_id == "!csw:fil"
     res = parse(
@@ -1305,9 +1270,7 @@ def test_channel_named_with_filler_word_resolves():
 
 def test_guidance_channel_containing_filler_word():
     channels = [*CHANNELS, ("!lounge:fil", "The Lounge")]
-    res = parse(
-        "/fil-config The Lounge guidance Be gentle.", channels=channels
-    )
+    res = parse("/fil-config The Lounge guidance Be gentle.", channels=channels)
     assert isinstance(res, slash.GuidanceCommand)
     assert res.room_id == "!lounge:fil"
     assert res.text == "Be gentle."
@@ -1354,10 +1317,7 @@ def test_duplicate_channel_names_are_distinguishable_candidates():
 def test_example_channel_is_not_markdown_escaped():
     # Examples render inside code spans, where escaping doesn't apply — a
     # backslash would end up in the command the principal copies back.
-    assert (
-        slash._example_channel([("!g:fil", "general_chat")])
-        == "#general_chat"
-    )
+    assert slash._example_channel([("!g:fil", "general_chat")]) == "#general_chat"
     text = slash.help_config([("!g:fil", "general_chat")])
     assert "#general_chat" in text
     assert "\\_" not in text
@@ -1399,9 +1359,7 @@ def test_channel_show_row_covered_by_split_bundles_names_both():
         wake_policy={},
         channel_instructions={},
     )
-    assert (
-        f"- **post** — {slash.ROW_DESCRIPTIONS['post']} (via a, b)" in text
-    )
+    assert f"- **post** — {slash.ROW_DESCRIPTIONS['post']} (via a, b)" in text
 
 
 def test_channel_show_alias_named_custom_bundle_is_a_bundle():
@@ -1412,9 +1370,7 @@ def test_channel_show_alias_named_custom_bundle_is_a_bundle():
         channel_name="welcome",
         capability_policy={
             "per_channel": {"!welcome:fil": ["messaging"]},
-            "bundles": {
-                "messaging": ["get_user_profile", "search_members"]
-            },
+            "bundles": {"messaging": ["get_user_profile", "search_members"]},
         },
         feature_flags={"advanced_tool_controls": True},
         wake_policy={},
@@ -1470,9 +1426,7 @@ def test_channel_named_guidance_team_takes_guidance():
     # A leading channel name owns its tokens before the keyword scan: the
     # first word of "Guidance Team" must not read as the guidance keyword.
     channels = [*CHANNELS, ("!gt:fil", "Guidance Team")]
-    res = parse(
-        "/fil-config Guidance Team guidance Be nice.", channels=channels
-    )
+    res = parse("/fil-config Guidance Team guidance Be nice.", channels=channels)
     assert isinstance(res, slash.GuidanceCommand)
     assert res.room_id == "!gt:fil"
     assert res.text == "Be nice."

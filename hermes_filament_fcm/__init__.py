@@ -893,8 +893,7 @@ def _register_reactive_tools(
             return None
         if section == "channel_instructions":
             if not isinstance(value, dict) or not all(
-                isinstance(k, str) and isinstance(v, str)
-                for k, v in value.items()
+                isinstance(k, str) and isinstance(v, str) for k, v in value.items()
             ):
                 return (
                     "channel_instructions must be an object mapping room id "
