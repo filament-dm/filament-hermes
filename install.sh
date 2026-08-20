@@ -383,8 +383,9 @@ run_setup() {
     "$PY" -m hermes_filament_fcm.setup_cli "$@"
 }
 
-# Re-attach the terminal so the setup wizard's prompts work even under
-# 'curl | bash', where stdin is the download pipe rather than your keyboard.
+# Re-attach the terminal so the setup wizard's prompts work even when this
+# script is piped from curl straight into bash, where stdin is the download
+# pipe rather than your keyboard.
 if [ -t 1 ] && [ -r /dev/tty ]; then
   run_setup < /dev/tty
 else

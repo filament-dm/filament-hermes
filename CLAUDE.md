@@ -1,4 +1,4 @@
-# CLAUDE.md
+# Repository guidance for coding agents
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -16,6 +16,8 @@ uv run --group dev ruff check .            # lint (config in pyproject.toml)
 ```
 
 There is no build step. End users never install this by hand — the Filament app hands them a one-liner that runs `install.sh` with a `CONNECT_TOKEN`, which pip-installs the package into the Hermes venv and runs the `filament-fcm-setup` wizard (`setup_cli.py`).
+
+`hermes plugins install` and `hermes plugins update` security-scan the whole cloned tree, `tests/` and docs included, and refuse to install anything they rate `dangerous`. Every version of this plugin has to pass that scan — check it before merging.
 
 ## The Hermes dependency is implicit — and tests must not need it
 
