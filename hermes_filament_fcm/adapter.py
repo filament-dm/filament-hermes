@@ -56,9 +56,11 @@ from .observability import (
 from .reactive import (
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
+    FEATURE_SHARED_CHANNEL_SESSIONS,
     FEATURE_SLASH_COMMANDS,
     KNOWN_FEATURES,
     CapabilityPolicyStore,
+    ChannelCursorStore,
     ChannelInstructionsStore,
     EngagedThreadStore,
     FeatureFlagStore,
@@ -66,18 +68,29 @@ from .reactive import (
     WakePolicyStore,
     capability_hint,
     context_breadcrumb,
+    conversation_key,
     current_capabilities,
+    current_cursor_channel,
+    current_reply_anchor,
     current_zone,
     guidance_block,
     is_agent_mention,
     is_system_sender,
+    keying_and_reply,
     principal_note,
+    reply_thread_for_send,
     sender_is_agent_in_thread,
 )
 from .server_config import ServerConfigSync
 from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
+# Marker written into config.extra alongside the plugin-managed session
+# keying knob, so a later adapter construction can tell the flag's own
+# residue from a genuine operator pin.
+_SESSION_KEYING_MANAGED_KEY = "_filament_fcm_managed_session_keying"
+
+
 logger = logging.getLogger("gateway.filament_fcm")
 slog = get_logger()
 
@@ -282,6 +295,25 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # enables it from the backchannel, a data turn stays ungated (None) and
         # gets no tool hint — i.e. a fresh install behaves exactly as before.
         self._feature_flags = FeatureFlagStore()
+        # The per-channel read cursor: advanced by the get_recent_messages
+        # tool proxy for window-covering fetches, consumed here so the
+        # breadcrumb counts the exact unread delta and goes quiet once
+        # caught up (shared-session keying only — see _context_breadcrumb).
+        self._channel_cursors = ChannelCursorStore()
+        # Whether the OPERATOR pinned session grouping to SHARED in the
+        # platform config. Only an explicit, unmarked False can carry
+        # operator intent: the engine scaffolds group_sessions_per_user at
+        # its default (True) into every config.yaml it writes, so a True —
+        # or mere key presence — is scaffold, not a choice, and must follow
+        # the flag (reading it as a pin would dead-letter the flag on every
+        # stock install). The flag's own write is False WITH the managed
+        # marker, so it can never read back as a pin either.
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        self._session_grouping_pinned = (
+            isinstance(extra, dict)
+            and extra.get("group_sessions_per_user") is False
+            and _SESSION_KEYING_MANAGED_KEY not in extra
+        )
         # Threads the agent was @-mentioned in — the "already engaged" half of
         # the engaged-thread wake rule (ENG-724). Recorded on admitted mention
         # wakes; read fresh per event like the wake policy.
@@ -1309,7 +1341,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             call_origin="adapter_send",
         ):
             try:
-                thread_id = (metadata or {}).get("thread_id") if metadata else None
+                thread_id = reply_thread_for_send(
+                    (metadata or {}).get("thread_id") if metadata else None,
+                    current_reply_anchor.get(),
+                    chat_id,
+                )
                 slog.info(
                     "filament_fcm.send.start",
                     installation_id=self._installation_id,
@@ -1486,6 +1522,67 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         ):
             await self._handle_push_message_turn(msg, turn_id)
 
+    def _shared_sessions_effective(self) -> bool:
+        """Whether shared channels currently key to ONE session per channel
+        — the fact the read cursor's soundness rests on. An operator pin
+        (an explicit, unmarked ``group_sessions_per_user: false``) means
+        shared by config; otherwise the feature flag decides. A True knob
+        is the engine's scaffolded default and never a pin — per-sender
+        keying is expressed by leaving the flag off, not by the knob."""
+        if getattr(self, "_session_grouping_pinned", False):
+            return True
+        flags = getattr(self, "_feature_flags", None)
+        return bool(flags and flags.is_enabled(FEATURE_SHARED_CHANNEL_SESSIONS))
+
+    def _cursor_channel_for_turn(
+        self, channel: str, thread_id: "str | None" = None
+    ) -> "str | None":
+        """The room this data turn may record a read cursor for: its own
+        channel, only when the turn's conversation IS the channel
+        (``conversation_key`` — a thread turn joins a different
+        conversation, whose reads say nothing about what the channel
+        session has seen) and only under effective shared-session keying.
+        Under per-sender keying a fetch is one reader's, not the channel
+        conversation's — recording it channel-wide would let a cursor laid
+        down before a keying flip mark the brand-new shared session as
+        caught up on messages it never saw."""
+        kind, _ = conversation_key(channel, thread_id)
+        if kind != "channel":
+            return None
+        return channel if self._shared_sessions_effective() else None
+
+    def _apply_session_keying(self) -> None:
+        """Honor the ``shared_channel_sessions`` flag: while on, shared
+        channels get ONE session per channel (sender becomes a label in
+        the envelope, not a partition of memory) by pointing the base
+        adapter's ``group_sessions_per_user`` knob at False before the
+        session key is derived. An operator pin — an explicit, unmarked
+        False, the one value the engine's scaffolded default (True) can't
+        produce — already means shared and is never touched. The flag is
+        read fresh per event so a backchannel toggle takes effect on the
+        next wake, no restart. DM (backchannel) and thread keying are
+        untouched either way.
+
+        The knob is written ONLY while the flag is on, always alongside the
+        managed marker; turning the flag off removes both, restoring
+        "absent = core default". The marker is what keeps the flag's own
+        residue from reading as an operator pin (and freezing this
+        privacy-sensitive knob) when the platform rebuilds the adapter over
+        the same config object."""
+        # getattr default True (= pinned, no-op): partially-constructed
+        # instances (tests build via __new__) must never mutate config.
+        if getattr(self, "_session_grouping_pinned", True):
+            return
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        if not isinstance(extra, dict):
+            return
+        if self._feature_flags.is_enabled(FEATURE_SHARED_CHANNEL_SESSIONS):
+            extra["group_sessions_per_user"] = False
+            extra[_SESSION_KEYING_MANAGED_KEY] = True
+        elif _SESSION_KEYING_MANAGED_KEY in extra:
+            extra.pop("group_sessions_per_user", None)
+            extra.pop(_SESSION_KEYING_MANAGED_KEY, None)
+
     async def _handle_push_message_turn(self, msg: PushMessage, turn_id: str) -> None:
         """Route an incoming message: backchannel = control, else = reactive.
 
@@ -1652,10 +1749,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # an existing thread stays threaded. Resolving to None here (rather than
         # coaxing the model to call post_message) is what makes main-timeline
         # replies reliable: send() already routes None → post_message.
-        if self._wake_policy.reply_style(msg.room_id) == "channel":
-            thread_id = msg.thread_id
-        else:
-            thread_id = msg.thread_id or msg.event_id
+        keying_thread, reply_anchor = keying_and_reply(
+            msg.thread_id,
+            msg.event_id,
+            self._wake_policy.reply_style(msg.room_id),
+            self._shared_sessions_effective(),
+        )
         await self._wake(
             channel=msg.room_id,
             channel_name=msg.room_name,
@@ -1666,7 +1765,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # mention-only one — is never mistaken for a reaction in _wake.
             data=data,
             target_event_id=msg.event_id,
-            thread_id=thread_id,
+            thread_id=keying_thread,
+            reply_anchor=reply_anchor,
             raw=msg.raw,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
@@ -1694,7 +1794,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return None
-        crumb = context_breadcrumb(messages, trigger_event_id=trigger_event_id)
+        # The read cursor is a channel-wide fact; it only means "THIS
+        # conversation has seen it" when the channel has exactly one
+        # conversation, so it is consulted only under EFFECTIVE
+        # shared-session keying (flag or operator pin, see
+        # _shared_sessions_effective). Per-sender sessions keep the
+        # windowed count: one sender's fetch must not silence another
+        # sender's cue.
+        cursors = getattr(self, "_channel_cursors", None)
+        cursor_applies = bool(cursors and self._shared_sessions_effective())
+        crumb = context_breadcrumb(
+            messages,
+            trigger_event_id=trigger_event_id,
+            last_seen_event_id=(cursors.get(channel) if cursor_applies else None),
+        )
         logger.info(
             "filament-fcm: context breadcrumb for %s: %d messages read, cue=%s",
             channel,
@@ -1843,6 +1956,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Control plane keeps full capability: None = ungated (the capability
         # gate only restricts data turns, which set an explicit allowed set).
         current_capabilities.set(None)
+        # A backchannel turn is never a channel's shared session: its reads
+        # must not mark any channel's conversation as caught up.
+        current_cursor_channel.set(None)
+        current_reply_anchor.set(None)
+        # Applied synchronously right before dispatch: the base adapter
+        # derives the session key at handle_message entry, so no await can
+        # interleave a flag toggle between decision and use — and the
+        # turn's config sync has already run, so the flag is fresh.
+        self._apply_session_keying()
         await self.handle_message(event)
 
     # ── Slash commands (control plane, no LLM) ──────────────────────
@@ -2126,6 +2248,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             trigger="reaction",
             key=reaction.key,
         )
+        # A reaction's reply always anchors to the reacted message.
+        keying_thread, reply_anchor = keying_and_reply(
+            reaction.thread_id,
+            reaction.target_event_id,
+            "thread",
+            self._shared_sessions_effective(),
+        )
         await self._wake(
             channel=reaction.room_id,
             channel_name=reaction.room_name,
@@ -2134,7 +2263,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             trigger=f"{reaction.key} reaction",
             data=None,
             target_event_id=reaction.target_event_id,
-            thread_id=reaction.thread_id or reaction.target_event_id,
+            thread_id=keying_thread,
+            reply_anchor=reply_anchor,
             raw=reaction.raw,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
@@ -2151,6 +2281,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         target_event_id: str,
         thread_id: str | None,
         raw: dict | None,
+        reply_anchor: str | None = None,
     ) -> None:
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + any per-channel guidance + the event data,
@@ -2267,12 +2398,43 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             instructions_length=len(instructions),
             envelope_length=len(envelope),
         )
+        # The session-scope rule is reactive.conversation_key; this line
+        # makes each turn's resolution greppable in gateway.log.
+        scope_kind, scope_id = conversation_key(channel, thread_id)
+        logger.info(
+            "filament-fcm: session scope: %s %s (%s)",
+            scope_kind,
+            scope_id,
+            "root + replies"
+            if scope_kind == "thread"
+            else "top-level messages, "
+            + (
+                "one shared session"
+                if self._shared_sessions_effective()
+                else "one session per sender"
+            ),
+        )
         current_zone.set("data")
         # Pin this turn's tool-capability grant (resolved above) so the
         # pre_tool_call hook (registered in __init__) denies any tool outside
         # the set — hard enforcement the data-as-data framing can't be talked
         # out of. Fail-closed: an unlisted channel/user got the minimal default.
         current_capabilities.set(allowed)
+        # This turn may record a read cursor only for its own channel, and
+        # only while shared-session keying is effective. Under per-sender
+        # keying (or from any other channel's turn) a fetch is one reader's,
+        # not the channel conversation's, and must not quiet the cue for a
+        # session that never saw the messages.
+        current_cursor_channel.set(self._cursor_channel_for_turn(channel, thread_id))
+        # send() threads the reply under the anchor; the session key never
+        # sees it.
+        current_reply_anchor.set(
+            (channel, reply_anchor)
+            if reply_anchor and reply_anchor != thread_id
+            else None
+        )
+        # Same last-moment keying application as the control path.
+        self._apply_session_keying()
         await self.handle_message(event)
 
     # ── Processing lifecycle (👀 reaction) ─────────────────────────
