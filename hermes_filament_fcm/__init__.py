@@ -58,6 +58,8 @@ from .reactive import (
 )
 from .server_config import ServerConfigSync, derive_tool_health
 from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
+from .status import enabled as status_enabled
+from .status import pre_tool_call_hook as status_pre_tool_call
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -605,6 +607,9 @@ def _register_capability_gate(ctx: Any) -> None:
     try:
         ctx.register_hook("pre_tool_call", _capability_pre_tool_call)
         logger.info("filament-fcm: capability gate registered (pre_tool_call)")
+        if status_enabled():
+            ctx.register_hook("pre_tool_call", status_pre_tool_call)
+            logger.info("filament-fcm: status narrator registered (pre_tool_call)")
     except Exception:
         # A Hermes without the pre_tool_call hook point would leave data turns
         # protected by framing only (the prior behavior) — degrade loudly, don't
