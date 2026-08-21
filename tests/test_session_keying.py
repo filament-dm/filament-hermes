@@ -70,7 +70,14 @@ def _load_modules():
     pkg = types.ModuleType("hermes_filament_fcm")
     pkg.__path__ = [str(_PKG_DIR)]
     sys.modules["hermes_filament_fcm"] = pkg
-    for name in ("credentials", "fcm_client", "filament_api", "reactive", "adapter"):
+    for name in (
+        "credentials",
+        "fcm_client",
+        "filament_api",
+        "reactive",
+        "turn_context",
+        "adapter",
+    ):
         spec = importlib.util.spec_from_file_location(
             f"hermes_filament_fcm.{name}", _PKG_DIR / f"{name}.py"
         )
@@ -79,11 +86,12 @@ def _load_modules():
         spec.loader.exec_module(module)
     return (
         sys.modules["hermes_filament_fcm.reactive"],
+        sys.modules["hermes_filament_fcm.turn_context"],
         sys.modules["hermes_filament_fcm.adapter"],
     )
 
 
-reactive, adapter = _load_modules()
+reactive, turn_context, adapter = _load_modules()
 
 
 def _make(tmp: Path, *, extra: dict, pinned_by_operator: bool):
@@ -266,7 +274,7 @@ def test_cursor_recording_scoped_to_shared_session_turns():
     # Under per-sender keying nothing may record — else a cursor laid down
     # before a keying flip marks the brand-new shared session as caught up
     # on messages it never saw (and outside any turn: fail-safe None).
-    assert reactive.current_cursor_channel.get() is None
+    assert turn_context.current().cursor_channel is None
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         a = _make(tmp, extra={}, pinned_by_operator=False)

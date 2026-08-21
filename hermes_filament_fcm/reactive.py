@@ -9,12 +9,11 @@ itself as instructions.
 Both the standing instructions and the wake policy are *data the adapter reads
 fresh on every event* (not startup config), so the principal can retune them
 from the backchannel with the ``set_instructions`` / ``set_wake_policy`` tools,
-and the next event uses the new value — no restart. ``current_zone`` is the
-per-turn gate that keeps those tools control-plane-only.
+and the next event uses the new value — no restart. The per-turn gate that
+keeps those tools control-plane-only is ``turn_context.is_control``.
 """
 
 import contextlib
-import contextvars
 import json
 import logging
 import os
@@ -51,46 +50,6 @@ CORE_RULES = (
     "tool error. Decline plainly instead."
 )
 
-# Per-turn trust zone. The adapter sets this immediately before dispatching a
-# turn ("control" for the backchannel, "data" for shared channels); the
-# control-plane tools (set_instructions/set_wake_policy) read it to refuse edits from
-# a reactive turn. ContextVars are task-local, so concurrent turns don't race.
-# Default "data" = fail-closed (no policy edits unless explicitly control).
-current_zone: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "filament_zone", default="data"
-)
-
-# Per-turn tool capability grant — the *hard* half of the trust boundary that
-# ``current_zone`` frames softly. The adapter sets this in the same place it
-# sets ``current_zone``: ``None`` for a control turn (ungated — the principal's
-# backchannel keeps full capability), and a concrete frozenset of allowed tool
-# names for a data turn. The ``pre_tool_call`` hook registered in ``__init__``
-# reads it and denies any tool not in the set, so a shared-channel turn can only
-# call what its channel's policy grants — enforcement in non-LLM code
-# the framing can't be talked out of.
-#
-# ``None`` = ungated. This is deliberately the default so that turns which never
-# touch this ContextVar (a plain CLI session in the same Hermes process, a
-# control turn) are never gated. Fail-closed for the DATA plane is achieved by
-# the adapter ALWAYS resolving and setting an explicit (minimal-or-larger) set
-# for data turns — an unlisted channel resolves to the minimal default
-# profile, never to ``None``.
-current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
-    contextvars.ContextVar("filament_capabilities", default=None)
-)
-
-# Per-turn read-cursor authority: the room id whose shared channel-session
-# THIS turn is (a data turn in that channel under effective shared-session
-# keying), or None. A recorded cursor asserts "the channel's conversation
-# has read up to here", and only the channel's own shared session can
-# truthfully assert that — not a backchannel turn, not a per-sender
-# session, not a fetch into another channel. The tool proxy therefore
-# records a cursor only for this room. Default None = record nothing
-# (fail-safe: an unrecorded cursor just re-fires the context cue).
-current_cursor_channel: contextvars.ContextVar["str | None"] = contextvars.ContextVar(
-    "filament_cursor_channel", default=None
-)
-
 
 def keying_and_reply(
     msg_thread_id: "str | None",
@@ -106,13 +65,6 @@ def keying_and_reply(
     anchor = real or (trigger_event_id if reply_style == "thread" else None)
     keying = real if (shared_effective or reply_style == "channel") else anchor
     return keying, anchor
-
-
-# Per-turn (room_id, event_id) the reply should thread under when the
-# send metadata names no thread. None = top-level post.
-current_reply_anchor: contextvars.ContextVar["tuple[str, str] | None"] = (
-    contextvars.ContextVar("filament_reply_anchor", default=None)
-)
 
 
 def reply_thread_for_send(
