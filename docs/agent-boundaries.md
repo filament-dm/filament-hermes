@@ -165,9 +165,10 @@ so Filament shows a single presence.
   owner, and `cc_room_id`.
 - **Push:** Filament allows many pushers per user (hence `list_push_tokens` is plural), so
   the server fans every push out to both processes. **Each process must use a distinct
-  `FILAMENT_FCM_CREDENTIALS_DIR`** (default `~/.hermes/filament-fcm/`, see
-  `credentials.py:22`) or they clobber each other's FCM registration. Two gateways on one
-  host also need separate `HERMES_HOME`.
+  state directory** (default `$HERMES_HOME/filament-fcm/`, override with
+  `FILAMENT_FCM_CREDENTIALS_DIR` — see `credentials.default_state_dir`) or they clobber
+  each other's FCM registration. Two gateways on one host also need separate
+  `HERMES_HOME`, which now gives them distinct state directories for free.
 - **Routing = work-claiming, not auth.** Both see every push, so each claims a *disjoint*
   slice by a deterministic zone rule (control process: backchannel + principal DMs; data
   process: other loops). The existing `_seen_events` dedup is per-process and won't

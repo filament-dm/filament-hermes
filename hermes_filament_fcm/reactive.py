@@ -306,10 +306,21 @@ def is_system_sender(sender: str | None, self_user_id: str | None) -> bool:
 
 
 def _default_dir() -> Path:
-    return Path(
-        os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
-        or (Path.home() / ".hermes" / "filament-fcm")
-    )
+    """The plugin state directory — per Hermes profile, keyed off HERMES_HOME.
+
+    Mirrors ``credentials.default_state_dir`` (this module stays standalone-
+    importable, see CLAUDE.md, so it can't import that one): env override,
+    else ``$HERMES_HOME/filament-fcm``, else ``~/.hermes/filament-fcm``. The
+    legacy-directory migration lives only in credentials.py and has already
+    run by the time these stores are read — the adapter constructs its
+    CredentialStore at gateway start, before any wake.
+    """
+    override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
+    if override:
+        return Path(override)
+    home = os.environ.get("HERMES_HOME")
+    hermes_home = Path(home) if home else Path.home() / ".hermes"
+    return hermes_home / "filament-fcm"
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

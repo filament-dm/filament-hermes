@@ -5,9 +5,16 @@ plugin doesn't re-register with Google on every startup, and the
 persistent ids of already-received pushes so Google MCS doesn't
 redeliver them after a gateway restart.
 
-Credentials are stored at ~/.hermes/filament-fcm/fcm_credentials.json
-and received ids at ~/.hermes/filament-fcm/received_persistent_ids.json
-(or the directory specified by FILAMENT_FCM_CREDENTIALS_DIR).
+Credentials are stored at $HERMES_HOME/filament-fcm/fcm_credentials.json
+and received ids at $HERMES_HOME/filament-fcm/received_persistent_ids.json
+(or the directory specified by FILAMENT_FCM_CREDENTIALS_DIR). Keying the
+default off HERMES_HOME rather than $HOME matters for Hermes profiles: each
+profile is its own HERMES_HOME, and each profile connected to Filament is a
+distinct agent that needs its own FCM registration — two profiles sharing
+one registration would each receive the other's pushes. Earlier versions
+used ~/.hermes/filament-fcm unconditionally; default_state_dir() migrates
+that directory forward for the root profile so an upgraded agent keeps its
+FCM identity, standing instructions, and dedup state.
 
 Note: The MCP token is NOT persisted here — it is provided by the user
 via the FILAMENT_MCP_TOKEN environment variable and can be rotated
@@ -23,7 +30,7 @@ from typing import Any
 
 logger = logging.getLogger("gateway.filament_fcm")
 
-_DEFAULT_DIR = os.path.join(os.path.expanduser("~"), ".hermes", "filament-fcm")
+_STATE_DIR_NAME = "filament-fcm"
 
 # Cap on how many received persistent ids we keep. MCS only redelivers
 # recent unacked messages, so a bounded tail is plenty; this just keeps
@@ -31,13 +38,59 @@ _DEFAULT_DIR = os.path.join(os.path.expanduser("~"), ".hermes", "filament-fcm")
 MAX_RECEIVED_PERSISTENT_IDS = 1000
 
 
+def default_state_dir() -> Path:
+    """Resolve (and, once, migrate) the plugin's state directory.
+
+    ``FILAMENT_FCM_CREDENTIALS_DIR`` wins when set. Otherwise the directory is
+    ``$HERMES_HOME/filament-fcm`` — per Hermes profile, since every profile is
+    its own HERMES_HOME — falling back to ``~/.hermes/filament-fcm`` when
+    HERMES_HOME is unset (hermes's own default home, so the path is unchanged
+    for plain installs).
+
+    Migration: earlier versions always used ``~/.hermes/filament-fcm``. When
+    the resolved directory doesn't exist yet but that legacy one does, it is
+    renamed into place so the agent keeps its FCM identity across the upgrade —
+    but only for the *root* profile. A named profile (a HERMES_HOME under
+    ``profiles/``) is a different agent: it must register fresh, never adopt
+    the root profile's identity. If the rename fails (permissions, cross-
+    device), stay on the legacy path rather than orphan a working identity.
+
+    ``reactive._default_dir`` mirrors the resolution rules (without the
+    migration, which this module owns and runs first at gateway start via the
+    adapter's CredentialStore) — keep them in sync.
+    """
+    override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
+    if override:
+        return Path(override)
+    home = os.environ.get("HERMES_HOME")
+    hermes_home = Path(home) if home else Path.home() / ".hermes"
+    state_dir = hermes_home / _STATE_DIR_NAME
+    legacy = Path.home() / ".hermes" / _STATE_DIR_NAME
+    if state_dir == legacy or state_dir.exists() or not legacy.exists():
+        return state_dir
+    if hermes_home.parent.name == "profiles":
+        return state_dir
+    try:
+        state_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(legacy, state_dir)
+        logger.info("Migrated filament-fcm state from %s to %s", legacy, state_dir)
+    except OSError:
+        logger.warning(
+            "Could not migrate filament-fcm state from %s to %s; "
+            "continuing on the legacy path",
+            legacy,
+            state_dir,
+            exc_info=True,
+        )
+        return legacy
+    return state_dir
+
+
 class CredentialStore:
     """Manages persisted FCM credentials for the filament-fcm plugin."""
 
     def __init__(self, base_dir: str | None = None) -> None:
-        self._dir = Path(
-            base_dir or os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR", _DEFAULT_DIR)
-        )
+        self._dir = Path(base_dir) if base_dir else default_state_dir()
 
     def _ensure_dir(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
