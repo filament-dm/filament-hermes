@@ -139,6 +139,20 @@ UV="$HERMES_HOME/bin/uv"
 [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
 [ -n "$UV" ] || err "uv not found — install Hermes Agent first (expected $HERMES_HOME/bin/uv)."
 
+# Make `hermes` resolvable for everything below (profile creation, the wizard's
+# gateway-restart step), without shadowing an existing launcher (the Docker
+# shim must stay first on PATH so root `docker exec` sessions keep dropping
+# privileges). When PATH is stripped enough that even the shim is missing, put
+# the shim dir ahead of $VENV/bin — the raw venv entry point run as root would
+# litter $HERMES_HOME with root-owned files and break the supervised gateway.
+if ! command -v hermes >/dev/null 2>&1; then
+  HERMES_PATH_PREFIX="$HERMES_HOME/bin:$VENV/bin"
+  if [ "$VENV" = /opt/hermes/.venv ] && [ -x /opt/hermes/bin/hermes ]; then
+    HERMES_PATH_PREFIX="/opt/hermes/bin:$HERMES_PATH_PREFIX"
+  fi
+  export PATH="$HERMES_PATH_PREFIX:$PATH"
+fi
+
 # --- Install dependencies ----------------------------------------------------
 # Only the Python dependencies go into the venv here — NOT the plugin package
 # (which is cloned as a directory plugin below). Sealed images (Docker / cloud)
@@ -222,6 +236,41 @@ elif [ "$SEALED" = 1 ]; then
   err "Hermes venv at $VENV is sealed (read-only or lazy installs disabled) and HERMES_LAZY_INSTALL_TARGET is not set — nowhere to install."
 else
   info "Installing dependencies into $VENV ..."
+fi
+
+# --- Optional: install into a named Hermes profile ----------------------------
+# FILAMENT_PROFILE targets a named profile (creating it if missing) instead of
+# the profile HERMES_HOME already points at. Each profile is an independent
+# HERMES_HOME under <root>/profiles/<name> — own config.yaml, .env, gateway,
+# and (via the plugin's HERMES_HOME-derived state dir) its own FCM identity —
+# which is how one Hermes instance hosts several Filament agents.
+#
+# Everything below (plugin clone into $HERMES_HOME/plugins, setup wizard, s6
+# restart) keys off HERMES_HOME, so re-pointing it here is the whole
+# mechanism. Deliberately AFTER the lazy-target computation above: venv deps
+# (and the lazy-target .pth on sealed images) are shared machine-wide, and a
+# per-profile lazy dir would clobber the previous profile's .pth on every
+# attach.
+if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
+  case "$FILAMENT_PROFILE" in
+    [!a-z0-9]* | *[!a-z0-9_-]*)
+      err "FILAMENT_PROFILE must match [a-z0-9][a-z0-9_-]* (got '$FILAMENT_PROFILE')."
+      ;;
+  esac
+  if [ ! -d "$HERMES_HOME/profiles/$FILAMENT_PROFILE" ]; then
+    command -v hermes >/dev/null 2>&1 \
+      || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
+    info "Creating Hermes profile '$FILAMENT_PROFILE' ..."
+    # --no-alias: no shell wrapper script; this profile is driven by its
+    # supervised gateway, not interactively. On s6 images, creation also
+    # registers the profile's gateway-<name> service, which the restart at
+    # the end of this script then bounces.
+    hermes profile create "$FILAMENT_PROFILE" --no-alias \
+      || err "could not create Hermes profile '$FILAMENT_PROFILE'."
+  fi
+  HERMES_HOME="$HERMES_HOME/profiles/$FILAMENT_PROFILE"
+  export HERMES_HOME
+  info "Installing into Hermes profile '$FILAMENT_PROFILE' ($HERMES_HOME)."
 fi
 
 # --- Install the plugin (as a Hermes directory plugin) -----------------------
@@ -328,54 +377,6 @@ if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
 fi
 "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}"
 
-# Make `hermes` resolvable for everything below (profile creation, the wizard's
-# gateway-restart step), without shadowing an existing launcher (the Docker
-# shim must stay first on PATH so root `docker exec` sessions keep dropping
-# privileges). When PATH is stripped enough that even the shim is missing, put
-# the shim dir ahead of $VENV/bin — the raw venv entry point run as root would
-# litter $HERMES_HOME with root-owned files and break the supervised gateway.
-if ! command -v hermes >/dev/null 2>&1; then
-  HERMES_PATH_PREFIX="$HERMES_HOME/bin:$VENV/bin"
-  if [ "$VENV" = /opt/hermes/.venv ] && [ -x /opt/hermes/bin/hermes ]; then
-    HERMES_PATH_PREFIX="/opt/hermes/bin:$HERMES_PATH_PREFIX"
-  fi
-  export PATH="$HERMES_PATH_PREFIX:$PATH"
-fi
-
-# --- Optional: install into a named Hermes profile ----------------------------
-# FILAMENT_PROFILE targets a named profile (creating it if missing) instead of
-# the profile HERMES_HOME already points at. Each profile is an independent
-# HERMES_HOME under <root>/profiles/<name> — own config.yaml, .env, gateway,
-# and (via the plugin's HERMES_HOME-derived state dir) its own FCM identity —
-# which is how one Hermes instance hosts several Filament agents.
-#
-# Everything below (plugin clone, setup wizard, s6 restart) keys off
-# HERMES_HOME, so re-pointing it here is the whole mechanism. Deliberately
-# AFTER the dependency install above: venv deps (and the lazy-target .pth on
-# sealed images) are shared machine-wide, and a per-profile lazy dir would
-# clobber the previous profile's .pth on every attach.
-if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
-  case "$FILAMENT_PROFILE" in
-    [!a-z0-9]* | *[!a-z0-9_-]*)
-      err "FILAMENT_PROFILE must match [a-z0-9][a-z0-9_-]* (got '$FILAMENT_PROFILE')."
-      ;;
-  esac
-  if [ ! -d "$HERMES_HOME/profiles/$FILAMENT_PROFILE" ]; then
-    command -v hermes >/dev/null 2>&1 \
-      || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
-    info "Creating Hermes profile '$FILAMENT_PROFILE' ..."
-    # --no-alias: no shell wrapper script; this profile is driven by its
-    # supervised gateway, not interactively. On s6 images, creation also
-    # registers the profile's gateway-<name> service, which the restart at
-    # the end of this script then bounces.
-    hermes profile create "$FILAMENT_PROFILE" --no-alias \
-      || err "could not create Hermes profile '$FILAMENT_PROFILE'."
-  fi
-  HERMES_HOME="$HERMES_HOME/profiles/$FILAMENT_PROFILE"
-  export HERMES_HOME
-  info "Installing into Hermes profile '$FILAMENT_PROFILE' ($HERMES_HOME)."
-fi
-
 # The directory-plugin entry point ($PLUGIN_DIR/__init__.py, which Hermes loads
 # to call register()) is committed to the repo, so the clone already has it —
 # this script used to generate it. Do not write one here: the committed shim
@@ -457,6 +458,10 @@ fi
 restart_slot() {
   [ -d "$1" ] && [ -p "$1/supervise/control" ] || return 1
   info "Restarting supervised gateway ($(basename "$1")) so the plugin loads ..."
+  # -u first: the slot a fresh `hermes profile create` registers is down
+  # until told to start, and -t alone is a no-op on a down service. On an
+  # already-running slot -u is the no-op and -t does the restart.
+  "$S6_SVC" -u "$1" 2>/dev/null || true
   "$S6_SVC" -t "$1" \
     || warn "could not restart $(basename "$1") — restart it manually: $S6_SVC -t $1"
 }
