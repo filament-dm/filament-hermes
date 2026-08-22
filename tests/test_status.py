@@ -314,7 +314,7 @@ class TestPublishLifecycle:
             texted = [c for c in api.calls if c.get("status_text")]
             assert len(texted) >= 2
             assert all(
-                c["status_text"] == "reading the conversation" for c in texted
+                c["status_text"] == "reading a new message" for c in texted
             )
             assert entry.ended and entry.refresh_task.cancelled
 
@@ -340,3 +340,76 @@ class TestPublishLifecycle:
             assert clears
 
         asyncio.run(go())
+
+
+class TestEnsureTurn:
+    def test_publishes_when_dispatch_never_announced(self):
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.ensure_turn("$m", status.TurnScope(room_id="!r"))
+            await asyncio.sleep(0.01)
+            texted = [c for c in api.calls if c.get("status_text")]
+            assert len(texted) == 1
+            assert texted[0]["status_text"] == "reading a new message"
+            await pub.end_turn("$m")
+
+        asyncio.run(go())
+
+    def test_noop_when_turn_already_pending(self):
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub.ensure_turn("$m", status.TurnScope(room_id="!r"))
+            await asyncio.sleep(0.01)
+            texted = [c for c in api.calls if c.get("status_text")]
+            assert len(texted) == 1
+            await pub.end_turn("$m")
+
+        asyncio.run(go())
+
+    def test_noop_when_turn_already_bound_to_session(self):
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+            await asyncio.sleep(0.01)
+            before = len([c for c in api.calls if c.get("status_text")])
+            pub.ensure_turn("$m", status.TurnScope(room_id="!r"))
+            await asyncio.sleep(0.01)
+            after = len([c for c in api.calls if c.get("status_text")])
+            assert after == before
+            await pub.end_turn("$m")
+
+        asyncio.run(go())
+
+
+class TestNonconversationalNotice:
+    def test_metadata_flag_wins(self):
+        assert status.is_nonconversational_notice({"non_conversational": True}, "hi")
+        assert status.is_nonconversational_notice(
+            {"non_conversational_history": True}, "hi"
+        )
+        assert not status.is_nonconversational_notice(
+            {"non_conversational": False}, "hi"
+        )
+
+    def test_legacy_patterns(self):
+        assert status.is_nonconversational_notice(
+            None, "💾 Self-improvement review: Skill 'filament-channel-awareness' created."
+        )
+        assert status.is_nonconversational_notice(None, "💾 Skill 'x' updated.")
+        assert status.is_nonconversational_notice(None, "⏳ Working — 5 min elapsed")
+        assert status.is_nonconversational_notice(
+            None, "[Background process abc123 finished with exit code 0]"
+        )
+
+    def test_conversation_is_not_a_notice(self):
+        assert not status.is_nonconversational_notice(None, "Here's the summary you asked for.")
+        assert not status.is_nonconversational_notice({}, "")
+        assert not status.is_nonconversational_notice(None, "I saved the file you sent.")

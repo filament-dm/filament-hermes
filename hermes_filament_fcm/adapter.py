@@ -75,7 +75,7 @@ from .reactive import (
     sender_is_agent_in_thread,
 )
 from .server_config import ServerConfigSync
-from .status import TurnScope
+from .status import TurnScope, is_nonconversational_notice
 from .status import publisher as status_publisher
 from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
@@ -86,10 +86,16 @@ slog = get_logger()
 _DEFAULT_MCP_URL = "https://api.filament.dm/mcp/agents"
 _MAX_MESSAGE_LENGTH = 16000
 
-# Reactions the adapter adds to every handled turn (👀 on start, removed on
-# complete). They must never be treated as wake triggers — otherwise the
-# agent's own processing reactions would re-wake it in an infinite loop.
+# Legacy processing markers: older harness versions reacted 👀 while working
+# (replaced by the status line, the agent's thinking indicator). Still never
+# a wake trigger — agents on old versions keep adding it, and waking on it
+# would loop them.
 _PROCESSING_REACTIONS = ("👀",)
+
+# System notices ("💾 Self-improvement review: …") become a transient status
+# line in shared channels; detection lives in status.py (stdlib-only, unit-
+# tested there). _NOTICE_STATUS_TIMEOUT_MS is how long one stays visible.
+_NOTICE_STATUS_TIMEOUT_MS = 30_000
 
 # ENG-429: the JSON-RPC error code agents_mcp returns while an agent is reserved
 # but not finalized (connect token valid, account not created yet).
@@ -1313,6 +1319,41 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         ):
             try:
                 thread_id = (metadata or {}).get("thread_id") if metadata else None
+
+                # Mid-work system notices become a transient status line in
+                # shared channels (never a posted message); the backchannel
+                # keeps them as posts — the principal's operational record.
+                if (
+                    chat_id != self._cc_room_id
+                    and is_nonconversational_notice(metadata, content)
+                    and hasattr(self._filament_api, "set_status")
+                ):
+                    slog.info(
+                        "filament_fcm.send.notice_as_status",
+                        installation_id=self._installation_id,
+                        send_id=send_id,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        content_fingerprint=content_hash,
+                    )
+                    try:
+                        await self._filament_api.set_status(
+                            channel=chat_id,
+                            status_text=re.sub(r"\s+", " ", content or "").strip()[
+                                :140
+                            ],
+                            thread_id=thread_id,
+                            timeout_ms=_NOTICE_STATUS_TIMEOUT_MS,
+                        )
+                        return SendResult(success=True)
+                    except Exception:
+                        # A failed status must not swallow the notice — fall
+                        # through and post it like before.
+                        logger.debug(
+                            "filament-fcm: notice status failed; posting",
+                            exc_info=True,
+                        )
+
                 slog.info(
                     "filament_fcm.send.start",
                     installation_id=self._installation_id,
@@ -2303,29 +2344,32 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
-    # ── Processing lifecycle (👀 reaction) ─────────────────────────
-    # The gateway calls these hooks around the agent turn. We add an "eyes"
-    # reaction when the agent starts working on a message and remove it when
-    # the turn finishes, so the 👀 marker is present only while in flight.
+    # ── Processing lifecycle (thinking indicator) ──────────────────
+    # The gateway calls these hooks around the agent turn. The status line
+    # (the agent's thinking indicator) replaces the old 👀 reaction: dispatch
+    # already announces the turn, and processing-start backstops any wake
+    # path that didn't, so the indicator is up the moment work begins and
+    # cleared when the turn finishes.
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         target = getattr(event, "message_id", None)
         if not target or not self._filament_api:
             return
-        try:
-            slog.debug(
-                "filament_fcm.processing.start",
-                target_event_id=target,
-            )
-            with bound_context(call_origin="processing_reaction"):
-                await self._filament_api.react(message_id=target, key="👀")
-        except Exception:
-            logger.debug("filament-fcm: failed to add 👀 reaction", exc_info=True)
-            slog.debug(
-                "filament_fcm.processing.react_failed",
-                target_event_id=target,
-                exc_info=True,
-            )
+        slog.debug(
+            "filament_fcm.processing.start",
+            target_event_id=target,
+        )
+        room_id = getattr(event, "chat_id", None)
+        if not room_id:
+            return
+        status_publisher.ensure_turn(
+            getattr(event, "filament_turn_key", None) or target,
+            TurnScope(
+                room_id=room_id,
+                thread_id=getattr(event, "thread_id", None),
+                prompt_event_id=target,
+            ),
+        )
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
@@ -2333,21 +2377,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         target = getattr(event, "message_id", None)
         if not target or not self._filament_api:
             return
+        slog.debug(
+            "filament_fcm.processing.complete",
+            target_event_id=target,
+            outcome=str(outcome),
+        )
         await status_publisher.end_turn(
             getattr(event, "filament_turn_key", None) or target
         )
-        try:
-            slog.debug(
-                "filament_fcm.processing.complete",
-                target_event_id=target,
-                outcome=str(outcome),
-            )
-            with bound_context(call_origin="processing_reaction"):
-                await self._filament_api.unreact(message_id=target, key="👀")
-        except Exception:
-            logger.debug("filament-fcm: failed to remove 👀 reaction", exc_info=True)
-            slog.debug(
-                "filament_fcm.processing.unreact_failed",
-                target_event_id=target,
-                exc_info=True,
-            )

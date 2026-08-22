@@ -68,6 +68,41 @@ def enabled() -> bool:
     return os.environ.get("FILAMENT_STATUS_UPDATES", "1").strip() != "0"
 
 
+# System notices the gateway emits mid-work ("💾 Self-improvement review: …",
+# background-process updates). In a shared channel these are noise as posted
+# messages — the adapter converts them to a transient status line instead
+# (the thinking indicator, expiring on its own). The backchannel keeps them
+# as real posts: it is the principal's durable operational record. Primary
+# signal is the gateway's metadata flag; the regexes are the same upgrade
+# bridge hermes's Discord adapter carries, for emitters predating the flag.
+_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
+    "non_conversational",
+    "non_conversational_history",
+})
+_NONCONVERSATIONAL_MESSAGE_PATTERNS = (
+    re.compile(r"^\s*💾\s*Self-improvement review:\s+\S[\s\S]*$", re.IGNORECASE),
+    re.compile(
+        r"^\s*💾\s+Skill\s+['\"].+?['\"]\s+(?:created|updated|improved|patched)\.?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*⏳\s+Working\s+—\s+\d+\s+min(?:\s|$)", re.IGNORECASE),
+    re.compile(
+        r"^\s*\[Background process\s+\S+\s+"
+        r"(?:finished with exit code|is still running~)[\s\S]*\]\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def is_nonconversational_notice(metadata: Any, content: str) -> bool:
+    """Whether a send is a mid-work system notice rather than conversation."""
+    if isinstance(metadata, dict) and any(
+        metadata.get(key) for key in _NONCONVERSATIONAL_METADATA_KEYS
+    ):
+        return True
+    return any(p.match(content or "") for p in _NONCONVERSATIONAL_MESSAGE_PATTERNS)
+
+
 # ── Phrases ──────────────────────────────────────────────────────────
 
 
@@ -327,7 +362,7 @@ class StatusPublisher:
         self._prune()
         entry = _Pending(scope=scope, created=time.monotonic())
         self._pending[trigger_event_id] = entry
-        self._publish(entry, "reading the conversation")
+        self._publish(entry, "reading a new message")
         # Exempt the first real phrase from the floor, or a single-tool
         # turn's only phrase would be suppressed.
         entry.last_ts = time.monotonic() - MIN_INTERVAL_SECONDS
@@ -337,6 +372,20 @@ class StatusPublisher:
             entry.refresh_task = asyncio.get_running_loop().create_task(
                 self._refresh(entry)
             )
+
+    def ensure_turn(self, trigger_event_id: str, scope: TurnScope) -> None:
+        """Publish the opening line for a turn that dispatch never announced.
+
+        The processing-start hook calls this so the indicator is up the
+        moment work begins even on wake paths that didn't park a scope at
+        dispatch (this replaced the 👀 processing reaction). A turn already
+        pending or bound keeps its line — begin_turn published it.
+        """
+        if trigger_event_id in self._pending:
+            return
+        if self._trigger_session.get(trigger_event_id) in self._bound:
+            return
+        self.begin_turn(trigger_event_id, scope)
 
     async def end_turn(self, trigger_event_id: str) -> None:
         if not hasattr(self._api, "set_status"):
