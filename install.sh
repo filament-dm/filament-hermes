@@ -261,60 +261,22 @@ if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
     command -v hermes >/dev/null 2>&1 \
       || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
     info "Creating Hermes profile '$FILAMENT_PROFILE' ..."
-    # A deliberately FRESH profile (no --clone): the new agent behaves like
-    # a brand-new Hermes instance — stock SOUL.md, bundled skills, its own
-    # config and state, nothing inherited from the root agent.
+    # --clone: the new agent starts as a copy of the instance's DEFAULT
+    # profile. Under the Filament-provisioned flow the default profile is
+    # never itself a connected agent — it is the instance's baseline (the
+    # image's managed provisioning: metered provider, Composio/Brave MCP
+    # surfaces, the managed plugins that teach the agent to use them, plus
+    # any operator customization) — so cloning inherits instance-level
+    # defaults, not another agent's identity. The setup step below
+    # overwrites the cloned Filament identity slots with this agent's own.
     # --no-alias: no shell wrapper script; this profile is driven by its
     # supervised gateway, not interactively. On s6 images, creation also
     # registers the profile's gateway-<name> service, which the restart at
     # the end of this script then bounces.
-    hermes profile create "$FILAMENT_PROFILE" --no-alias \
+    hermes profile create "$FILAMENT_PROFILE" --no-alias --clone \
       || err "could not create Hermes profile '$FILAMENT_PROFILE'."
-    # One exception to freshness: the image's managed provisioning. On
-    # hosted images it lands in the ROOT profile's config.yaml (e.g.
-    # Agent37's metered custom provider, its Composio/Brave MCP surfaces,
-    # approvals and platform toolsets) rather than baked image-wide — a
-    # bare profile fails every model call and lacks the managed tool
-    # integrations. Copy exactly those keys — what a new instance of the
-    # same image would have had — and nothing else. Agent37's entrypoint
-    # re-runs its managed-config updater over every profile config on
-    # container restart, so these copies stay rotation-fresh afterwards.
-    "$PY" - "$HERMES_HOME" "$HERMES_HOME/profiles/$FILAMENT_PROFILE" <<'PYEOF' \
-      || warn "could not copy inference provider config into the profile — \
-configure a model for it with: hermes -p $FILAMENT_PROFILE model"
-import sys
-
-import yaml
-
-root, prof = sys.argv[1], sys.argv[2]
-try:
-    with open(f"{root}/config.yaml") as f:
-        root_cfg = yaml.safe_load(f) or {}
-except OSError:
-    root_cfg = {}
-path = f"{prof}/config.yaml"
-try:
-    with open(path) as f:
-        cfg = yaml.safe_load(f) or {}
-except OSError:
-    cfg = {}
-changed = False
-for key in (
-    "custom_providers",
-    "model",
-    "fallback",
-    "mcp_servers",
-    "approvals",
-    "platform_toolsets",
-):
-    if key in root_cfg and key not in cfg:
-        cfg[key] = root_cfg[key]
-        changed = True
-if changed:
-    with open(path, "w") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False)
-PYEOF
   fi
+  ROOT_HERMES_HOME="$HERMES_HOME"
   HERMES_HOME="$HERMES_HOME/profiles/$FILAMENT_PROFILE"
   export HERMES_HOME
   info "Installing into Hermes profile '$FILAMENT_PROFILE' ($HERMES_HOME)."
@@ -477,6 +439,54 @@ if [ -t 1 ] && [ -r /dev/tty ]; then
   run_setup < /dev/tty
 else
   run_setup
+fi
+
+# For a cloned profile, repair the config after setup: enabling the plugin
+# rewrites config.yaml through Hermes's config layer, which has been seen to
+# drop cloned keys it doesn't own (e.g. custom_providers). Merge back any
+# root-config key the profile lost and union plugins.enabled with the root's
+# (the managed agent37-* plugins carry the guidance for the instance's
+# integrations). No-op when the rewrite preserved everything.
+if [ -n "${FILAMENT_PROFILE:-}" ] && [ -n "${ROOT_HERMES_HOME:-}" ]; then
+  "$PY" - "$ROOT_HERMES_HOME" "$HERMES_HOME" <<'PYEOF' \
+    || warn "could not merge the default profile's config into '$FILAMENT_PROFILE' — \
+its managed integrations may be missing; compare config.yaml against the root profile's."
+import sys
+
+import yaml
+
+root, prof = sys.argv[1], sys.argv[2]
+try:
+    with open(f"{root}/config.yaml") as f:
+        root_cfg = yaml.safe_load(f) or {}
+except OSError:
+    root_cfg = {}
+path = f"{prof}/config.yaml"
+try:
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+except OSError:
+    cfg = {}
+changed = False
+# Per-profile state the clone-repair must never overwrite from the root.
+for key in root_cfg:
+    if key in ("plugins", "onboarding"):
+        continue
+    if key not in cfg:
+        cfg[key] = root_cfg[key]
+        changed = True
+root_enabled = (root_cfg.get("plugins") or {}).get("enabled") or []
+plugins = cfg.setdefault("plugins", {})
+enabled = plugins.setdefault("enabled", [])
+for name in root_enabled:
+    if name not in enabled:
+        enabled.append(name)
+        changed = True
+if changed:
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    print("merged root config keys the setup rewrite had dropped")
+PYEOF
 fi
 
 # --- Force a supervised restart ------------------------------------------
