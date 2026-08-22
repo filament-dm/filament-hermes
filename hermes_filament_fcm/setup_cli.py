@@ -392,6 +392,12 @@ def _run_interactive_setup() -> bool:
     # Token validated — persist all configuration.
     save_env_value("FILAMENT_MCP_TOKEN", token)
     save_env_value("FILAMENT_MCP_URL", url)
+    # A token names an identity; a FILAMENT_HOME_ROOM carried over from a
+    # previous one (a reconnect with a different token, or a profile whose
+    # .env was cloned from another agent's) would misroute cron/home-channel
+    # delivery to the old agent's backchannel. Clear it — the adapter
+    # re-derives and persists the right backchannel at the next connect.
+    save_env_value("FILAMENT_HOME_ROOM", "")
 
     # Carry the Firebase project through to the gateway (see _FIREBASE_ENV_KEYS).
     for key in _FIREBASE_ENV_KEYS:
@@ -464,6 +470,9 @@ def _persist(token: str, url: str, principal_id: str | None) -> None:
     """
     save_env_value("FILAMENT_MCP_TOKEN", token)
     save_env_value("FILAMENT_MCP_URL", url)
+    # Same stale-identity guard as the interactive path: a cloned or
+    # reconnected .env must not keep the previous agent's home room.
+    save_env_value("FILAMENT_HOME_ROOM", "")
 
     # Carry the Firebase project through, as the interactive path does (see
     # _FIREBASE_ENV_KEYS). Against a non-production homeserver these come from

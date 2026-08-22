@@ -261,11 +261,17 @@ if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
     command -v hermes >/dev/null 2>&1 \
       || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
     info "Creating Hermes profile '$FILAMENT_PROFILE' ..."
+    # --clone-from default: the image's inference wiring (e.g. Agent37's
+    # metered custom provider) lives in the root profile's config.yaml and
+    # .env — a bare profile has no provider and every model call fails with
+    # "No inference provider configured". Cloning carries it (plus SOUL.md
+    # and skills) over; the setup step below then overwrites the cloned
+    # Filament identity slots with this agent's own.
     # --no-alias: no shell wrapper script; this profile is driven by its
     # supervised gateway, not interactively. On s6 images, creation also
     # registers the profile's gateway-<name> service, which the restart at
     # the end of this script then bounces.
-    hermes profile create "$FILAMENT_PROFILE" --no-alias \
+    hermes profile create "$FILAMENT_PROFILE" --no-alias --clone-from default \
       || err "could not create Hermes profile '$FILAMENT_PROFILE'."
   fi
   HERMES_HOME="$HERMES_HOME/profiles/$FILAMENT_PROFILE"
