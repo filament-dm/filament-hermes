@@ -261,20 +261,49 @@ if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
     command -v hermes >/dev/null 2>&1 \
       || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
     info "Creating Hermes profile '$FILAMENT_PROFILE' ..."
-    # --clone: the image's inference wiring (e.g. Agent37's metered custom
-    # provider) lives in the root profile's config.yaml and .env — a bare
-    # profile has no provider and every model call fails with "No inference
-    # provider configured". Cloning from the active (root) profile carries
-    # it (plus SOUL.md and skills) over; the setup step below then
-    # overwrites the cloned Filament identity slots with this agent's own.
-    # (--clone, not --clone-from: deployed images run Hermes versions
-    # without the latter.)
+    # A deliberately FRESH profile (no --clone): the new agent behaves like
+    # a brand-new Hermes instance — stock SOUL.md, bundled skills, its own
+    # config and state, nothing inherited from the root agent.
     # --no-alias: no shell wrapper script; this profile is driven by its
     # supervised gateway, not interactively. On s6 images, creation also
     # registers the profile's gateway-<name> service, which the restart at
     # the end of this script then bounces.
-    hermes profile create "$FILAMENT_PROFILE" --no-alias --clone \
+    hermes profile create "$FILAMENT_PROFILE" --no-alias \
       || err "could not create Hermes profile '$FILAMENT_PROFILE'."
+    # One exception to freshness: inference wiring. On hosted images it is
+    # provisioned into the ROOT profile's config.yaml (e.g. Agent37's
+    # metered custom provider) rather than baked image-wide, so a bare
+    # profile fails every model call with "No inference provider
+    # configured". Copy exactly those keys — what a new instance of the
+    # same image would have had — and nothing else.
+    "$PY" - "$HERMES_HOME" "$HERMES_HOME/profiles/$FILAMENT_PROFILE" <<'PYEOF' \
+      || warn "could not copy inference provider config into the profile — \
+configure a model for it with: hermes -p $FILAMENT_PROFILE model"
+import sys
+
+import yaml
+
+root, prof = sys.argv[1], sys.argv[2]
+try:
+    with open(f"{root}/config.yaml") as f:
+        root_cfg = yaml.safe_load(f) or {}
+except OSError:
+    root_cfg = {}
+path = f"{prof}/config.yaml"
+try:
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+except OSError:
+    cfg = {}
+changed = False
+for key in ("custom_providers", "model", "fallback"):
+    if key in root_cfg and key not in cfg:
+        cfg[key] = root_cfg[key]
+        changed = True
+if changed:
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+PYEOF
   fi
   HERMES_HOME="$HERMES_HOME/profiles/$FILAMENT_PROFILE"
   export HERMES_HOME
