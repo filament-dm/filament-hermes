@@ -75,6 +75,8 @@ from .reactive import (
     sender_is_agent_in_thread,
 )
 from .server_config import ServerConfigSync
+from .status import TurnScope
+from .status import publisher as status_publisher
 from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
@@ -303,6 +305,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # during _initialize_api().  Shared with tool handlers registered
         # in __init__.py (they close over the same instance).
         self._filament_api = filament_api
+        status_publisher.set_api(filament_api)
 
         # Shared credential store (for FCM credentials only).
         self._credentials = CredentialStore()
@@ -1843,6 +1846,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Control plane keeps full capability: None = ungated (the capability
         # gate only restricts data turns, which set an explicit allowed set).
         current_capabilities.set(None)
+        status_publisher.begin_turn(
+            msg.event_id,
+            TurnScope(
+                room_id=msg.room_id,
+                thread_id=thread_id,
+                prompt_event_id=msg.event_id,
+            ),
+        )
         await self.handle_message(event)
 
     # ── Slash commands (control plane, no LLM) ──────────────────────
@@ -2136,6 +2147,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             target_event_id=reaction.target_event_id,
             thread_id=reaction.thread_id or reaction.target_event_id,
             raw=reaction.raw,
+            wake_event_id=reaction.event_id,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
@@ -2151,6 +2163,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         target_event_id: str,
         thread_id: str | None,
         raw: dict | None,
+        wake_event_id: str | None = None,
     ) -> None:
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + any per-channel guidance + the event data,
@@ -2273,6 +2286,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # the set — hard enforcement the data-as-data framing can't be talked
         # out of. Fail-closed: an unlisted channel/user got the minimal default.
         current_capabilities.set(allowed)
+        # The status lifecycle needs a key unique per wake: message_id is the
+        # reaction target for reaction wakes, which several reactions share.
+        turn_key = wake_event_id or message_id
+        try:
+            event.filament_turn_key = turn_key
+        except Exception:
+            turn_key = message_id
+        status_publisher.begin_turn(
+            turn_key,
+            TurnScope(
+                room_id=channel,
+                thread_id=thread_id,
+                prompt_event_id=target_event_id,
+            ),
+        )
         await self.handle_message(event)
 
     # ── Processing lifecycle (👀 reaction) ─────────────────────────
@@ -2305,6 +2333,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         target = getattr(event, "message_id", None)
         if not target or not self._filament_api:
             return
+        await status_publisher.end_turn(
+            getattr(event, "filament_turn_key", None) or target
+        )
         try:
             slog.debug(
                 "filament_fcm.processing.complete",
