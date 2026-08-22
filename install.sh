@@ -525,3 +525,35 @@ if [ -n "$S6_SVC" ]; then
     done
   fi
 fi
+
+# --- Keep profile gateways alive across restarts (non-s6 images) -------------
+# Without s6 there is no supervisor for a named profile's gateway: the setup
+# wizard starts it as a plain background process, which dies with the
+# container (restart, sleep/wake, update) while the image's entrypoint only
+# revives the DEFAULT profile's gateway. Agent37's image runs
+# ~/.agent37/hooks/post-restart.sh on every container start for exactly this —
+# install one managed block there that revives the gateway of every Hermes
+# profile connected to Filament. The loop covers all such profiles, so one
+# block serves every agent ever attached; other non-s6 hosts (no hooks dir)
+# are skipped — their operators own gateway supervision.
+AGENT37_HOOK="${AGENT37_HOOKS_DIR:-$HOME/.agent37/hooks}/post-restart.sh"
+if [ -z "$S6_SVC" ] && [ -n "${FILAMENT_PROFILE:-}" ] \
+    && [ -d "$(dirname "$AGENT37_HOOK")" ] \
+    && ! grep -q "filament-hermes profile gateways" "$AGENT37_HOOK" 2>/dev/null; then
+  cat >> "$AGENT37_HOOK" <<'HOOKEOF'
+
+# >>> filament-hermes profile gateways (managed block; do not edit)
+# Revive the gateway of every Hermes profile connected to Filament: their
+# background gateways die with the container, and the entrypoint only
+# supervises the default profile's.
+command -v hermes >/dev/null 2>&1 \
+  || PATH="/usr/local/bin:/usr/local/lib/hermes/hermes-agent/venv/bin:$PATH"
+for _fil_plugin_dir in "$HOME"/.hermes/profiles/*/plugins/filament; do
+  [ -d "$_fil_plugin_dir" ] || continue
+  HERMES_HOME="$(dirname "$(dirname "$_fil_plugin_dir")")" \
+    hermes gateway restart >/dev/null 2>&1 || true
+done
+# <<< filament-hermes profile gateways
+HOOKEOF
+  info "Installed post-restart hook: profile gateways revive on container restarts."
+fi
