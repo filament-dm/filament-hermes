@@ -270,12 +270,15 @@ if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
     # the end of this script then bounces.
     hermes profile create "$FILAMENT_PROFILE" --no-alias \
       || err "could not create Hermes profile '$FILAMENT_PROFILE'."
-    # One exception to freshness: inference wiring. On hosted images it is
-    # provisioned into the ROOT profile's config.yaml (e.g. Agent37's
-    # metered custom provider) rather than baked image-wide, so a bare
-    # profile fails every model call with "No inference provider
-    # configured". Copy exactly those keys — what a new instance of the
-    # same image would have had — and nothing else.
+    # One exception to freshness: the image's managed provisioning. On
+    # hosted images it lands in the ROOT profile's config.yaml (e.g.
+    # Agent37's metered custom provider, its Composio/Brave MCP surfaces,
+    # approvals and platform toolsets) rather than baked image-wide — a
+    # bare profile fails every model call and lacks the managed tool
+    # integrations. Copy exactly those keys — what a new instance of the
+    # same image would have had — and nothing else. Agent37's entrypoint
+    # re-runs its managed-config updater over every profile config on
+    # container restart, so these copies stay rotation-fresh afterwards.
     "$PY" - "$HERMES_HOME" "$HERMES_HOME/profiles/$FILAMENT_PROFILE" <<'PYEOF' \
       || warn "could not copy inference provider config into the profile — \
 configure a model for it with: hermes -p $FILAMENT_PROFILE model"
@@ -296,7 +299,14 @@ try:
 except OSError:
     cfg = {}
 changed = False
-for key in ("custom_providers", "model", "fallback"):
+for key in (
+    "custom_providers",
+    "model",
+    "fallback",
+    "mcp_servers",
+    "approvals",
+    "platform_toolsets",
+):
     if key in root_cfg and key not in cfg:
         cfg[key] = root_cfg[key]
         changed = True
