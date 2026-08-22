@@ -400,9 +400,11 @@ class TestNonconversationalNotice:
         )
 
     def test_legacy_patterns(self):
-        assert status.is_nonconversational_notice(
-            None, "💾 Self-improvement review: Skill 'filament-channel-awareness' created."
+        review = (
+            "💾 Self-improvement review: "
+            "Skill 'filament-channel-awareness' created."
         )
+        assert status.is_nonconversational_notice(None, review)
         assert status.is_nonconversational_notice(None, "💾 Skill 'x' updated.")
         assert status.is_nonconversational_notice(None, "⏳ Working — 5 min elapsed")
         assert status.is_nonconversational_notice(
@@ -410,6 +412,10 @@ class TestNonconversationalNotice:
         )
 
     def test_conversation_is_not_a_notice(self):
-        assert not status.is_nonconversational_notice(None, "Here's the summary you asked for.")
+        assert not status.is_nonconversational_notice(
+            None, "Here's the summary you asked for."
+        )
         assert not status.is_nonconversational_notice({}, "")
-        assert not status.is_nonconversational_notice(None, "I saved the file you sent.")
+        assert not status.is_nonconversational_notice(
+            None, "I saved the file you sent."
+        )
