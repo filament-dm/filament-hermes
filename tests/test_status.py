@@ -419,3 +419,33 @@ class TestNonconversationalNotice:
         assert not status.is_nonconversational_notice(
             None, "I saved the file you sent."
         )
+
+
+class TestDoubleUnderscoreMcpNames:
+    def test_composio_manage_connections(self):
+        assert (
+            phrase_for("mcp__composio__COMPOSIO_MANAGE_CONNECTIONS", {})
+            == "managing connections in Composio"
+        )
+
+    def test_composio_search_tools_with_query(self):
+        assert (
+            phrase_for("mcp__composio__COMPOSIO_SEARCH_TOOLS", {"query": "calendar"})
+            == 'searching tools "calendar" in Composio'
+        )
+
+    def test_wait_for_connections_reads_naturally(self):
+        # The old single-underscore split made the server segment empty here,
+        # rendering the dreaded bare "…is using".
+        line = phrase_for("mcp__composio__COMPOSIO_WAIT_FOR_CONNECTIONS", {})
+        assert line == "waiting for connections in Composio"
+
+    def test_unknown_verb_still_names_the_server(self):
+        assert phrase_for("mcp__composio__COMPOSIO_FROBNICATE", {}) == "using Composio"
+
+    def test_single_underscore_form_unchanged(self):
+        assert phrase_for("mcp_linear_list_issues", {}) == "listing issues in Linear"
+
+    def test_degenerate_tool_name_says_working(self):
+        assert phrase_for("_", {}) == "working"
+        assert phrase_for("__", {}) == "working"
