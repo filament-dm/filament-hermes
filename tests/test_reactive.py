@@ -158,11 +158,6 @@ def test_reply_style_unknown_value_fails_safe_to_thread():
         assert wp.reply_style("!room") == "thread"
 
 
-def test_current_zone_default_is_data():
-    # Fail-closed: control-plane tools refuse unless a turn explicitly set this.
-    assert reactive.current_zone.get() == "data"
-
-
 # ── context_breadcrumb ────────────────────────────────────────────────
 def _msg(event_id, sender="@x:s", is_from_self=False, type="m.room.message"):
     return {
@@ -171,6 +166,43 @@ def _msg(event_id, sender="@x:s", is_from_self=False, type="m.room.message"):
         "is_from_self": is_from_self,
         "type": type,
     }
+
+
+def test_keying_and_reply_decouples_identity_from_placement():
+    kar = reactive.keying_and_reply
+    # A real thread reply: identity and placement are the thread, always.
+    for style in ("thread", "channel"):
+        for shared in (False, True):
+            assert kar("$t", "$trig", style, shared) == ("$t", "$t")
+    # Top-level, "thread" style, shared OFF: the legacy fold — the invented
+    # reply root is also the conversation. Byte-identical to old behavior.
+    assert kar(None, "$trig", "thread", False) == ("$trig", "$trig")
+    # Top-level, "thread" style, shared ON: the decouple. The reply still
+    # threads under the trigger, but the turn joins the CHANNEL
+    # conversation (keying None).
+    assert kar(None, "$trig", "thread", True) == (None, "$trig")
+    # Top-level, "channel" style: reply posts top-level, channel keying,
+    # with or without shared keying.
+    assert kar(None, "$trig", "channel", False) == (None, None)
+    assert kar(None, "$trig", "channel", True) == (None, None)
+
+
+def test_reply_thread_for_send_routing():
+    rtfs = reactive.reply_thread_for_send
+    # Explicit metadata thread always wins.
+    assert rtfs("$meta", ("!r:s", "$anchor"), "!r:s") == "$meta"
+    # No metadata: the turn's anchor applies, but only for its own room.
+    assert rtfs(None, ("!r:s", "$anchor"), "!r:s") == "$anchor"
+    assert rtfs(None, ("!other:s", "$anchor"), "!r:s") is None
+    # Nothing at all → top-level post.
+    assert rtfs(None, None, "!r:s") is None
+
+
+def test_conversation_key_rule():
+    # The session-scope rule: a thread turn joins the thread (root +
+    # replies); a top-level turn joins the channel (top-level messages).
+    assert reactive.conversation_key("!r:s", "$t") == ("thread", "$t")
+    assert reactive.conversation_key("!r:s", None) == ("channel", "!r:s")
 
 
 def test_breadcrumb_none_when_empty():
@@ -918,7 +950,7 @@ def test_sender_is_agent_in_thread_unknown_is_none():
 
 def test_flag_off_turn_stays_ungated():
     # With the feature flag off the adapter never calls resolve: it leaves
-    # current_capabilities None, and None never denies — a fresh install
+    # the turn's capabilities None, and None never denies — a fresh install
     # behaves identically regardless of what the policy file says.
     with tempfile.TemporaryDirectory() as d:
         flags = reactive.FeatureFlagStore(Path(d) / "feature_flags.json")
@@ -1029,3 +1061,178 @@ def test_expand_bundle_diamond_expands_once_cycle_still_nothing():
     assert store.expand_bundle("top", policy) == frozenset({"l", "r", "deep"})
     # A self-cycle still grants only its non-cyclic members.
     assert store.expand_bundle("loop", policy) == frozenset({"x"})
+
+
+def test_breadcrumb_delta_counts_only_after_cursor():
+    # The read cursor marks $b as already fetched: only $c and $d count,
+    # and the wording says so ("since your last read", exact — not "recent").
+    msgs = [_msg("$a"), _msg("$b"), _msg("$c"), _msg("$d")]
+    out = reactive.context_breadcrumb(
+        msgs, trigger_event_id="$t", last_seen_event_id="$b"
+    )
+    assert "2 message(s) in this channel since your last read" in out
+    assert "get_recent_messages" in out
+
+
+def test_breadcrumb_delta_none_when_caught_up():
+    # Cursor at the newest message → nothing unread → NO cue, no fetch
+    # order. This is the collapse of the fetch-every-wake loop.
+    msgs = [_msg("$a"), _msg("$b")]
+    assert (
+        reactive.context_breadcrumb(
+            msgs, trigger_event_id="$t", last_seen_event_id="$b"
+        )
+        is None
+    )
+
+
+def test_breadcrumb_delta_trigger_after_cursor_still_excluded():
+    msgs = [_msg("$a"), _msg("$t")]
+    assert (
+        reactive.context_breadcrumb(
+            msgs, trigger_event_id="$t", last_seen_event_id="$a"
+        )
+        is None
+    )
+
+
+def test_breadcrumb_cursor_out_of_window_falls_back_to_full_count():
+    # A cursor that rolled out of the window means at least a windowful is
+    # unread — count the whole window with the windowed ("recent") wording.
+    msgs = [_msg("$a"), _msg("$b")]
+    out = reactive.context_breadcrumb(
+        msgs, trigger_event_id="$t", last_seen_event_id="$gone"
+    )
+    assert "2 recent message(s)" in out
+
+
+# ── ChannelCursorStore ───────────────────────────────────────────────
+
+
+def test_channel_cursor_roundtrip_and_missing():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        assert store.get("!room:s") is None
+        store.record("!room:s", "$e1")
+        assert store.get("!room:s") == "$e1"
+        store.record("!room:s", "$e2")  # advances
+        assert store.get("!room:s") == "$e2"
+
+
+def test_channel_cursor_ignores_empty_values():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store.record("", "$e1")
+        store.record("!room:s", "")
+        assert store.read() == {}
+
+
+def test_channel_cursor_stale_write_skipped():
+    # Overlapping fetches completing out of order: the older result must
+    # not rewind a newer cursor (both carry timestamps — provably stale).
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store.record("!room:s", "$newer", ts=2000)
+        store.record("!room:s", "$older", ts=1000)
+        assert store.get("!room:s") == "$newer"
+        # Equal or newer timestamps advance normally.
+        store.record("!room:s", "$same", ts=2000)
+        assert store.get("!room:s") == "$same"
+        store.record("!room:s", "$next", ts=3000)
+        assert store.get("!room:s") == "$next"
+
+
+def test_channel_cursor_unknown_ts_stays_fail_open():
+    # Without both timestamps ordering is unknowable: the write proceeds
+    # (a rewind re-fires the cue once; a wrong skip could pin forever).
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store.record("!room:s", "$a", ts=2000)
+        store.record("!room:s", "$b")  # incoming ts unknown — allowed
+        assert store.get("!room:s") == "$b"
+        store.record("!room:s", "$c", ts=1000)  # stored ts unknown — allowed
+        assert store.get("!room:s") == "$c"
+
+
+def test_channel_cursor_survives_non_finite_ts():
+    # json.loads admits NaN/Infinity; int() raises on both. A poisoned
+    # file must read as ts-unknown (best-effort state), never crash the
+    # per-wake get() in the breadcrumb path.
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "cursors.json"
+        path.write_text(
+            '{"!room:s": {"event_id": "$e", "ts": NaN},'
+            ' "!inf:s": {"event_id": "$i", "ts": Infinity}}',
+            encoding="utf-8",
+        )
+        store = reactive.ChannelCursorStore(path)
+        assert store.get("!room:s") == "$e"
+        assert store.get("!inf:s") == "$i"
+        # ts unknown → ordering unknowable → the write proceeds.
+        store.record("!room:s", "$new", ts=1000)
+        assert store.get("!room:s") == "$new"
+
+
+def test_channel_cursor_reads_bare_string_values():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "cursors.json"
+        path.write_text('{"!room:s": "$bare"}', encoding="utf-8")
+        store = reactive.ChannelCursorStore(path)
+        assert store.get("!room:s") == "$bare"
+        store.record("!room:s", "$new", ts=1000)  # rewrites to the dict form
+        assert store.get("!room:s") == "$new"
+        assert store.read()["!room:s"] == {"event_id": "$new", "ts": 1000}
+
+
+def test_channel_cursor_bounded_drops_oldest():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.ChannelCursorStore(Path(d) / "cursors.json")
+        store._MAX_CHANNELS = 3
+        for i in range(4):
+            store.record(f"!r{i}:s", f"$e{i}")
+        cursors = store.read()
+        assert len(cursors) == 3
+        assert "!r0:s" not in cursors  # oldest dropped
+        # Re-recording refreshes a channel's position.
+        store.record("!r1:s", "$e1b")
+        store.record("!r9:s", "$e9")
+        assert store.get("!r1:s") == "$e1b"
+
+
+class TestUnseenMessages:
+    def _msgs(self):
+        return [
+            {"event_id": "$a", "type": "m.room.message", "body": "one"},
+            {"event_id": "$b", "type": "m.room.message", "is_from_self": True},
+            {"event_id": "$c", "type": "m.reaction"},
+            {"event_id": "$d", "type": "m.room.message", "body": "two"},
+            {"event_id": "$trig", "type": "m.room.message", "body": "trigger"},
+        ]
+
+    def test_no_cursor_returns_all_countable(self):
+        unseen, seen = reactive.unseen_messages(
+            self._msgs(), trigger_event_id="$trig"
+        )
+        assert [m["event_id"] for m in unseen] == ["$a", "$d"]
+        assert seen is False
+
+    def test_cursor_cuts_window_and_reports_seen(self):
+        unseen, seen = reactive.unseen_messages(
+            self._msgs(), trigger_event_id="$trig", last_seen_event_id="$a"
+        )
+        assert [m["event_id"] for m in unseen] == ["$d"]
+        assert seen is True
+
+    def test_expired_cursor_falls_back_to_full_window(self):
+        unseen, seen = reactive.unseen_messages(
+            self._msgs(), trigger_event_id="$trig", last_seen_event_id="$gone"
+        )
+        assert [m["event_id"] for m in unseen] == ["$a", "$d"]
+        assert seen is False
+
+    def test_breadcrumb_matches_unseen_count(self):
+        msgs = self._msgs()
+        crumb = reactive.context_breadcrumb(msgs, trigger_event_id="$trig")
+        assert crumb is not None and "2 " in crumb
+        unseen, _ = reactive.unseen_messages(msgs, trigger_event_id="$trig")
+        assert len(unseen) == 2
