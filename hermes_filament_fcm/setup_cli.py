@@ -650,6 +650,14 @@ def main() -> None:
     print_info("Check status: hermes gateway status")
     print_info("View logs:    tail -f ~/.hermes/logs/gateway.log")
     print()
+    if not ready:
+        # Exit nonzero so a scripted install (the hosted-attach exec pipes
+        # this through `set -e`) fails loudly instead of reporting an
+        # installed agent with no credentials. Observed live: a setup that
+        # couldn't reach the MCP URL returned 0, the server recorded
+        # hosting_status=installed, and the agent sat connected-looking
+        # and tokenless.
+        sys.exit(1)
 
 
 if __name__ == "__main__":
