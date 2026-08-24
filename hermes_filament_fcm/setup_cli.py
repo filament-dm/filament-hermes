@@ -650,7 +650,10 @@ def main() -> None:
     ready = _run_interactive_setup()
     print()
 
-    if ready:
+    # The hosted installer restarts the gateway itself (s6 bounce, or a
+    # direct detached spawn) — the wizard's restart would only add a
+    # redundant CLI round trip between them. It sets this to say so.
+    if ready and not os.environ.get("FILAMENT_SETUP_SKIP_RESTART"):
         _restart_gateway()
 
     print()
