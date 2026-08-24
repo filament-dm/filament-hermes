@@ -294,7 +294,9 @@ TOOL_MAP_PROMPT = (
     "Tool map: web search = brave_web_search(query); open/read a page = "
     "browser_exec; SaaS integrations (calendars, email, docs) = the composio "
     "tools; Filament history = get_recent_messages(channel). A deferred tool "
-    "can be called directly with tool_call(name, arguments) — skip "
-    "tool_search when the tool is named here. Prefer brave_web_search over "
-    "terminal curl for public web lookups."
+    "can be called directly with tool_call(name, arguments) — never call "
+    "tool_search or tool_describe for a tool named here. Prefer "
+    "brave_web_search over terminal curl for public web lookups, and for "
+    "simple lookups answer from the FIRST successful result: no second tool "
+    "to double-check, no browser when a search snippet already answers it."
 )
