@@ -29,6 +29,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from . import reactive as reactive_mod
+from . import timeline, turn_context
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
 from .cli import register_cli
 from .deps import (
@@ -50,14 +52,13 @@ from .reactive import (
     InstructionsStore,
     WakePolicyStore,
     capability_denies,
-    current_capabilities,
-    current_zone,
     is_auto_bundle_name,
 )
 from .server_config import ServerConfigSync, derive_tool_health
 from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
 from .status import enabled as status_enabled
 from .status import pre_tool_call_hook as status_pre_tool_call
+from .turn_context import Zone
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -114,12 +115,35 @@ BLOCKED_TOOLS: dict[str, str] = {
 }
 
 
-def _make_tool_handler(tool_name: str, api: FilamentAPI):
+def _make_tool_handler(
+    tool_name: str,
+    api: FilamentAPI,
+    cursor_store: "reactive_mod.ChannelCursorStore | None" = None,
+    feature_flags: "reactive_mod.FeatureFlagStore | None" = None,
+):
     """Create an async handler that proxies a tool call through the
     given ``FilamentAPI`` instance.
 
     The handler holds a direct reference to ``api`` — the same object
     the adapter uses.  No module-level mutable state needed.
+
+    Two session-economy hooks ride on the proxy for the message-read
+    tools:
+
+    - ``cursor_store``: a ``get_recent_messages`` fetch that provably
+      covers the context cue's window advances the per-channel read cursor
+      to the newest message returned (see ``timeline.cursor_advance_is_sound``
+      for
+      what "provably" excludes: paged reads, narrow limits, non-id channel
+      keys), and only when the calling turn IS that channel's shared
+      session (``turn_context.current().cursor_channel``). This is the one
+      place that KNOWS the channel's conversation read the channel, so the
+      context breadcrumb can count the exact unread delta and go quiet when
+      there is none.
+    - ``feature_flags``: with ``compact_timeline`` enabled, renderable
+      results return as compact provenance-labeled lines instead of
+      pretty-printed JSON. Read fresh per call; any rendering surprise
+      falls back to the JSON form, never an error.
     """
 
     async def handler(args: dict, **kwargs: Any) -> str:
@@ -134,7 +158,46 @@ def _make_tool_handler(tool_name: str, api: FilamentAPI):
                 logger.warning("filament-fcm: tool %s rejected: %s", tool_name, error)
                 return json.dumps({"error": error})
             parsed = api.parse_tool_result(result)
-            return json.dumps(parsed, indent=2, default=str)
+            if cursor_store is not None and tool_name == "get_recent_messages":
+                try:
+                    channel = str((args or {}).get("channel") or "")
+                    # Only the turn that IS this channel's shared session may
+                    # record (turn_context's cursor_channel, set at dispatch): a
+                    # per-sender session's, backchannel's, or other channel's
+                    # fetch is one reader's; recording it channel-wide would
+                    # quiet the cue for a session that never saw the messages.
+                    if (
+                        channel
+                        and channel == (turn_context.current().cursor_channel)
+                        and timeline.cursor_advance_is_sound(
+                            args,
+                            channel,
+                            payload=parsed,
+                            prev_cursor=cursor_store.get(channel),
+                            min_window=reactive_mod.BREADCRUMB_LIMIT,
+                        )
+                    ):
+                        newest = timeline.newest_message(parsed)
+                        if newest:
+                            cursor_store.record(channel, newest[0], ts=newest[1])
+                except Exception:
+                    logger.warning(
+                        "filament-fcm: read-cursor update failed",
+                        exc_info=True,
+                    )
+            if tool_name in timeline.RENDERABLE_TOOLS:
+                # Flag read gated on renderability: the file read costs
+                # nothing on the many tools that can never render compactly.
+                compact = feature_flags is not None and feature_flags.is_enabled(
+                    reactive_mod.FEATURE_COMPACT_TIMELINE
+                )
+                return timeline.render_tool_result(
+                    tool_name,
+                    parsed,
+                    compact=compact,
+                    channel=str((args or {}).get("channel") or "") or None,
+                )
+            return timeline.render_tool_result(tool_name, parsed, compact=False)
         except Exception as exc:
             logger.exception("filament-fcm: tool %s failed", tool_name)
             # Several transport errors, httpx.ReadError included, stringify to
@@ -364,6 +427,12 @@ def register(ctx: Any) -> None:
     # handler closes over ``api`` — the same instance the adapter will
     # use — so tool calls proxy through the live MCP session.
     all_tools = _resolve_tools(mcp_url, mcp_token)
+    # Session-economy hooks for the message-read proxies: the read
+    # cursor (always on) and the compact_timeline flag (read fresh per
+    # call). Fresh store instances — like every store, state lives in the
+    # files, not the objects.
+    cursor_store = reactive_mod.ChannelCursorStore()
+    handler_flags = FeatureFlagStore()
     registered = 0
     skipped = 0
     for tool in all_tools:
@@ -382,7 +451,12 @@ def register(ctx: Any) -> None:
             name=name,
             toolset="filament",
             schema=schema,
-            handler=_make_tool_handler(name, api),
+            handler=_make_tool_handler(
+                name,
+                api,
+                cursor_store=cursor_store,
+                feature_flags=handler_flags,
+            ),
             is_async=True,
             description=tool.get("description", ""),
         )
@@ -499,23 +573,23 @@ def _register_capability_gate(ctx: Any) -> None:
     model cannot argue with. This is what turns the data-plane trust boundary
     from *soft* (framing only) into *hard* per-call denial.
 
-    The gate reads the per-turn ``current_capabilities`` ContextVar the adapter
-    pins in ``_wake``: ``None`` (control turns, non-Filament turns) is ungated;
-    a frozenset restricts the turn to exactly those tool names. Fires for EVERY
-    tool in the process — Filament tools and any other plugin's (a calendar/web
-    MCP server) alike — so a data channel can be granted or denied capabilities
-    it doesn't even own.
+    The gate reads the ``turn_context`` the adapter pins in ``_wake``. A
+    ``capabilities`` of ``None`` (control turns, non-Filament turns) is
+    ungated; a frozenset restricts the turn to exactly those tool names.
+    Fires for EVERY tool in the process — Filament tools and any other
+    plugin's (a calendar/web MCP server) alike — so a data channel can be
+    granted or denied capabilities it doesn't even own.
     """
 
     def _capability_pre_tool_call(**kwargs: Any) -> dict | None:
         tool_name = kwargs.get("tool_name") or ""
-        allowed = current_capabilities.get()
+        allowed = turn_context.current().capabilities
         if not capability_denies(allowed, tool_name):
             return None
         logger.info(
             "filament-fcm: capability gate DENIED tool=%s (zone=%s, %d allowed)",
             tool_name,
-            current_zone.get(),
+            turn_context.current().zone,
             len(allowed) if allowed is not None else -1,
         )
         return {
@@ -677,7 +751,7 @@ def _register_reactive_tools(
     them inspect. The principal edits these CONVERSATIONALLY — they describe the
     change in plain language and the agent reads, amends, and saves; they never
     type a tool call. All four refuse unless the calling turn is control-plane
-    (``current_zone`` == "control"), so a shared-channel participant can never
+    (``turn_context.is_control``), so a shared-channel participant can never
     rewrite the agent's instructions. The stores are file-backed (same paths the
     adapter reads), so writes take effect on the next event with no restart.
 
@@ -691,20 +765,27 @@ def _register_reactive_tools(
     feature_flags = FeatureFlagStore()
     channel_instructions_store = ChannelInstructionsStore()
 
-    def _deny(tool: str) -> str:
-        logger.info(
-            "filament-fcm: %s DENIED (zone=%s, not control plane)",
-            tool,
-            current_zone.get(),
-        )
+    def _require_control(tool: str) -> str | None:
+        """Returns a refusal payload unless the calling turn is control-plane.
+
+        Args:
+            tool: The tool name, for the log lines and nothing else.
+
+        Returns:
+            A JSON error string to hand back to the model, or None to proceed.
+        """
+        zone = turn_context.current().zone
+        logger.info("filament-fcm: %s (zone=%s)", tool, zone)
+        if zone is Zone.CONTROL:
+            return None
+        logger.info("filament-fcm: %s DENIED (zone=%s, not control plane)", tool, zone)
         return json.dumps(
             {"error": "Only available from your backchannel (control plane)."}
         )
 
     async def _set_instructions(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: set_instructions (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("set_instructions")
+        if denial := _require_control("set_instructions"):
+            return denial
         text = args.get("instructions", "") or ""
         instructions_store.write(text)
         # Mirror the local edit to the server document, rebased on the
@@ -714,15 +795,13 @@ def _register_reactive_tools(
         return json.dumps({"ok": True, "bytes": len(text)})
 
     async def _get_instructions(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: get_instructions (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("get_instructions")
+        if denial := _require_control("get_instructions"):
+            return denial
         return json.dumps({"instructions": instructions_store.read()})
 
     async def _set_wake_policy(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: set_wake_policy (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("set_wake_policy")
+        if denial := _require_control("set_wake_policy"):
+            return denial
         policy = args.get("policy")
         if not isinstance(policy, dict):
             return json.dumps(
@@ -739,9 +818,8 @@ def _register_reactive_tools(
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_wake_policy(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: get_wake_policy (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("get_wake_policy")
+        if denial := _require_control("get_wake_policy"):
+            return denial
         return json.dumps({"policy": wake_store.read()})
 
     def _available_tools_by_toolset() -> dict[str, list[str]] | None:
@@ -774,9 +852,8 @@ def _register_reactive_tools(
         )
 
     async def _get_capabilities(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: get_capabilities (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("get_capabilities")
+        if denial := _require_control("get_capabilities"):
+            return denial
         if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
             return _feature_off_notice()
         policy = capability_store.read()
@@ -798,9 +875,8 @@ def _register_reactive_tools(
         return json.dumps(out, indent=2)
 
     async def _set_capabilities(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: set_capabilities (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("set_capabilities")
+        if denial := _require_control("set_capabilities"):
+            return denial
         if not feature_flags.is_enabled(FEATURE_ADVANCED_TOOL_CONTROLS):
             return _feature_off_notice()
         policy = args.get("policy")
@@ -819,9 +895,8 @@ def _register_reactive_tools(
         return json.dumps({"ok": True, "policy": policy})
 
     async def _get_features(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: get_features (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("get_features")
+        if denial := _require_control("get_features"):
+            return denial
         flags = feature_flags.read()
         return json.dumps(
             {
@@ -834,9 +909,8 @@ def _register_reactive_tools(
         )
 
     async def _set_feature(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: set_feature (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("set_feature")
+        if denial := _require_control("set_feature"):
+            return denial
         name = args.get("feature")
         enabled = args.get("enabled")
         if name not in KNOWN_FEATURES:
@@ -931,9 +1005,8 @@ def _register_reactive_tools(
             feature_flags.write(value)
 
     async def _set_agent_config(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: set_agent_config (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("set_agent_config")
+        if denial := _require_control("set_agent_config"):
+            return denial
         section = args.get("section")
         if section not in _CONFIG_SECTIONS:
             return json.dumps(
@@ -957,9 +1030,8 @@ def _register_reactive_tools(
         return json.dumps({"ok": True, "section": section})
 
     async def _get_agent_config(args: dict, **kwargs: Any) -> str:
-        logger.info("filament-fcm: get_agent_config (zone=%s)", current_zone.get())
-        if current_zone.get() != "control":
-            return _deny("get_agent_config")
+        if denial := _require_control("get_agent_config"):
+            return denial
         section = args.get("section")
         if section is None:
             return json.dumps({"config": _config_document()}, indent=2)

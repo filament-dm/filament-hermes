@@ -101,6 +101,7 @@ def _load_modules():
         "credentials",
         "fcm_client",
         "filament_api",
+        "framing",
         "reactive",
         "adapter",
         "media_tool",
@@ -115,10 +116,11 @@ def _load_modules():
         sys.modules["hermes_filament_fcm.fcm_client"],
         sys.modules["hermes_filament_fcm.adapter"],
         sys.modules["hermes_filament_fcm.media_tool"],
+        sys.modules["hermes_filament_fcm.framing"],
     )
 
 
-fcm_client, adapter, media_tool = _load_modules()
+fcm_client, adapter, media_tool, framing = _load_modules()
 
 
 # ── Payload parsing: has_content ─────────────────────────────────────
@@ -172,11 +174,11 @@ def test_missing_content_and_body_defaults_to_empty_text():
     assert msg.has_content is True
 
 
-# ── _summarize_media formatting ──────────────────────────────────────
+# ── framing.summarize_media formatting ───────────────────────────────
 
 
 def test_summarize_media_formats_attachment():
-    note = adapter._summarize_media(
+    note = framing.summarize_media(
         [
             {
                 "mxc_url": "mxc://hs/abc",
@@ -196,9 +198,9 @@ def test_summarize_media_formats_attachment():
 
 
 def test_summarize_media_empty_or_malformed():
-    assert adapter._summarize_media([]) is None
-    assert adapter._summarize_media(None) is None
-    assert adapter._summarize_media(["nope"]) is None
+    assert framing.summarize_media([]) is None
+    assert framing.summarize_media(None) is None
+    assert framing.summarize_media(["nope"]) is None
 
 
 # ── _media_note fetch behavior ───────────────────────────────────────
