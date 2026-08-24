@@ -834,6 +834,9 @@ ALWAYS_GRANTED: frozenset[str] = frozenset(
         "get_self",
         "mark_read",
         "get_backchannel",
+        # The status line is the agent's typing indicator; participation
+        # gates it server-side like posting.
+        "set_status",
         # Orientation: WHERE the agent is, never authority to act there.
         # These belong to no bundle and this gate is gateway-wide, so without
         # them a channel granted EVERY row the app offers still had

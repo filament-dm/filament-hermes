@@ -272,6 +272,27 @@ class FilamentAPI:
             }
         )
 
+    async def set_status(
+        self,
+        channel: str,
+        status_text: str | None = None,
+        about_message_id: str | None = None,
+        thread_id: str | None = None,
+        timeout_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Set the agent's ephemeral status line; only ``channel`` (and
+        ``thread_id``, if any) clears it."""
+        arguments: dict[str, Any] = {"channel": channel}
+        if status_text is not None:
+            arguments["status_text"] = status_text
+        if about_message_id is not None:
+            arguments["about_message_id"] = about_message_id
+        if thread_id is not None:
+            arguments["thread_id"] = thread_id
+        if timeout_ms is not None:
+            arguments["timeout_ms"] = timeout_ms
+        return await self.call_tool("set_status", arguments)
+
     async def post_message(self, channel: str, markdown_body: str) -> dict[str, Any]:
         """Send a message to a room. The server renders markdown to HTML."""
         return await self.call_tool(
