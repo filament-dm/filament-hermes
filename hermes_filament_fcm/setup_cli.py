@@ -602,6 +602,14 @@ def _restart_gateway() -> None:
 
     print_info("Gateway restarting in the background...")
 
+    # The health check below is interactive comfort: ~5s of sleep plus a
+    # second CLI start purely to print a thumbs-up. A scripted install (the
+    # hosted-attach exec, CI) has nobody watching and the server polls the
+    # real signal (push registration), so skip it there.
+    if not sys.stdout.isatty():
+        print_info("Verify it came up with: hermes gateway status")
+        return
+
     # Brief, bounded health check so the installer can give a thumbs-up without
     # blocking on the (possibly foreground) restart. Give the gateway a moment
     # to come up, then ask `hermes gateway status` once — status is a quick,
