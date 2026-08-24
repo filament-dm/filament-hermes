@@ -647,54 +647,39 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._greet_pending = False
 
         try:
-            greet_id = new_id("greet")
-            trigger_id = f"greet:{self._cc_room_id}"
-            source = self.build_source(
-                chat_id=self._cc_room_id,
-                chat_name="backchannel",
-                chat_type="dm",
-                user_id=self._owner_id,
-                user_name=self._owner_name or self._owner_id,
-                message_id=trigger_id,
-            )
-            event = MessageEvent(
-                text=(
-                    "[system: You have just connected to Filament and are now in "
-                    "your backchannel with your principal. Reply with a short, "
-                    "friendly one-line hello introducing yourself so they know "
-                    "you're connected. Just write the reply directly — it is "
-                    "delivered to them automatically. Do not call any tools.]"
-                ),
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=trigger_id,
-                raw_message=None,
-            )
+            # Deterministic, not a model turn: the hello is the connect flow's
+            # finish line (the app literally waits for it), so it should land
+            # the moment the gateway is up — an LLM round added ~6 seconds of
+            # pure wait and could say anything. Personality gets its chance on
+            # the first real exchange.
             logger.info(
                 "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
             )
             with bound_context(
                 installation_id=self._installation_id,
                 gateway_instance_id=self._gateway_instance_id,
-                turn_id=greet_id,
                 call_origin="first_contact_greet",
-                trigger_event_id=trigger_id,
             ):
                 slog.info(
                     "filament_fcm.greet.dispatch",
                     channel_id=self._cc_room_id,
                     principal_id=self._owner_id,
-                    synthetic_event_id=trigger_id,
                 )
-                await self.handle_message(event)
+                await self._filament_api.post_message(
+                    channel=self._cc_room_id,
+                    markdown_body=(
+                        "👋 Connected and ready. This is our private channel — "
+                        "give me a task, ask me anything, or invite me into a "
+                        "channel."
+                    ),
+                )
                 slog.info(
                     "filament_fcm.greet.dispatched",
                     channel_id=self._cc_room_id,
                     principal_id=self._owner_id,
-                    synthetic_event_id=trigger_id,
                 )
         except Exception:
-            logger.exception("filament-fcm: greet turn failed")
+            logger.exception("filament-fcm: greet post failed")
             slog.exception("filament_fcm.greet.failed")
 
     def _note_reserved(self) -> None:
