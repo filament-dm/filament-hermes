@@ -428,7 +428,11 @@ info "Connecting to Filament ..."
 # dep target) on PYTHONPATH, so `hermes_filament_fcm` imports from the clone.
 # The package is not pip-installed, so there is no console script to run.
 run_setup() {
+  # In the profile (hosted) flow this script owns the gateway restart — an
+  # s6 bounce or the direct spawn below — so the wizard's own restart would
+  # only spend two extra CLI startups getting replaced moments later.
   PYTHONPATH="$PLUGIN_DIR${PYPATH_PREFIX:+:$PYPATH_PREFIX}${PYTHONPATH:+:$PYTHONPATH}" \
+    FILAMENT_SETUP_SKIP_RESTART="${FILAMENT_PROFILE:+1}" \
     "$PY" -m hermes_filament_fcm.setup_cli "$@"
 }
 
@@ -544,6 +548,20 @@ if [ -n "$S6_SVC" ]; then
       restart_slot "$SVCDIR" || true
     done
   fi
+fi
+
+# --- Start the profile gateway (non-s6 images) --------------------------------
+# The wizard's restart was skipped above (FILAMENT_SETUP_SKIP_RESTART): with
+# no supervisor, `hermes gateway restart` is two CLI startups (restart, then
+# run) where one will do. Spawn the gateway directly, detached from this
+# session; --replace hands over cleanly if one is somehow already up.
+if [ -z "$S6_SVC" ] && [ -n "${FILAMENT_PROFILE:-}" ]; then
+  SETSID="$(command -v setsid 2>/dev/null || true)"
+  info "Starting the gateway ..."
+  # shellcheck disable=SC2086  # $SETSID intentionally word-splits away when absent
+  $SETSID nohup hermes gateway run --replace \
+    > "$HERMES_HOME/logs/gateway-detached.log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
 fi
 
 # --- Keep profile gateways alive across restarts (non-s6 images) -------------
