@@ -281,3 +281,20 @@ def control_body(
     else:
         sender_line = f"[Message from {sanitize_meta(sender_display_name or sender)}.]"
     return f"{sender_line}\n{body}" if body else sender_line
+
+
+# Ephemeral system-prompt line riding on every Filament turn (the source's
+# channel_prompt — applied at API-call time, never persisted to history).
+# Hermes defers most MCP tool schemas behind tool_search, and a model that
+# doesn't know its own tools spends two full rounds (tool_search +
+# tool_describe) rediscovering them per session — measured on every
+# web-lookup task. Naming the workhorses lets it go straight to tool_call;
+# steering to brave keeps it off approval-gated terminal curl.
+TOOL_MAP_PROMPT = (
+    "Tool map: web search = brave_web_search(query); open/read a page = "
+    "browser_exec; SaaS integrations (calendars, email, docs) = the composio "
+    "tools; Filament history = get_recent_messages(channel). A deferred tool "
+    "can be called directly with tool_call(name, arguments) — skip "
+    "tool_search when the tool is named here. Prefer brave_web_search over "
+    "terminal curl for public web lookups."
+)
