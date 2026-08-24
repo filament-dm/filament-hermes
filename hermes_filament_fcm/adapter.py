@@ -34,7 +34,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, slash, turn_context
+from . import framing, slash, timeline, turn_context
 from ._version import PLUGIN_VERSION
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -76,6 +76,7 @@ from .reactive import (
     principal_note,
     reply_thread_for_send,
     sender_is_agent_in_thread,
+    unseen_messages,
 )
 from .server_config import ServerConfigSync
 from .status import TurnScope, is_nonconversational_notice
@@ -1748,7 +1749,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     async def _context_breadcrumb(
-        self, channel: str, trigger_event_id: str | None
+        self, channel: str, trigger_event_id: str | None, inline: bool = False
     ) -> str | None:
         """Read a bounded recent-message window and build the counted context
         cue (see reactive.context_breadcrumb). Best-effort: any failure — no
@@ -1778,11 +1779,69 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # windowed count: one sender's fetch must not silence another
         # sender's cue.
         cursors = getattr(self, "_channel_cursors", None)
-        cursor_applies = bool(cursors and self._shared_sessions_effective())
+        # Inline mode (control plane only): the backchannel is a single
+        # conversation with the principal by construction, so the channel
+        # cursor is sound there without the shared-session gate.
+        cursor_applies = bool(
+            cursors and (inline or self._shared_sessions_effective())
+        )
+        cursor = cursors.get(channel) if cursor_applies else None
+        if inline:
+            # Control plane: deliver the unseen messages themselves instead
+            # of a count-and-fetch order — backchannel content is already
+            # command-authority, so inlining bodies adds no trust surface,
+            # and it saves the model a whole tool round on every wake. The
+            # DATA plane must keep the count-only cue (bodies from a shared
+            # channel are untrusted and never ride in the prompt frame).
+            unseen, _ = unseen_messages(
+                messages,
+                trigger_event_id=trigger_event_id,
+                last_seen_event_id=cursor,
+            )
+            block: str | None = None
+            if unseen:
+                try:
+                    rendered = timeline.render_recent_messages(
+                        {"messages": unseen}, channel=channel
+                    )
+                    block = (
+                        "[RECENT BACKCHANNEL MESSAGES — read for you just "
+                        "now; with these you are caught up, no need to call "
+                        f"get_recent_messages]\n{rendered}"
+                    )
+                except Exception:
+                    # Renderer surprise: fall back to the counted cue rather
+                    # than lose the context signal entirely.
+                    block = context_breadcrumb(
+                        messages,
+                        trigger_event_id=trigger_event_id,
+                        last_seen_event_id=cursor,
+                    )
+            # The adapter itself fetched this window: advance the cursor so
+            # the next wake's delta is exact (same "provably fetched"
+            # semantics as the tool-proxy advance).
+            if cursors:
+                newest = next(
+                    (
+                        m.get("event_id")
+                        for m in reversed(messages)
+                        if m.get("event_id")
+                    ),
+                    None,
+                )
+                if newest:
+                    cursors.record(channel, newest)
+            logger.info(
+                "filament-fcm: inline context for %s: %d unseen of %d read",
+                channel,
+                len(unseen),
+                len(messages),
+            )
+            return block
         crumb = context_breadcrumb(
             messages,
             trigger_event_id=trigger_event_id,
-            last_seen_event_id=(cursors.get(channel) if cursor_applies else None),
+            last_seen_event_id=cursor,
         )
         logger.info(
             "filament-fcm: context breadcrumb for %s: %d messages read, cue=%s",
@@ -1896,7 +1955,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # timeline may hold context this session never saw. Flag the count so
         # the agent reads it instead of answering "I don't see that" from an
         # empty memory. The framework prepends channel_context to the body.
-        breadcrumb = await self._context_breadcrumb(msg.room_id, msg.event_id)
+        breadcrumb = await self._context_breadcrumb(
+            msg.room_id, msg.event_id, inline=True
+        )
         event = MessageEvent(
             text=body,
             message_type=MessageType.TEXT,
