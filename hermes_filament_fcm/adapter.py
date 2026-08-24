@@ -1712,7 +1712,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     async def _context_breadcrumb(
-        self, channel: str, trigger_event_id: str | None
+        self, channel: str, trigger_event_id: str | None, thread_id: str | None = None
     ) -> str | None:
         """Read a bounded recent-message window and build the counted context
         cue (see reactive.context_breadcrumb). Best-effort: any failure — no
@@ -1735,14 +1735,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             return None
         # The read cursor is a channel-wide fact; it only means "THIS
-        # conversation has seen it" when the channel has exactly one
-        # conversation, so it is consulted only under EFFECTIVE
-        # shared-session keying (flag or operator pin, see
-        # _shared_sessions_effective). Per-sender sessions keep the
-        # windowed count: one sender's fetch must not silence another
-        # sender's cue.
+        # conversation has seen it" for the turn whose conversation IS the
+        # channel — the same rule that decides whether a turn may record
+        # one, so reads and writes cannot disagree. A thread turn joins a
+        # different conversation and keeps the windowed count, as do
+        # per-sender sessions: another conversation's fetch must not
+        # silence this one's cue.
         cursors = getattr(self, "_channel_cursors", None)
-        cursor_applies = bool(cursors and self._shared_sessions_effective())
+        cursor_applies = bool(
+            cursors and self._cursor_channel_for_turn(channel, thread_id)
+        )
         crumb = context_breadcrumb(
             messages,
             trigger_event_id=trigger_event_id,
@@ -2294,7 +2296,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Reinforce the envelope's get_recent_messages hint with a concrete
         # count of channel history this reactive turn can't see — the counted
         # cue is what reliably drives the fetch (the static hint alone doesn't).
-        breadcrumb = await self._context_breadcrumb(channel, target_event_id)
+        breadcrumb = await self._context_breadcrumb(
+            channel, target_event_id, thread_id=thread_id
+        )
         event = MessageEvent(
             text=envelope,
             message_type=MessageType.TEXT,
