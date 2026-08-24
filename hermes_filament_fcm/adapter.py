@@ -672,9 +672,55 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     channel_id=self._cc_room_id,
                     principal_id=self._owner_id,
                 )
+            # Fire-and-forget capabilities intro: a short model turn in the
+            # backchannel session. Two jobs — a genuinely useful second
+            # message, and priming the session + provider prompt cache so the
+            # principal's FIRST real message answers warm (~3s faster,
+            # measured). Never awaited and never gates readiness.
+            with contextlib.suppress(RuntimeError):
+                task = asyncio.get_running_loop().create_task(
+                    self._greet_intro_turn()
+                )
+                self._background_greet_task = task
         except Exception:
             logger.exception("filament-fcm: greet post failed")
             slog.exception("filament_fcm.greet.failed")
+
+    async def _greet_intro_turn(self) -> None:
+        """Background capabilities intro (see _maybe_greet). Best-effort."""
+        try:
+            trigger_id = f"greet-intro:{self._cc_room_id}"
+            source = self.build_source(
+                chat_id=self._cc_room_id,
+                chat_name="backchannel",
+                chat_type="dm",
+                user_id=self._owner_id,
+                user_name=self._owner_name or self._owner_id,
+                message_id=trigger_id,
+            )
+            with contextlib.suppress(AttributeError):
+                source.channel_prompt = framing.TOOL_MAP_PROMPT
+            event = MessageEvent(
+                text=(
+                    "[system: You just connected and posted a canned hello in "
+                    "your backchannel. Follow it with ONE short line (no "
+                    "greeting, no tools) telling your principal two or three "
+                    "concrete things you can do for them.]"
+                ),
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=trigger_id,
+                raw_message=None,
+            )
+            with bound_context(
+                installation_id=self._installation_id,
+                gateway_instance_id=self._gateway_instance_id,
+                call_origin="first_contact_greet",
+                trigger_event_id=trigger_id,
+            ):
+                await self.handle_message(event)
+        except Exception:
+            logger.debug("filament-fcm: greet intro turn failed", exc_info=True)
 
     def _note_reserved(self) -> None:
         """Mark this connect attempt blocked on an unfinalized agent, and tell
