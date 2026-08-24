@@ -155,12 +155,21 @@ def _annotations(msg: Mapping) -> str:
     if rechat is not None and not isinstance(rechat, Mapping):
         raise ValueError("rechat is not an object")
     if isinstance(rechat, Mapping):
-        src = (
-            rechat.get("source_channel_name")
-            or rechat.get("source_channel_id")
-            or "another channel"
+        src_key = next(
+            (k for k in ("source_channel_name", "source_channel_id") if rechat.get(k)),
+            None,
         )
-        parts.append(f"⟨rechat from {_clean(src)}⟩")
+        src = _clean(rechat[src_key]) if src_key else "another channel"
+        # "rechat" is in _RENDERED_KEYS, so no unknown-field stub would
+        # surface the rest of the mapping. Render it here or lose it.
+        bits = [
+            f"{_clean(k)}={_clean(v)}"
+            for k, v in rechat.items()
+            if k != src_key and v is not None
+        ]
+        parts.append(
+            "⟨rechat from " + src + (f" {' '.join(bits)}" if bits else "") + "⟩"
+        )
     return (" " + " ".join(parts)) if parts else ""
 
 
@@ -409,7 +418,11 @@ def newest_message(payload: Mapping) -> tuple[str, int | None] | None:
             if event_id:
                 try:
                     ts = int(msg.get("timestamp"))  # type: ignore[arg-type]
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError: JSON like 1e309 parses to float inf,
+                    # which int() refuses. Degrade to "no timestamp" —
+                    # raising here would skip the cursor advance and make
+                    # the context cue re-fire on messages already read.
                     ts = None
                 return str(event_id), ts
     return None
