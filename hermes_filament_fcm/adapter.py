@@ -1894,6 +1894,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             message_id=msg.event_id,
         )
+        # Ephemeral tool map (system prompt, never persisted): saves the
+        # model the tool_search/tool_describe discovery rounds. See framing.
+        # suppress: test doubles build plain dict sources.
+        with contextlib.suppress(AttributeError):
+            source.channel_prompt = framing.TOOL_MAP_PROMPT
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel
         # timeline may hold context this session never saw. Flag the count so
@@ -2332,6 +2337,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             message_id=message_id,
         )
+        # Same ephemeral tool map as the control path — the discovery-round
+        # tax is per session, and shared channels start sessions too.
+        with contextlib.suppress(AttributeError):
+            source.channel_prompt = framing.TOOL_MAP_PROMPT
         # Reinforce the envelope's get_recent_messages hint with a concrete
         # count of channel history this reactive turn can't see — the counted
         # cue is what reliably drives the fetch (the static hint alone doesn't).
