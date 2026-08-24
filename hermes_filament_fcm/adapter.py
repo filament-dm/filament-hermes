@@ -1220,6 +1220,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """Stop listening and clean up."""
         self._mark_disconnected()
 
+        # The publisher is module-global and outlives this adapter: drop
+        # this adapter's turns so nothing publishes through an API that is
+        # about to close, or through whichever API replaces it.
+        status_publisher.reset()
+
         if self._fcm_client:
             await self._fcm_client.stop()
 
