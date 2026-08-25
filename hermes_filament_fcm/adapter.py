@@ -86,10 +86,10 @@ slog = get_logger()
 _DEFAULT_MCP_URL = "https://api.filament.dm/mcp/agents"
 _MAX_MESSAGE_LENGTH = 16000
 
-# Legacy processing markers: older harness versions reacted 👀 while working
-# (replaced by the status line, the agent's thinking indicator). Still never
-# a wake trigger — agents on old versions keep adding it, and waking on it
-# would loop them.
+# Processing markers the adapter reacts with while working (👀 on start,
+# removed on completion). Kept alongside the status line until clients render
+# the thinking indicator. Never a wake trigger — waking on our own marker
+# would loop.
 _PROCESSING_REACTIONS = ("👀",)
 
 # System notices ("💾 Self-improvement review: …") become a transient status
@@ -2344,12 +2344,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
-    # ── Processing lifecycle (thinking indicator) ──────────────────
+    # ── Processing lifecycle (thinking indicator + 👀 reaction) ────
     # The gateway calls these hooks around the agent turn. The status line
-    # (the agent's thinking indicator) replaces the old 👀 reaction: dispatch
+    # (the agent's thinking indicator) is the working marker: dispatch
     # already announces the turn, and processing-start backstops any wake
     # path that didn't, so the indicator is up the moment work begins and
-    # cleared when the turn finishes.
+    # cleared when the turn finishes. The 👀 reaction is redundant with it
+    # but stays until clients render the indicator.
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         target = getattr(event, "message_id", None)
@@ -2360,16 +2361,25 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             target_event_id=target,
         )
         room_id = getattr(event, "chat_id", None)
-        if not room_id:
-            return
-        status_publisher.ensure_turn(
-            getattr(event, "filament_turn_key", None) or target,
-            TurnScope(
-                room_id=room_id,
-                thread_id=getattr(event, "thread_id", None),
-                prompt_event_id=target,
-            ),
-        )
+        if room_id:
+            status_publisher.ensure_turn(
+                getattr(event, "filament_turn_key", None) or target,
+                TurnScope(
+                    room_id=room_id,
+                    thread_id=getattr(event, "thread_id", None),
+                    prompt_event_id=target,
+                ),
+            )
+        try:
+            with bound_context(call_origin="processing_reaction"):
+                await self._filament_api.react(message_id=target, key="👀")
+        except Exception:
+            logger.debug("filament-fcm: failed to add 👀 reaction", exc_info=True)
+            slog.debug(
+                "filament_fcm.processing.react_failed",
+                target_event_id=target,
+                exc_info=True,
+            )
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
@@ -2385,3 +2395,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         await status_publisher.end_turn(
             getattr(event, "filament_turn_key", None) or target
         )
+        try:
+            with bound_context(call_origin="processing_reaction"):
+                await self._filament_api.unreact(message_id=target, key="👀")
+        except Exception:
+            logger.debug("filament-fcm: failed to remove 👀 reaction", exc_info=True)
+            slog.debug(
+                "filament_fcm.processing.unreact_failed",
+                target_event_id=target,
+                exc_info=True,
+            )
