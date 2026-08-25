@@ -21,6 +21,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from collections import deque
 from typing import Any
 
@@ -118,6 +119,12 @@ _PROCESSING_REACTIONS = ("👀",)
 # line in shared channels; detection lives in status.py (stdlib-only, unit-
 # tested there). _NOTICE_STATUS_TIMEOUT_MS is how long one stays visible.
 _NOTICE_STATUS_TIMEOUT_MS = 30_000
+
+# How often the gateway asks to be probed. Long relative to the 20s heartbeat:
+# this is a reachability check, not a presence one, and each probe costs a push
+# to the machine hosting the agent.
+_PROBE_REQUEST_INTERVAL_S = 600
+
 
 # ENG-429: the JSON-RPC error code agents_mcp returns while an agent is reserved
 # but not finalized (connect token valid, account not created yet).
@@ -302,6 +309,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._fcm_client: FilamentFCMClient | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task | None = None
+        # When we last asked the server to probe our push path. None means
+        # never, so the first heartbeat tick after connect probes immediately
+        # and a reconnect gets a fresh reading rather than inheriting the old
+        # one. Declared here, not created on first use: it is read on the
+        # heartbeat path every tick.
+        self._last_probe_request: float | None = None
         self._update_checker = UpdateChecker(self._credentials)
         self._pending_upgrade = PendingUpgradeStore(self._credentials)
         # The gateway's event loop, captured in connect(). FCM callbacks (which
@@ -1220,6 +1233,50 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # raises, so it can't disturb the presence cadence.
             with bound_context(call_origin="heartbeat"):
                 await self._server_config.maybe_report_tools()
+            # So does the push-path probe, on its own much longer interval.
+            await self._maybe_request_probe()
+
+    # ── Push-path probe ─────────────────────────────────────────────
+
+    async def _maybe_request_probe(self) -> None:
+        """Ask the server to ping us, at most once per interval.
+
+        Everything else this gateway sends proves only that we can reach the
+        server. That stays true when our FCM registration has been invalidated
+        or the listener has died, which is exactly the failure a principal
+        experiences as "my agent stopped answering" while every status surface
+        reads healthy. The only way to test the other direction is to be sent
+        something, so we ask.
+
+        The cadence lives here rather than on the server because this timer
+        already exists, and because an agent too broken to ask is one whose
+        heartbeat has stopped anyway — which the server reads directly. Never
+        raises: a failed probe request is itself a symptom, not a reason to
+        disturb the heartbeat.
+        """
+        if not self._filament_api:
+            return
+        now = time.monotonic()
+        if (
+            self._last_probe_request is not None
+            and (now - self._last_probe_request) < _PROBE_REQUEST_INTERVAL_S
+        ):
+            return
+        self._last_probe_request = now
+        try:
+            with bound_context(call_origin="probe_request"):
+                result = await self._filament_api.request_probe()
+        except Exception:
+            logger.warning("filament-fcm: probe request failed", exc_info=True)
+            return
+        if isinstance(result, dict) and result.get("no_push_tokens"):
+            # We never registered for push, so no probe can arrive. Worth
+            # saying out loud: the gateway is running but unreachable.
+            logger.warning(
+                "filament-fcm: probe requested but no push token is registered"
+            )
+        else:
+            logger.debug("filament-fcm: probe requested")
 
     # ── Update check ────────────────────────────────────────────────
 
