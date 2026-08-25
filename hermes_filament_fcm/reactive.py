@@ -808,6 +808,7 @@ def is_auto_bundle_name(name: str) -> bool:
     even though it resolves to nothing."""
     return any(name.startswith(p) for p in AUTO_BUNDLE_PREFIXES)
 
+
 # What no grant can remove. One flat set, not named sub-groups: the *reasons*
 # an entry is here differ, but the rule is identical for all of them — none is
 # a grantable row, so the app must never draw a switch implying otherwise, and
@@ -1035,8 +1036,7 @@ class CapabilityPolicyStore:
                 return
             if nm in path:
                 logger.warning(
-                    "filament-fcm: capability bundle cycle at %r "
-                    "(granting nothing)",
+                    "filament-fcm: capability bundle cycle at %r (granting nothing)",
                     nm,
                 )
                 return
@@ -1047,8 +1047,7 @@ class CapabilityPolicyStore:
             if not isinstance(entries, list):
                 if entries is None:
                     logger.warning(
-                        "filament-fcm: unknown capability bundle %r "
-                        "(granting nothing)",
+                        "filament-fcm: unknown capability bundle %r (granting nothing)",
                         nm,
                     )
                 return

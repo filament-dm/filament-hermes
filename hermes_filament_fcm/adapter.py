@@ -1678,9 +1678,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # the thread root once replies thread off it. A follow-up wake
         # re-records to refresh the thread's eviction slot.
         if mentioned or thread_follow_up:
-            self._engaged_threads.record(
-                msg.room_id, msg.thread_id or msg.event_id
-            )
+            self._engaged_threads.record(msg.room_id, msg.thread_id or msg.event_id)
 
         # The push never includes attachments (ENG-603): describe any media on
         # the event so the agent knows it exists. Only for admitted wakes, so
@@ -1963,11 +1961,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         mcp_servers = _mcp_server_inventory()
         capability_policy = self._capability_store.read()
         raw_bundles = capability_policy.get("bundles")
-        bundles = (
-            [str(b) for b in raw_bundles]
-            if isinstance(raw_bundles, dict)
-            else []
-        )
+        bundles = [str(b) for b in raw_bundles] if isinstance(raw_bundles, dict) else []
         result = slash.parse(
             body,
             channels=channels,
@@ -2049,9 +2043,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 self._wake_policy.write(mutation.wake_policy)
             text, sections = mutation.reply, mutation.sections
         elif isinstance(result, slash.GuidanceCommand):
-            mutation = slash.apply_guidance(
-                result, self._channel_instructions.read()
-            )
+            mutation = slash.apply_guidance(result, self._channel_instructions.read())
             if mutation.changed:
                 self._channel_instructions.write(mutation.channel_instructions)
             text, sections = mutation.reply, mutation.sections
@@ -2260,9 +2252,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             # Same server-attributed comparison as the wake-note: the decline
             # coaching must not tell the principal about "your principal".
-            tool_hint = capability_hint(
-                allowed, sender_is_principal=bool(sender_note)
-            )
+            tool_hint = capability_hint(allowed, sender_is_principal=bool(sender_note))
         else:
             allowed = None
             tool_hint = ""

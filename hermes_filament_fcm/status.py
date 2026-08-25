@@ -75,10 +75,12 @@ def enabled() -> bool:
 # as real posts: it is the principal's durable operational record. Primary
 # signal is the gateway's metadata flag; the regexes are the same upgrade
 # bridge hermes's Discord adapter carries, for emitters predating the flag.
-_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
-    "non_conversational",
-    "non_conversational_history",
-})
+_NONCONVERSATIONAL_METADATA_KEYS = frozenset(
+    {
+        "non_conversational",
+        "non_conversational_history",
+    }
+)
 _NONCONVERSATIONAL_MESSAGE_PATTERNS = (
     re.compile(r"^\s*💾\s*Self-improvement review:\s+\S[\s\S]*$", re.IGNORECASE),
     re.compile(
@@ -251,7 +253,7 @@ def _generic_arg(args: dict | None) -> str:
 
 
 def _mcp_phrase(tool_name: str, args: dict | None) -> str | None:
-    """"mcp_linear_list_issues" / "mcp__composio__COMPOSIO_SEARCH_TOOLS"
+    """ "mcp_linear_list_issues" / "mcp__composio__COMPOSIO_SEARCH_TOOLS"
     -> "listing issues in Linear" / "searching tools in Composio".
 
     Hermes registers MCP tools under both separators: single underscore
@@ -440,9 +442,7 @@ class StatusPublisher:
 
     # -- per-tool-call (called from the pre_tool_call hook) --
 
-    def on_tool_call(
-        self, tool_name: str, args: dict | None, session_id: str
-    ) -> None:
+    def on_tool_call(self, tool_name: str, args: dict | None, session_id: str) -> None:
         if not enabled() or not hasattr(self._api, "set_status"):
             return
         entry = self._bound.get(session_id)
@@ -478,9 +478,7 @@ class StatusPublisher:
             ]
         else:
             candidates = [
-                key
-                for key, entry in self._pending.items()
-                if self._claimable(entry)
+                key for key, entry in self._pending.items() if self._claimable(entry)
             ]
             if len(candidates) != 1:
                 return None
@@ -514,9 +512,7 @@ class StatusPublisher:
                 self._halt(entry)
                 if finished:
                     self._schedule(self._clear(entry))
-        stale_sessions = {
-            sid for sid, v in self._bound.items() if v.created < cutoff
-        }
+        stale_sessions = {sid for sid, v in self._bound.items() if v.created < cutoff}
         for sid in stale_sessions:
             self._halt(self._bound[sid])
             del self._bound[sid]

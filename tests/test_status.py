@@ -313,9 +313,7 @@ class TestPublishLifecycle:
             await pub.end_turn("$m")
             texted = [c for c in api.calls if c.get("status_text")]
             assert len(texted) >= 2
-            assert all(
-                c["status_text"] == "reading a new message" for c in texted
-            )
+            assert all(c["status_text"] == "reading a new message" for c in texted)
             assert entry.ended and entry.refresh_task.cancelled
 
         asyncio.run(go())
@@ -401,8 +399,7 @@ class TestNonconversationalNotice:
 
     def test_legacy_patterns(self):
         review = (
-            "💾 Self-improvement review: "
-            "Skill 'filament-channel-awareness' created."
+            "💾 Self-improvement review: Skill 'filament-channel-awareness' created."
         )
         assert status.is_nonconversational_notice(None, review)
         assert status.is_nonconversational_notice(None, "💾 Skill 'x' updated.")
