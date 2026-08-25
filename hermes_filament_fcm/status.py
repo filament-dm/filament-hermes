@@ -26,6 +26,7 @@ import contextlib
 import logging
 import os
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -81,7 +82,7 @@ def _basename(path: Any) -> str:
 
 
 def _domain(url: Any) -> str:
-    m = re.match(r"^\w+://(?:[^/@]*@)?([^/]+)", str(url))
+    m = re.match(r"^\w+://(?:[^/@]*@)?([^/?#]+)", str(url))
     return _clip(m.group(1) if m else str(url), _MAX_ARG_CHARS)
 
 
@@ -278,6 +279,10 @@ def should_publish(
 class _Pending:
     scope: TurnScope
     created: float
+    # The API this turn started on. A completion awaiting its clear must
+    # not land on whichever API a rebuilt adapter installed in the
+    # meantime, so every call for this turn goes through this reference.
+    api: Any = None
     last_phrase: str | None = None
     last_ts: float = 0.0
     # Set by a completion inside the grace window. A tool call afterward
@@ -288,6 +293,11 @@ class _Pending:
     publishes: set = field(default_factory=set)
     refresh_task: Any = None
     finalize_task: Any = None
+    # A phrase the floor suppressed, held until the floor expires. Without
+    # it a burst's last tool -- often the long-running one -- would leave
+    # the previous, now-wrong phrase up for the rest of the turn.
+    queued_phrase: str | None = None
+    flush_task: Any = None
 
 
 class StatusPublisher:
@@ -305,8 +315,17 @@ class StatusPublisher:
         # its later claims may bind to.
         self._session_room: dict[str, str] = {}
         self._tasks: set = set()
+        # Turn bookkeeping is touched from two threads: dispatch and
+        # completion run on the gateway loop, tool-call claims on the
+        # engine's. Reentrant because begin_turn prunes while holding it.
+        self._lock = threading.RLock()
 
     def set_api(self, api: Any) -> None:
+        # The publisher is module-global but the adapter is not. A rebuilt
+        # adapter brings a new API, and the previous adapter's turns must
+        # not survive to publish through it or be claimed by a new session.
+        if self._api is not None and api is not self._api:
+            self.reset()
         self._api = api
         # May run before the gateway loop exists; begin_turn re-captures
         # the loop on every dispatch.
@@ -314,6 +333,23 @@ class StatusPublisher:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = None
+
+    def reset(self) -> None:
+        """Forget every tracked turn and stop its tasks.
+
+        Called when the API instance is replaced and on disconnect: a
+        stale entry would otherwise publish through the new API, or be
+        claimed by a new session's first tool call and narrate that turn
+        into the old turn's room.
+        """
+        with self._lock:
+            entries = [*self._pending.values(), *self._bound.values()]
+            self._pending.clear()
+            self._bound.clear()
+            self._trigger_session.clear()
+            self._session_room.clear()
+        for entry in entries:
+            self._halt(entry)
 
     # -- turn lifecycle (called from the adapter) --
 
@@ -324,9 +360,10 @@ class StatusPublisher:
         # scheduled onto it.
         with contextlib.suppress(RuntimeError):
             self._loop = asyncio.get_running_loop()
-        self._prune()
-        entry = _Pending(scope=scope, created=time.monotonic())
-        self._pending[trigger_event_id] = entry
+        with self._lock:
+            self._prune()
+            entry = _Pending(scope=scope, created=time.monotonic(), api=self._api)
+            self._pending[trigger_event_id] = entry
         self._publish(entry, "reading the conversation")
         # Exempt the first real phrase from the floor, or a single-tool
         # turn's only phrase would be suppressed.
@@ -342,21 +379,27 @@ class StatusPublisher:
         if not hasattr(self._api, "set_status"):
             return
         entry: _Pending | None = None
-        session_id = self._trigger_session.pop(trigger_event_id, None)
-        if session_id is not None:
-            entry = self._bound.pop(session_id, None)
-        else:
-            pending = self._pending.get(trigger_event_id)
-            if pending is None:
-                return
-            if time.monotonic() - pending.created < COMPLETION_GRACE_SECONDS:
-                pending.completed_early = True
-                if pending.finalize_task is None:
-                    pending.finalize_task = asyncio.get_running_loop().create_task(
-                        self._finalize_after_grace(trigger_event_id)
-                    )
-                return
-            entry = self._pending.pop(trigger_event_id)
+        # Held across the whole transition: a concurrent _claim on the
+        # engine thread moves an entry from _pending to _bound, and a
+        # completion that read one dict before the move and the other
+        # after would either miss the turn (leaving its status refreshing
+        # forever) or pop an entry that is no longer there.
+        with self._lock:
+            session_id = self._trigger_session.pop(trigger_event_id, None)
+            if session_id is not None:
+                entry = self._bound.pop(session_id, None)
+            else:
+                pending = self._pending.get(trigger_event_id)
+                if pending is None:
+                    return
+                if time.monotonic() - pending.created < COMPLETION_GRACE_SECONDS:
+                    pending.completed_early = True
+                    if pending.finalize_task is None:
+                        pending.finalize_task = asyncio.get_running_loop().create_task(
+                            self._finalize_after_grace(trigger_event_id)
+                        )
+                    return
+                entry = self._pending.pop(trigger_event_id, None)
         if entry is None:
             return
         self._halt(entry)
@@ -367,18 +410,25 @@ class StatusPublisher:
     def on_tool_call(self, tool_name: str, args: dict | None, session_id: str) -> None:
         if not enabled() or not hasattr(self._api, "set_status"):
             return
-        entry = self._bound.get(session_id)
-        if entry is None:
-            entry = self._claim(session_id)
-        if entry is None:
-            return
-        phrase = phrase_for(tool_name, args, scope_room=entry.scope.room_id)
-        if phrase is None:
-            return
-        now = time.monotonic()
-        if not should_publish(entry.last_phrase, entry.last_ts, phrase, now):
-            return
-        self._publish(entry, phrase)
+        # Held across the claim AND the publish: a tool call that read the
+        # entry while end_turn (or reset) was clearing it would otherwise
+        # publish a phrase after the clear, leaving a finished turn's
+        # status on screen until the server timeout.
+        with self._lock:
+            entry = self._bound.get(session_id)
+            if entry is None:
+                entry = self._claim_locked(session_id)
+            if entry is None or entry.ended:
+                return
+            phrase = phrase_for(tool_name, args, scope_room=entry.scope.room_id)
+            if phrase is None:
+                return
+            now = time.monotonic()
+            if not should_publish(entry.last_phrase, entry.last_ts, phrase, now):
+                if phrase != entry.last_phrase:
+                    self._queue(entry, phrase, now)
+                return
+            self._publish(entry, phrase)
 
     # -- internals --
 
@@ -389,6 +439,10 @@ class StatusPublisher:
         only that room's turns, and an unknown session claims only when a
         single turn is pending. Ambiguous turns stay un-narrated.
         """
+        with self._lock:
+            return self._claim_locked(session_id)
+
+    def _claim_locked(self, session_id: str) -> _Pending | None:
         if not session_id or not self._pending:
             return None
         known_room = self._session_room.get(session_id)
@@ -423,6 +477,7 @@ class StatusPublisher:
         return time.monotonic() - entry.created < COMPLETION_GRACE_SECONDS
 
     def _prune(self) -> None:
+        # Callers hold the lock.
         now = time.monotonic()
         cutoff = now - STALE_SECONDS
         for key, entry in list(self._pending.items()):
@@ -446,8 +501,10 @@ class StatusPublisher:
     def _publish(self, entry: _Pending, phrase: str) -> None:
         entry.last_phrase = phrase
         entry.last_ts = time.monotonic()
+        # This publish is newer than anything the floor is holding.
+        entry.queued_phrase = None
         handle = self._schedule(
-            self._api.set_status(
+            entry.api.set_status(
                 channel=entry.scope.room_id,
                 status_text=phrase,
                 about_message_id=entry.scope.prompt_event_id,
@@ -459,31 +516,63 @@ class StatusPublisher:
             entry.publishes.add(handle)
             handle.add_done_callback(entry.publishes.discard)
 
+    def _queue(self, entry: _Pending, phrase: str, now: float) -> None:
+        """Hold a phrase the floor suppressed and publish it when the
+        floor expires, unless a later publish supersedes it first."""
+        entry.queued_phrase = phrase
+        if entry.flush_task is not None and not entry.flush_task.done():
+            return
+        wait = max(0.0, MIN_INTERVAL_SECONDS - (now - entry.last_ts))
+        entry.flush_task = self._schedule(self._flush_after_floor(entry, wait))
+
+    async def _flush_after_floor(self, entry: _Pending, wait: float) -> None:
+        if wait > 0:
+            await asyncio.sleep(wait)
+        with self._lock:
+            phrase = entry.queued_phrase
+            if entry.ended or phrase is None or phrase == entry.last_phrase:
+                return
+            self._publish(entry, phrase)
+
     def _halt(self, entry: _Pending) -> None:
         """Stop a turn's in-flight work so nothing lands after the clear."""
-        entry.ended = True
-        if entry.refresh_task is not None:
-            entry.refresh_task.cancel()
-        if entry.finalize_task is not None:
-            entry.finalize_task.cancel()
-        for handle in list(entry.publishes):
-            handle.cancel()
+        with self._lock:
+            # Under the lock so a tool call cannot pass its ended check and
+            # publish into the gap between this flag and the cancels below.
+            entry.ended = True
+            if entry.refresh_task is not None:
+                entry.refresh_task.cancel()
+            if entry.finalize_task is not None:
+                entry.finalize_task.cancel()
+            if entry.flush_task is not None:
+                entry.flush_task.cancel()
+            for handle in list(entry.publishes):
+                handle.cancel()
 
     async def _finalize_after_grace(self, trigger_event_id: str) -> None:
         """Clear a turn whose completion arrived inside the grace window,
         once the window closes with no claim."""
-        await asyncio.sleep(COMPLETION_GRACE_SECONDS)
         entry = self._pending.get(trigger_event_id)
         if entry is None or not entry.completed_early:
             return
-        del self._pending[trigger_event_id]
-        entry.finalize_task = None
+        # _claimable measures the window from dispatch, so sleeping a full
+        # window from the completion would hold a finished turn's status up
+        # for nearly twice as long as the window it is waiting out.
+        remaining = COMPLETION_GRACE_SECONDS - (time.monotonic() - entry.created)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        with self._lock:
+            entry = self._pending.get(trigger_event_id)
+            if entry is None or not entry.completed_early:
+                return
+            del self._pending[trigger_event_id]
+            entry.finalize_task = None
         self._halt(entry)
         await self._clear(entry)
 
     async def _clear(self, entry: _Pending) -> None:
         try:
-            await self._api.set_status(
+            await entry.api.set_status(
                 channel=entry.scope.room_id,
                 thread_id=entry.scope.thread_id,
             )
@@ -495,10 +584,11 @@ class StatusPublisher:
             await asyncio.sleep(REFRESH_SECONDS / 2)
             if entry.ended or time.monotonic() - entry.created > STALE_SECONDS:
                 return
-            if entry.last_phrase is None:
-                continue
-            if time.monotonic() - entry.last_ts >= REFRESH_SECONDS:
-                self._publish(entry, entry.last_phrase)
+            with self._lock:
+                if entry.ended or entry.last_phrase is None:
+                    continue
+                if time.monotonic() - entry.last_ts >= REFRESH_SECONDS:
+                    self._publish(entry, entry.last_phrase)
 
     def _schedule(self, coro: Any) -> Any:
         """Run a status coroutine on the gateway loop from any context.

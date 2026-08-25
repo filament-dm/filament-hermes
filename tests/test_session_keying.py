@@ -328,3 +328,41 @@ def test_effective_keying_pin_means_shared_scaffold_follows_flag():
         assert c._shared_sessions_effective() is True
         _enable(tmp, False)
         assert c._shared_sessions_effective() is False
+
+
+def test_thread_turn_does_not_read_the_channel_cursor():
+    """Reads follow the same rule as writes: only the turn whose
+    conversation IS the channel may consult the channel cursor. A thread
+    turn joins a different conversation, so the channel session's reads
+    must not quiet its cue."""
+
+    class _API:
+        @staticmethod
+        def parse_tool_result(raw):
+            return raw
+
+        async def call_tool(self, name, args):
+            return {
+                "messages": [
+                    {"event_id": "$a", "sender": "@x:s", "is_from_self": False},
+                    {"event_id": "$b", "sender": "@y:s", "is_from_self": False},
+                ]
+            }
+
+    import asyncio  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)
+        a._filament_api = _API()
+        a._feature_flags = reactive.FeatureFlagStore(tmp / "flags.json")
+        a._channel_cursors = reactive.ChannelCursorStore(tmp / "cursors.json")
+        a._channel_cursors.record("!room:s", "$b")  # the CHANNEL is caught up
+        (tmp / "flags.json").write_text(json.dumps({"shared_channel_sessions": True}))
+
+        # The channel conversation is caught up: cue quiet.
+        assert asyncio.run(a._context_breadcrumb("!room:s", "$t")) is None
+
+        # A thread turn has seen none of it: cue fires.
+        crumb = asyncio.run(a._context_breadcrumb("!room:s", "$t", thread_id="$thread"))
+        assert crumb is not None and "recent message(s)" in crumb

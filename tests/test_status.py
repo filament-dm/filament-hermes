@@ -338,3 +338,219 @@ class TestPublishLifecycle:
             assert clears
 
         asyncio.run(go())
+
+
+class TestSuppressedPhraseIsNotLost:
+    """A phrase the floor suppresses must still reach the channel: the
+    tool that trips the floor is often the long one, and dropping its
+    phrase leaves the previous operation on screen for the whole turn."""
+
+    def test_queued_phrase_publishes_when_the_floor_expires(self, monkeypatch):
+        monkeypatch.setattr(status, "MIN_INTERVAL_SECONDS", 0.05)
+
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub.on_tool_call("web_search", {"query": "first"}, "sess1")
+            # Inside the floor: held, not published yet.
+            pub.on_tool_call("terminal", {"command": "cargo build"}, "sess1")
+            assert pub._bound["sess1"].queued_phrase is not None
+            texts = [c.get("status_text") for c in api.calls]
+            assert not any(t and t.startswith("running") for t in texts)
+            await asyncio.sleep(0.15)
+            texts = [c.get("status_text") for c in api.calls]
+            assert any(t and t.startswith("running") for t in texts)
+
+        asyncio.run(go())
+
+    def test_a_later_publish_supersedes_the_queued_phrase(self, monkeypatch):
+        monkeypatch.setattr(status, "MIN_INTERVAL_SECONDS", 0.05)
+
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub.on_tool_call("web_search", {"query": "first"}, "sess1")
+            pub.on_tool_call("terminal", {"command": "cargo build"}, "sess1")
+            entry = pub._bound["sess1"]
+            entry.last_ts -= status.MIN_INTERVAL_SECONDS
+            pub.on_tool_call("read_file", {"path": "/a/notes.md"}, "sess1")
+            assert entry.queued_phrase is None
+            await asyncio.sleep(0.15)
+            assert entry.last_phrase == "reading notes.md"
+
+        asyncio.run(go())
+
+
+class TestPublisherReset:
+    def test_a_new_api_drops_the_previous_adapter_s_turns(self):
+        pub = status.StatusPublisher()
+        pub.set_api(_FakeAPI())
+        pub.begin_turn("$m", status.TurnScope(room_id="!old"))
+        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+        pub.begin_turn("$n", status.TurnScope(room_id="!old"))
+        pub.set_api(_FakeAPI())
+        assert not pub._pending and not pub._bound
+        assert not pub._trigger_session and not pub._session_room
+
+    def test_a_new_session_cannot_claim_a_reset_turn(self):
+        pub = status.StatusPublisher()
+        pub.set_api(_FakeAPI())
+        pub.begin_turn("$m", status.TurnScope(room_id="!old"))
+        pub.set_api(_FakeAPI())
+        pub.on_tool_call("web_search", {"query": "x"}, "sess-new")
+        assert "sess-new" not in pub._bound
+
+    def test_reset_halts_the_refresh_loop(self):
+        async def go():
+            pub = status.StatusPublisher()
+            pub.set_api(_FakeAPI())
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            entry = pub._pending["$m"]
+            pub.reset()
+            assert entry.ended
+            # Let the cancellation actually take effect.
+            await asyncio.sleep(0)
+            assert entry.refresh_task.cancelled()
+
+        asyncio.run(go())
+
+
+class TestCompletionRaces:
+    def test_completion_after_a_concurrent_claim_still_clears(self):
+        """The engine thread can claim between the completion's two dict
+        reads. The turn must still be cleared, not left refreshing."""
+
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub._pending["$m"].created -= status.COMPLETION_GRACE_SECONDS + 1
+            pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+            await pub.end_turn("$m")
+            assert not pub._bound and not pub._pending
+            clears = [c for c in api.calls if "status_text" not in c]
+            assert clears
+
+        asyncio.run(go())
+
+    def test_completion_of_an_already_claimed_turn_does_not_raise(self):
+        async def go():
+            pub = status.StatusPublisher()
+            pub.set_api(_FakeAPI())
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            entry = pub._pending["$m"]
+            entry.created -= status.COMPLETION_GRACE_SECONDS + 1
+            # Simulate the interleaving directly: the trigger's binding is
+            # gone (claim not yet recorded) and the pending entry has been
+            # taken, exactly the window the old pop() raised KeyError in.
+            del pub._pending["$m"]
+            await pub.end_turn("$m")
+
+        asyncio.run(go())
+
+
+class TestGraceWindowTiming:
+    def test_finalize_waits_only_the_window_s_remainder(self, monkeypatch):
+        monkeypatch.setattr(status, "COMPLETION_GRACE_SECONDS", 0.4)
+
+        async def go():
+            pub = status.StatusPublisher()
+            pub.set_api(_FakeAPI())
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            # Completion arrives most of the way through the window.
+            pub._pending["$m"].created -= 0.3
+            await pub.end_turn("$m")
+            # The remaining ~0.1s, not another full window.
+            await asyncio.sleep(0.25)
+            assert "$m" not in pub._pending
+
+        asyncio.run(go())
+
+
+class TestNoPublishAfterTermination:
+    """A tool call racing a completion must not restore a status the
+    completion just cleared: the clear is the last word on a turn."""
+
+    def test_tool_call_after_completion_publishes_nothing(self):
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+            entry = pub._bound["sess1"]
+            await pub.end_turn("$m")
+            before = len(api.calls)
+            # The engine thread had this tool call in flight.
+            pub.on_tool_call("terminal", {"command": "cargo build"}, "sess1")
+            assert entry.ended
+            assert len(api.calls) == before
+
+        asyncio.run(go())
+
+    def test_tool_call_after_reset_publishes_nothing(self):
+        api = _FakeAPI()
+        pub = status.StatusPublisher()
+        pub.set_api(api)
+        pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+        pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+        pub.reset()
+        before = len(api.calls)
+        pub.on_tool_call("terminal", {"command": "cargo build"}, "sess1")
+        assert len(api.calls) == before
+
+    def test_queued_phrase_is_dropped_when_the_turn_ends(self, monkeypatch):
+        monkeypatch.setattr(status, "MIN_INTERVAL_SECONDS", 0.05)
+
+        async def go():
+            api = _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(api)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            pub.on_tool_call("web_search", {"query": "x"}, "sess1")
+            pub.on_tool_call("terminal", {"command": "cargo build"}, "sess1")
+            await pub.end_turn("$m")
+            texted_before = len([c for c in api.calls if c.get("status_text")])
+            await asyncio.sleep(0.15)
+            texted_after = len([c for c in api.calls if c.get("status_text")])
+            assert texted_after == texted_before
+
+        asyncio.run(go())
+
+
+class TestUrlAuthorityStopsAtQuery:
+    def test_query_string_never_reaches_the_status(self):
+        # A URL with no path: the authority still ends at "?", or the whole
+        # query rides into a channel-visible status line.
+        line = phrase_for("browser_navigate", {"url": "https://example.com?token=sec"})
+        assert line == "reading example.com"
+
+    def test_fragment_is_dropped_too(self):
+        line = phrase_for("browser_navigate", {"url": "https://example.com#tok"})
+        assert line == "reading example.com"
+
+
+class TestTurnKeepsItsOwnApi:
+    def test_a_completion_clears_through_the_api_it_started_on(self):
+        """A turn awaiting its clear must not deliver it through whatever
+        API a rebuilt adapter installed in the meantime."""
+
+        async def go():
+            first, second = _FakeAPI(), _FakeAPI()
+            pub = status.StatusPublisher()
+            pub.set_api(first)
+            pub.begin_turn("$m", status.TurnScope(room_id="!r"))
+            entry = pub._pending["$m"]
+            entry.created -= status.COMPLETION_GRACE_SECONDS + 1
+            # The adapter is replaced while the completion is in flight.
+            pub._api = second
+            await pub._clear(entry)
+            assert any("status_text" not in c for c in first.calls)
+            assert second.calls == []
+
+        asyncio.run(go())
