@@ -678,9 +678,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # principal's FIRST real message answers warm (~3s faster,
             # measured). Never awaited and never gates readiness.
             with contextlib.suppress(RuntimeError):
-                task = asyncio.get_running_loop().create_task(
-                    self._greet_intro_turn()
-                )
+                task = asyncio.get_running_loop().create_task(self._greet_intro_turn())
                 self._background_greet_task = task
         except Exception:
             logger.exception("filament-fcm: greet post failed")
@@ -1772,9 +1770,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Inline mode (control plane only): the backchannel is a single
         # conversation with the principal by construction, so the channel
         # cursor is sound there without the shared-session gate.
-        cursor_applies = bool(
-            cursors and (inline or self._shared_sessions_effective())
-        )
+        cursor_applies = bool(cursors and (inline or self._shared_sessions_effective()))
         cursor = cursors.get(channel) if cursor_applies else None
         if inline:
             # Control plane: deliver the unseen messages themselves instead
