@@ -167,3 +167,25 @@ def test_successful_migration_leaves_a_marker(tmp_path, monkeypatch):
     assert str(resolved) in marker.read_text()
     assert credentials.default_state_dir() == resolved
     assert reactive._default_dir() == resolved
+
+
+def test_store_constructed_before_migration_follows_the_move(tmp_path, monkeypatch):
+    """The adapter builds its reactive stores before CredentialStore runs the
+    one-time migration. Store paths resolve per access, so instructions
+    written pre-upgrade are still found after the directory moves."""
+    monkeypatch.delenv("FILAMENT_FCM_CREDENTIALS_DIR", raising=False)
+    monkeypatch.delenv("FILAMENT_INSTRUCTIONS_FILE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "data"))
+    legacy = tmp_path / ".hermes" / "filament-fcm"
+    legacy.mkdir(parents=True)
+    (legacy / "instructions.md").write_text("answer in haiku")
+
+    store = reactive.InstructionsStore()
+    assert store.path == legacy / "instructions.md"
+
+    migrated = credentials.default_state_dir()
+
+    assert migrated == tmp_path / "data" / "filament-fcm"
+    assert store.path == migrated / "instructions.md"
+    assert store.path.read_text() == "answer in haiku"
