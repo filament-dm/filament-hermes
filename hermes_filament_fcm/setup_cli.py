@@ -331,12 +331,13 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
         return False, None
 
 
-def _run_interactive_setup() -> bool:
+def _run_interactive_setup() -> bool | None:
     """Run the interactive setup prompts.
 
     Returns ``True`` when setup completed successfully (the agent is
-    finalized and the gateway should be restarted), ``False`` when setup
-    was skipped, aborted, or finalization failed.
+    finalized and the gateway should be restarted), ``None`` when the user
+    declined to touch an already-working configuration (a no-op, not a
+    failure), and ``False`` when setup was aborted or finalization failed.
     """
     print_header("Filament (FCM)")
 
@@ -350,7 +351,7 @@ def _run_interactive_setup() -> bool:
             f"Filament FCM: already configured (token: {existing_token[:12]}...)"
         )
         if not prompt_yes_no("Reconfigure?", False):
-            return False
+            return None
 
     print_info("Connect Hermes to Filament via FCM push notifications.")
     if not connect_token:
@@ -657,17 +658,23 @@ def main() -> None:
         _restart_gateway()
 
     print()
-    print_info("Setup complete." if ready else "Setup incomplete.")
+    if ready:
+        print_info("Setup complete.")
+    elif ready is None:
+        print_info("Existing configuration left in place.")
+    else:
+        print_info("Setup incomplete.")
     print_info("Check status: hermes gateway status")
     print_info("View logs:    tail -f ~/.hermes/logs/gateway.log")
     print()
-    if not ready:
+    if ready is False:
         # Exit nonzero so a scripted install (the hosted-attach exec pipes
         # this through `set -e`) fails loudly instead of reporting an
         # installed agent with no credentials. Observed live: a setup that
         # couldn't reach the MCP URL returned 0, the server recorded
         # hosting_status=installed, and the agent sat connected-looking
-        # and tokenless.
+        # and tokenless. Declining "Reconfigure?" on a working install is
+        # a no-op (None), not a failure — that still exits 0.
         sys.exit(1)
 
 

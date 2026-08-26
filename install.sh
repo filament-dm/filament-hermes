@@ -257,6 +257,12 @@ if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
       err "FILAMENT_PROFILE must match [a-z0-9][a-z0-9_-]* (got '$FILAMENT_PROFILE')."
       ;;
   esac
+  # HERMES_HOME may itself point INTO a named profile (a re-run from a
+  # profile's environment). Profiles are siblings under the root home, never
+  # nested — climb to the root before creating or targeting one.
+  while [ "$(basename "$(dirname "$HERMES_HOME")")" = profiles ]; do
+    HERMES_HOME="$(dirname "$(dirname "$HERMES_HOME")")"
+  done
   if [ ! -d "$HERMES_HOME/profiles/$FILAMENT_PROFILE" ]; then
     command -v hermes >/dev/null 2>&1 \
       || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
@@ -585,8 +591,8 @@ if [ -z "$S6_SVC" ] && [ -n "${FILAMENT_PROFILE:-}" ] \
 # background gateways die with the container, and the entrypoint only
 # supervises the default profile's.
 command -v hermes >/dev/null 2>&1 \
-  || PATH="/usr/local/bin:/usr/local/lib/hermes/hermes-agent/venv/bin:$PATH"
-for _fil_plugin_dir in "$HOME"/.hermes/profiles/*/plugins/filament; do
+  || PATH="/usr/local/bin:/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes/hermes-agent/venv/bin:$PATH"
+for _fil_plugin_dir in "${HERMES_HOME:-$HOME/.hermes}"/profiles/*/plugins/filament; do
   [ -d "$_fil_plugin_dir" ] || continue
   HERMES_HOME="$(dirname "$(dirname "$_fil_plugin_dir")")" \
     hermes gateway restart >/dev/null 2>&1 || true

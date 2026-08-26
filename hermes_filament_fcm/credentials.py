@@ -55,9 +55,10 @@ def default_state_dir() -> Path:
     the root profile's identity. If the rename fails (permissions, cross-
     device), stay on the legacy path rather than orphan a working identity.
 
-    ``reactive._default_dir`` mirrors the resolution rules (without the
-    migration, which this module owns and runs first at gateway start via the
-    adapter's CredentialStore) — keep them in sync.
+    ``reactive._default_dir`` mirrors the resolution rules, including the
+    prefer-legacy-when-unmigrated fallback (but not the migration itself,
+    which this module owns and runs first at gateway start via the adapter's
+    CredentialStore) — keep them in sync.
     """
     override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
     if override:
@@ -70,10 +71,19 @@ def default_state_dir() -> Path:
         return state_dir
     if hermes_home.parent.name == "profiles":
         return state_dir
+    marker = legacy.with_name(_STATE_DIR_NAME + ".moved")
     try:
         state_dir.parent.mkdir(parents=True, exist_ok=True)
         os.replace(legacy, state_dir)
-        logger.info("Migrated filament-fcm state from %s to %s", legacy, state_dir)
+        # A one-way door: warn (not info), and leave a breadcrumb next to
+        # where the directory was for anyone later debugging the old agent.
+        logger.warning("Migrated filament-fcm state from %s to %s", legacy, state_dir)
+        try:
+            marker.write_text(
+                f"filament-fcm state moved to: {state_dir}\n", encoding="utf-8"
+            )
+        except OSError:
+            logger.debug("Could not write migration marker %s", marker, exc_info=True)
     except OSError:
         logger.warning(
             "Could not migrate filament-fcm state from %s to %s; "

@@ -313,14 +313,23 @@ def _default_dir() -> Path:
     else ``$HERMES_HOME/filament-fcm``, else ``~/.hermes/filament-fcm``. The
     legacy-directory migration lives only in credentials.py and has already
     run by the time these stores are read — the adapter constructs its
-    CredentialStore at gateway start, before any wake.
+    CredentialStore at gateway start, before any wake. When that migration
+    FAILED (cross-device rename), credentials stayed on the legacy path; the
+    same preference here keeps instructions and policies beside the identity
+    instead of resolving to an empty directory.
     """
     override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
     if override:
         return Path(override)
     home = os.environ.get("HERMES_HOME")
     hermes_home = Path(home) if home else Path.home() / ".hermes"
-    return hermes_home / "filament-fcm"
+    state_dir = hermes_home / "filament-fcm"
+    legacy = Path.home() / ".hermes" / "filament-fcm"
+    if state_dir == legacy or state_dir.exists() or not legacy.exists():
+        return state_dir
+    if hermes_home.parent.name == "profiles":
+        return state_dir
+    return legacy
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
