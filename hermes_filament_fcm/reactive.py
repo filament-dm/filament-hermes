@@ -469,14 +469,35 @@ def _default_dir() -> Path:
     else ``$HERMES_HOME/filament-fcm``, else ``~/.hermes/filament-fcm``. The
     legacy-directory migration lives only in credentials.py and has already
     run by the time these stores are read — the adapter constructs its
-    CredentialStore at gateway start, before any wake.
+    CredentialStore at gateway start, before any wake. When that migration
+    FAILED (cross-device rename), credentials stayed on the legacy path; the
+    same preference here keeps instructions and policies beside the identity
+    instead of resolving to an empty directory.
     """
     override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
     if override:
         return Path(override)
     home = os.environ.get("HERMES_HOME")
     hermes_home = Path(home) if home else Path.home() / ".hermes"
-    return hermes_home / "filament-fcm"
+    state_dir = hermes_home / "filament-fcm"
+    legacy = Path.home() / ".hermes" / "filament-fcm"
+    if state_dir == legacy or state_dir.exists() or not legacy.exists():
+        return state_dir
+    if hermes_home.parent.name == "profiles":
+        return state_dir
+    return legacy
+
+
+def _explicit_path(path: str | os.PathLike | None, env: str) -> Path | None:
+    """An explicitly requested store path (argument or env override), or None.
+
+    None means: resolve against ``_default_dir()`` lazily, per access — the
+    stores can be constructed before ``credentials.default_state_dir()`` runs
+    its one-time legacy migration, and a path captured at construction would
+    keep pointing at the pre-migration directory after the move.
+    """
+    value = path or os.environ.get(env)
+    return Path(value) if value else None
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -519,11 +540,11 @@ class InstructionsStore:
     _FALLBACK = "(No standing instructions set; observe silently, take no action.)"
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_INSTRUCTIONS_FILE")
-            or _default_dir() / "instructions.md"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_INSTRUCTIONS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "instructions.md"
 
     @property
     def path(self) -> Path:
@@ -574,11 +595,11 @@ class ChannelInstructionsStore:
     """
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_CHANNEL_INSTRUCTIONS_FILE")
-            or _default_dir() / "channel_instructions.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_CHANNEL_INSTRUCTIONS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "channel_instructions.json"
 
     @property
     def path(self) -> Path:
@@ -670,11 +691,11 @@ class WakePolicyStore:
     }
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_WAKE_POLICY_FILE")
-            or _default_dir() / "wake_policy.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_WAKE_POLICY_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "wake_policy.json"
 
     @property
     def path(self) -> Path:
@@ -795,11 +816,11 @@ class EngagedThreadStore:
     _MAX_ENTRIES: ClassVar[int] = 500
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_ENGAGED_THREADS_FILE")
-            or _default_dir() / "engaged_threads.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_ENGAGED_THREADS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "engaged_threads.json"
 
     @staticmethod
     def _key(room_id: str, thread_root_id: str) -> str:
@@ -1112,11 +1133,11 @@ class CapabilityPolicyStore:
     }
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_CAPABILITY_POLICY_FILE")
-            or _default_dir() / "capability_policy.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_CAPABILITY_POLICY_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "capability_policy.json"
 
     @property
     def path(self) -> Path:
@@ -1402,11 +1423,11 @@ class FeatureFlagStore:
     """
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_FEATURE_FLAGS_FILE")
-            or _default_dir() / "feature_flags.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_FEATURE_FLAGS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "feature_flags.json"
 
     @property
     def path(self) -> Path:

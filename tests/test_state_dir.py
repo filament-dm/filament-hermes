@@ -124,3 +124,68 @@ def test_credential_store_uses_resolved_dir(tmp_path, monkeypatch):
     store.save_fcm_credentials({"gcm": {"token": "t"}})
     expected = tmp_path / "data" / "filament-fcm" / "fcm_credentials.json"
     assert expected.exists()
+
+
+def test_failed_migration_stays_on_legacy_and_reactive_converges(tmp_path, monkeypatch):
+    """A cross-device rename (docker bind mounts) must not split the state:
+    credentials stays on the legacy path, and reactive's stores resolve to
+    the same place — not to an empty $HERMES_HOME dir that silently feeds
+    the agent default instructions."""
+    monkeypatch.delenv("FILAMENT_FCM_CREDENTIALS_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "data"))
+    legacy = tmp_path / ".hermes" / "filament-fcm"
+    legacy.mkdir(parents=True)
+    (legacy / "instructions.md").write_text("act on requests")
+
+    def _cross_device(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(credentials.os, "replace", _cross_device)
+
+    resolved = credentials.default_state_dir()
+
+    assert resolved == legacy
+    assert (resolved / "instructions.md").exists()
+    assert reactive._default_dir() == legacy
+
+
+def test_successful_migration_leaves_a_marker(tmp_path, monkeypatch):
+    """The move is a one-way door: a breadcrumb next to the old path records
+    where the state went, and later resolutions are not confused by it."""
+    monkeypatch.delenv("FILAMENT_FCM_CREDENTIALS_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "data"))
+    legacy = tmp_path / ".hermes" / "filament-fcm"
+    legacy.mkdir(parents=True)
+    (legacy / "fcm_credentials.json").write_text("{}")
+
+    resolved = credentials.default_state_dir()
+
+    marker = tmp_path / ".hermes" / "filament-fcm.moved"
+    assert marker.exists()
+    assert str(resolved) in marker.read_text()
+    assert credentials.default_state_dir() == resolved
+    assert reactive._default_dir() == resolved
+
+
+def test_store_constructed_before_migration_follows_the_move(tmp_path, monkeypatch):
+    """The adapter builds its reactive stores before CredentialStore runs the
+    one-time migration. Store paths resolve per access, so instructions
+    written pre-upgrade are still found after the directory moves."""
+    monkeypatch.delenv("FILAMENT_FCM_CREDENTIALS_DIR", raising=False)
+    monkeypatch.delenv("FILAMENT_INSTRUCTIONS_FILE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "data"))
+    legacy = tmp_path / ".hermes" / "filament-fcm"
+    legacy.mkdir(parents=True)
+    (legacy / "instructions.md").write_text("answer in haiku")
+
+    store = reactive.InstructionsStore()
+    assert store.path == legacy / "instructions.md"
+
+    migrated = credentials.default_state_dir()
+
+    assert migrated == tmp_path / "data" / "filament-fcm"
+    assert store.path == migrated / "instructions.md"
+    assert store.path.read_text() == "answer in haiku"

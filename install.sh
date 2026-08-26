@@ -257,6 +257,12 @@ if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
       err "FILAMENT_PROFILE must match [a-z0-9][a-z0-9_-]* (got '$FILAMENT_PROFILE')."
       ;;
   esac
+  # HERMES_HOME may itself point INTO a named profile (a re-run from a
+  # profile's environment). Profiles are siblings under the root home, never
+  # nested — climb to the root before creating or targeting one.
+  while [ "$(basename "$(dirname "$HERMES_HOME")")" = profiles ]; do
+    HERMES_HOME="$(dirname "$(dirname "$HERMES_HOME")")"
+  done
   if [ ! -d "$HERMES_HOME/profiles/$FILAMENT_PROFILE" ]; then
     command -v hermes >/dev/null 2>&1 \
       || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
@@ -527,6 +533,10 @@ restart_slot() {
     || warn "could not restart $(basename "$1") — restart it manually: $S6_SVC -t $1"
 }
 
+# Whether some live s6 slot took the restart. s6-svc merely being installed
+# is not enough — with no supervised slot for this gateway the direct-spawn
+# and hook paths below must still run, or the profile never starts.
+SUPERVISED=0
 if [ -n "$S6_SVC" ]; then
   # Each profile is an independent HERMES_HOME (the default profile at the
   # root, named ones under <root>/profiles/<name>), and the wizard only
@@ -537,25 +547,24 @@ if [ -n "$S6_SVC" ]; then
     HERMES_PROFILE=default
   fi
 
-  RESTARTED=0
   for SVCDIR in "/run/service/gateway-$HERMES_PROFILE" "/run/service/hermes-gateway-$HERMES_PROFILE"; do
-    if restart_slot "$SVCDIR"; then RESTARTED=1; fi
+    if restart_slot "$SVCDIR"; then SUPERVISED=1; fi
   done
-  if [ "$RESTARTED" = 0 ]; then
+  if [ "$SUPERVISED" = 0 ]; then
     # This provider names its slots differently — restart every live
     # gateway rather than leave the plugin unloaded.
     for SVCDIR in /run/service/gateway-* /run/service/hermes-gateway-*; do
-      restart_slot "$SVCDIR" || true
+      if restart_slot "$SVCDIR"; then SUPERVISED=1; fi
     done
   fi
 fi
 
-# --- Start the profile gateway (non-s6 images) --------------------------------
+# --- Start the profile gateway (no supervised slot) ---------------------------
 # The wizard's restart was skipped above (FILAMENT_SETUP_SKIP_RESTART): with
 # no supervisor, `hermes gateway restart` is two CLI startups (restart, then
 # run) where one will do. Spawn the gateway directly, detached from this
 # session; --replace hands over cleanly if one is somehow already up.
-if [ -z "$S6_SVC" ] && [ -n "${FILAMENT_PROFILE:-}" ]; then
+if [ "$SUPERVISED" = 0 ] && [ -n "${FILAMENT_PROFILE:-}" ]; then
   SETSID="$(command -v setsid 2>/dev/null || true)"
   info "Starting the gateway ..."
   # shellcheck disable=SC2086  # $SETSID intentionally word-splits away when absent
@@ -564,7 +573,7 @@ if [ -z "$S6_SVC" ] && [ -n "${FILAMENT_PROFILE:-}" ]; then
   disown 2>/dev/null || true
 fi
 
-# --- Keep profile gateways alive across restarts (non-s6 images) -------------
+# --- Keep profile gateways alive across restarts (no supervised slot) --------
 # Without s6 there is no supervisor for a named profile's gateway: the setup
 # wizard starts it as a plain background process, which dies with the
 # container (restart, sleep/wake, update) while the image's entrypoint only
@@ -575,7 +584,7 @@ fi
 # block serves every agent ever attached; other non-s6 hosts (no hooks dir)
 # are skipped — their operators own gateway supervision.
 AGENT37_HOOK="${AGENT37_HOOKS_DIR:-$HOME/.agent37/hooks}/post-restart.sh"
-if [ -z "$S6_SVC" ] && [ -n "${FILAMENT_PROFILE:-}" ] \
+if [ "$SUPERVISED" = 0 ] && [ -n "${FILAMENT_PROFILE:-}" ] \
     && [ -d "$(dirname "$AGENT37_HOOK")" ] \
     && ! grep -q "filament-hermes profile gateways" "$AGENT37_HOOK" 2>/dev/null; then
   cat >> "$AGENT37_HOOK" <<'HOOKEOF'
@@ -585,8 +594,8 @@ if [ -z "$S6_SVC" ] && [ -n "${FILAMENT_PROFILE:-}" ] \
 # background gateways die with the container, and the entrypoint only
 # supervises the default profile's.
 command -v hermes >/dev/null 2>&1 \
-  || PATH="/usr/local/bin:/usr/local/lib/hermes/hermes-agent/venv/bin:$PATH"
-for _fil_plugin_dir in "$HOME"/.hermes/profiles/*/plugins/filament; do
+  || PATH="/usr/local/bin:/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes/hermes-agent/venv/bin:$PATH"
+for _fil_plugin_dir in "${HERMES_HOME:-$HOME/.hermes}"/profiles/*/plugins/filament; do
   [ -d "$_fil_plugin_dir" ] || continue
   HERMES_HOME="$(dirname "$(dirname "$_fil_plugin_dir")")" \
     hermes gateway restart >/dev/null 2>&1 || true
