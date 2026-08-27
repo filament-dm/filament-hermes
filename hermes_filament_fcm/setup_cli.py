@@ -331,12 +331,13 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
         return False, None
 
 
-def _run_interactive_setup() -> bool:
+def _run_interactive_setup() -> bool | None:
     """Run the interactive setup prompts.
 
     Returns ``True`` when setup completed successfully (the agent is
-    finalized and the gateway should be restarted), ``False`` when setup
-    was skipped, aborted, or finalization failed.
+    finalized and the gateway should be restarted), ``None`` when the user
+    declined to touch an already-working configuration (a no-op, not a
+    failure), and ``False`` when setup was aborted or finalization failed.
     """
     print_header("Filament (FCM)")
 
@@ -350,7 +351,7 @@ def _run_interactive_setup() -> bool:
             f"Filament FCM: already configured (token: {existing_token[:12]}...)"
         )
         if not prompt_yes_no("Reconfigure?", False):
-            return False
+            return None
 
     print_info("Connect Hermes to Filament via FCM push notifications.")
     if not connect_token:
@@ -392,6 +393,12 @@ def _run_interactive_setup() -> bool:
     # Token validated — persist all configuration.
     save_env_value("FILAMENT_MCP_TOKEN", token)
     save_env_value("FILAMENT_MCP_URL", url)
+    # A token names an identity; a FILAMENT_HOME_ROOM carried over from a
+    # previous one (a reconnect with a different token, or a profile whose
+    # .env was cloned from another agent's) would misroute cron/home-channel
+    # delivery to the old agent's backchannel. Clear it — the adapter
+    # re-derives and persists the right backchannel at the next connect.
+    save_env_value("FILAMENT_HOME_ROOM", "")
 
     # Carry the Firebase project through to the gateway (see _FIREBASE_ENV_KEYS).
     for key in _FIREBASE_ENV_KEYS:
@@ -464,6 +471,9 @@ def _persist(token: str, url: str, principal_id: str | None) -> None:
     """
     save_env_value("FILAMENT_MCP_TOKEN", token)
     save_env_value("FILAMENT_MCP_URL", url)
+    # Same stale-identity guard as the interactive path: a cloned or
+    # reconnected .env must not keep the previous agent's home room.
+    save_env_value("FILAMENT_HOME_ROOM", "")
 
     # Carry the Firebase project through, as the interactive path does (see
     # _FIREBASE_ENV_KEYS). Against a non-production homeserver these come from
@@ -535,8 +545,14 @@ def connect(
         return 2
 
     resolved = (
-        url or get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents"
-    ).strip().rstrip("/")
+        (
+            url
+            or get_env_value("FILAMENT_MCP_URL")
+            or "https://api.filament.dm/mcp/agents"
+        )
+        .strip()
+        .rstrip("/")
+    )
 
     print_header("Filament (FCM)")
 
@@ -587,6 +603,14 @@ def _restart_gateway() -> None:
 
     print_info("Gateway restarting in the background...")
 
+    # The health check below is interactive comfort: ~5s of sleep plus a
+    # second CLI start purely to print a thumbs-up. A scripted install (the
+    # hosted-attach exec, CI) has nobody watching and the server polls the
+    # real signal (push registration), so skip it there.
+    if not sys.stdout.isatty():
+        print_info("Verify it came up with: hermes gateway status")
+        return
+
     # Brief, bounded health check so the installer can give a thumbs-up without
     # blocking on the (possibly foreground) restart. Give the gateway a moment
     # to come up, then ask `hermes gateway status` once — status is a quick,
@@ -627,14 +651,31 @@ def main() -> None:
     ready = _run_interactive_setup()
     print()
 
-    if ready:
+    # The hosted installer restarts the gateway itself (s6 bounce, or a
+    # direct detached spawn) — the wizard's restart would only add a
+    # redundant CLI round trip between them. It sets this to say so.
+    if ready and not os.environ.get("FILAMENT_SETUP_SKIP_RESTART"):
         _restart_gateway()
 
     print()
-    print_info("Setup complete." if ready else "Setup incomplete.")
+    if ready:
+        print_info("Setup complete.")
+    elif ready is None:
+        print_info("Existing configuration left in place.")
+    else:
+        print_info("Setup incomplete.")
     print_info("Check status: hermes gateway status")
     print_info("View logs:    tail -f ~/.hermes/logs/gateway.log")
     print()
+    if ready is False:
+        # Exit nonzero so a scripted install (the hosted-attach exec pipes
+        # this through `set -e`) fails loudly instead of reporting an
+        # installed agent with no credentials. Observed live: a setup that
+        # couldn't reach the MCP URL returned 0, the server recorded
+        # hosting_status=installed, and the agent sat connected-looking
+        # and tokenless. Declining "Reconfigure?" on a working install is
+        # a no-op (None), not a failure — that still exits 0.
+        sys.exit(1)
 
 
 if __name__ == "__main__":

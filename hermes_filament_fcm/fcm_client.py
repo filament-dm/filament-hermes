@@ -79,8 +79,13 @@ if not _fb_logger.handlers:
 #
 # We use the web app ID (same as the Electron desktop client) since the
 # Hermes plugin is a non-mobile FCM client.
+#
+# `_DEFAULT_FIREBASE_PUB_KEY` is the project's public Firebase key: it
+# identifies the app to the GCM/FCM registration endpoints, ships in every
+# Filament client, and grants nothing on its own. Rotating it would break
+# every released client, not just this plugin.
 _DEFAULT_FIREBASE_PROJECT_ID = "filament-8ce44"
-_DEFAULT_FIREBASE_API_KEY = "AIzaSyBtYzzP3IRpmIZ57dp1PMS4Y8RPjTB0snk"
+_DEFAULT_FIREBASE_PUB_KEY = "AIzaSyBtYzzP3IRpmIZ57dp1PMS4Y8RPjTB0snk"
 _DEFAULT_FIREBASE_APP_ID = "1:143821144946:web:90e517a7f36aa42a6093eb"
 _DEFAULT_FIREBASE_SENDER_ID = "143821144946"
 
@@ -132,7 +137,7 @@ class FCMConfig:
             app_id=os.environ.get("FILAMENT_FIREBASE_APP_ID")
             or _DEFAULT_FIREBASE_APP_ID,
             api_key=os.environ.get("FILAMENT_FIREBASE_API_KEY")
-            or _DEFAULT_FIREBASE_API_KEY,
+            or _DEFAULT_FIREBASE_PUB_KEY,
             sender_id=os.environ.get("FILAMENT_FIREBASE_SENDER_ID")
             or _DEFAULT_FIREBASE_SENDER_ID,
         )

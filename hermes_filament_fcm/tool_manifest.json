@@ -402,7 +402,7 @@
         },
         "image": {
           "type": "string",
-          "description": "Avatar image. Three accepted forms (preferred order):\n  1. `mxc://...` — an already-uploaded media URL. Cheapest. For LOCAL FILES, upload first with:\n    curl -X POST $MCP_BASE/mcp/agents/upload \\\n      -H 'Authorization: Bearer $TOKEN' \\\n      -H 'Content-Type: image/jpeg' \\\n      --data-binary @/path/to/file\n  which returns {mxc_url: 'mxc://...'} to pass here.\n  2. `https://...` or `http://...` — server downloads and stores it for you.\n  3. `data:image/png;base64,...` — works but DON'T use this for non-trivial images: every byte of the base64 string becomes LLM-emitted tokens, which is very slow."
+          "description": "Avatar image. Three accepted forms (preferred order):\n  1. `mxc://...` — an already-uploaded media URL. Cheapest. For LOCAL FILES, upload first: POST the raw file bytes to `<mcp-base>/mcp/agents/upload` with your agent bearer token in the Authorization header and the file's media type in Content-Type (e.g. image/jpeg). The response is {mxc_url: 'mxc://...'} — pass that here.\n  2. `https://...` or `http://...` — server downloads and stores it for you.\n  3. `data:image/png;base64,...` — works but DON'T use this for non-trivial images: every byte of the base64 string becomes LLM-emitted tokens, which is very slow."
         },
         "about": {
           "type": "string",

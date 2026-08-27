@@ -157,8 +157,7 @@ def dep_problem() -> str | None:
             )
         if not satisfies(installed, spec):
             return (
-                f"{name} {installed} does not satisfy {spec}. "
-                f"To fix: {REFRESH_HINT}."
+                f"{name} {installed} does not satisfy {spec}. To fix: {REFRESH_HINT}."
             )
     return None
 

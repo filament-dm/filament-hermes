@@ -1,0 +1,31 @@
+---
+exclude: ^vendor/
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --group dev ruff format --check
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --group dev ruff check
+        language: system
+        types_or: [python, pyi]
+      - id: pytest
+        name: pytest
+        entry: uv run --group dev pytest tests/ --report-chars=A
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true

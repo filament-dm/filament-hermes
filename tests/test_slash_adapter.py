@@ -113,9 +113,7 @@ _WELCOME = "!welcome:fil"
 
 
 def _envelope(payload) -> dict:
-    return {
-        "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}
-    }
+    return {"result": {"content": [{"type": "text", "text": json.dumps(payload)}]}}
 
 
 class _FakeFilamentAPI:
@@ -135,8 +133,7 @@ class _FakeFilamentAPI:
                     "channels": [
                         {"channel_id": _WELCOME, "name": "welcome"},
                         {"channel_id": _CC_ROOM, "name": "backchannel"},
-                        {"channel_id": "!loop:fil", "name": "aloop",
-                         "type": "m.space"},
+                        {"channel_id": "!loop:fil", "name": "aloop", "type": "m.space"},
                     ]
                 }
             )
@@ -380,9 +377,7 @@ def test_slash_flag_off_falls_through_to_llm(tmp_path, monkeypatch):
     # deterministic reply, no writes. (Opt-in is via set_feature /
     # set_agent_config / the server config document; slash can't enable
     # itself while off.)
-    a, api, sync, dispatched = _make_adapter(
-        tmp_path, monkeypatch, slash_enabled=False
-    )
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch, slash_enabled=False)
     asyncio.run(
         a._handle_control_message(_control_msg("/fil-config #welcome post off"))
     )
@@ -408,9 +403,7 @@ if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
 
-def test_flag_enable_and_grant_write_back_in_one_batched_call(
-    tmp_path, monkeypatch
-):
+def test_flag_enable_and_grant_write_back_in_one_batched_call(tmp_path, monkeypatch):
     # The grant that also flips advanced_tool_controls must push both
     # sections in ONE write_back call: pushed separately, the first call's
     # rebase would revert the second section's local file to the server's
@@ -447,9 +440,7 @@ def test_lead_mention_requires_a_token_boundary(tmp_path, monkeypatch):
     a, _api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
     a._user_id = "@agent:fil"
     asyncio.run(
-        a._handle_control_message(
-            _control_msg("agent/fil-config #welcome post off")
-        )
+        a._handle_control_message(_control_msg("agent/fil-config #welcome post off"))
     )
     assert len(dispatched) == 1  # LLM path
     assert sync.written_back == []  # no mutation

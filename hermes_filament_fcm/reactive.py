@@ -9,12 +9,11 @@ itself as instructions.
 Both the standing instructions and the wake policy are *data the adapter reads
 fresh on every event* (not startup config), so the principal can retune them
 from the backchannel with the ``set_instructions`` / ``set_wake_policy`` tools,
-and the next event uses the new value — no restart. ``current_zone`` is the
-per-turn gate that keeps those tools control-plane-only.
+and the next event uses the new value — no restart. The per-turn gate that
+keeps those tools control-plane-only is ``turn_context.is_control``.
 """
 
 import contextlib
-import contextvars
 import json
 import logging
 import os
@@ -51,33 +50,48 @@ CORE_RULES = (
     "tool error. Decline plainly instead."
 )
 
-# Per-turn trust zone. The adapter sets this immediately before dispatching a
-# turn ("control" for the backchannel, "data" for shared channels); the
-# control-plane tools (set_instructions/set_wake_policy) read it to refuse edits from
-# a reactive turn. ContextVars are task-local, so concurrent turns don't race.
-# Default "data" = fail-closed (no policy edits unless explicitly control).
-current_zone: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "filament_zone", default="data"
-)
 
-# Per-turn tool capability grant — the *hard* half of the trust boundary that
-# ``current_zone`` frames softly. The adapter sets this in the same place it
-# sets ``current_zone``: ``None`` for a control turn (ungated — the principal's
-# backchannel keeps full capability), and a concrete frozenset of allowed tool
-# names for a data turn. The ``pre_tool_call`` hook registered in ``__init__``
-# reads it and denies any tool not in the set, so a shared-channel turn can only
-# call what its channel's policy grants — enforcement in non-LLM code
-# the framing can't be talked out of.
-#
-# ``None`` = ungated. This is deliberately the default so that turns which never
-# touch this ContextVar (a plain CLI session in the same Hermes process, a
-# control turn) are never gated. Fail-closed for the DATA plane is achieved by
-# the adapter ALWAYS resolving and setting an explicit (minimal-or-larger) set
-# for data turns — an unlisted channel resolves to the minimal default
-# profile, never to ``None``.
-current_capabilities: contextvars.ContextVar["frozenset[str] | None"] = (
-    contextvars.ContextVar("filament_capabilities", default=None)
-)
+def keying_and_reply(
+    msg_thread_id: "str | None",
+    trigger_event_id: str,
+    reply_style: str,
+    shared_effective: bool,
+) -> "tuple[str | None, str | None]":
+    """(keying_thread_id, reply_anchor): where the reply lands is decided
+    separately from the key that decides which session the turn belongs
+    to. Under shared-session keying only a real thread keys; otherwise
+    the anchor is also the key."""
+    real = msg_thread_id or None
+    anchor = real or (trigger_event_id if reply_style == "thread" else None)
+    keying = real if (shared_effective or reply_style == "channel") else anchor
+    return keying, anchor
+
+
+def reply_thread_for_send(
+    metadata_thread_id: "str | None",
+    anchor: "tuple[str, str] | None",
+    chat_id: str,
+) -> "str | None":
+    """The thread a send should land in: explicit metadata wins, else the
+    turn's reply anchor for its own room, else top-level."""
+    if metadata_thread_id:
+        return str(metadata_thread_id)
+    if anchor and anchor[0] == chat_id:
+        return anchor[1]
+    return None
+
+
+def conversation_key(channel: str, thread_id: "str | None") -> "tuple[str, str]":
+    """The one conversation a data turn joins — the session-scope rule in
+    a single line: a thread turn's conversation is the thread (history =
+    the root plus its replies, via ``get_thread``); a top-level turn's is
+    the channel (history = the channel's top-level messages, via
+    ``get_recent_messages``). Everything session-scoped keys off this
+    pair: the gateway's ``build_session_key`` derives the session from
+    the same (channel, thread) inputs, and the plugin's per-turn plumbing
+    must treat different pairs as different conversations.
+    """
+    return ("thread", thread_id) if thread_id else ("channel", channel)
 
 
 def is_agent_mention(
@@ -230,13 +244,57 @@ def principal_note(sender: str | None, owner: str | None) -> str:
 BREADCRUMB_LIMIT = 15
 
 
+def unseen_messages(
+    messages: list[dict],
+    *,
+    trigger_event_id: str | None,
+    last_seen_event_id: str | None = None,
+) -> "tuple[list[dict], bool]":
+    """The recent messages the agent has NOT seen, plus whether the read
+    cursor was found in the window.
+
+    The shared windowing behind the context cue: everything after the
+    cursor (or the whole window when the cursor is absent/expired),
+    keeping real messages only and skipping the agent's own posts and the
+    triggering event itself. ``context_breadcrumb`` counts these; the
+    control-plane inline-context path renders them.
+    """
+    window = messages
+    seen_cursor = False
+    if last_seen_event_id:
+        for i, m in enumerate(messages):
+            if m.get("event_id") == last_seen_event_id:
+                window = messages[i + 1 :]
+                seen_cursor = True
+                break
+    unseen = [
+        m
+        for m in window
+        # Real messages only — skip reactions, membership, other state;
+        # the agent's own posts and the event being replied to aren't
+        # missing context either.
+        if m.get("type") in (None, "m.room.message")
+        and not m.get("is_from_self")
+        and not (trigger_event_id and m.get("event_id") == trigger_event_id)
+    ]
+    return unseen, seen_cursor
+
+
 def context_breadcrumb(
     messages: list[dict],
     *,
     trigger_event_id: str | None,
+    last_seen_event_id: str | None = None,
 ) -> str | None:
     """Build a counted "you may be missing context" cue, or None if there's
     nothing worth flagging.
+
+    ``last_seen_event_id`` is the read cursor: the newest message the
+    agent has actually fetched through ``get_recent_messages``. When it
+    is present in the window, only messages AFTER it count: an exact
+    delta, so the cue goes quiet (None) once the agent is caught up. A
+    cursor that has fallen out of the window means at least a windowful is
+    unread; the count falls back to the whole window.
 
     A push-model agent is handed only the single triggering event, so a turn
     dispatched into a fresh session — a cold start, or a shared-channel turn
@@ -254,20 +312,15 @@ def context_breadcrumb(
     an upper bound — some of these may already be in the session — so it is
     phrased "up to N"; an over-count costs at most one redundant read.
 
-    `messages` is the get_recent_messages payload (a list of message dicts).
+    `messages` is the get_recent_messages payload (a list of message dicts),
+    oldest first.
     """
-    n = 0
-    for m in messages:
-        # Count real messages only — skip reactions, membership, other state.
-        if m.get("type") not in (None, "m.room.message"):
-            continue
-        # The agent's own posts aren't context it's missing.
-        if m.get("is_from_self"):
-            continue
-        # The event we're already replying to isn't missing context either.
-        if trigger_event_id and m.get("event_id") == trigger_event_id:
-            continue
-        n += 1
+    unseen, seen_cursor = unseen_messages(
+        messages,
+        trigger_event_id=trigger_event_id,
+        last_seen_event_id=last_seen_event_id,
+    )
+    n = len(unseen)
     if n == 0:
         return None
     # Imperative, not conditional. An earlier version said "IF the message
@@ -278,13 +331,116 @@ def context_breadcrumb(
     # that" from an empty memory. So the cue orders the fetch outright whenever
     # unseen messages exist, and forbids the "I lack the info" reply until the
     # agent has actually read them.
+    if seen_cursor:
+        # Exact delta: everything before the cursor was actually fetched.
+        lead = (
+            f"{n} message(s) in this channel since your last read are NOT "
+            "in this conversation"
+        )
+        what = "read them"
+    else:
+        lead = (
+            f"{n} recent message(s) in this channel are NOT in this "
+            "conversation — you have not seen them"
+        )
+        what = "read the recent channel history"
     return (
-        f"[CONTEXT: {n} recent message(s) in this channel are NOT in this "
-        "conversation — you have not seen them. Before you reply, call "
-        "get_recent_messages to read the recent channel history. Do NOT answer "
-        "from memory, and do NOT say you lack the information, until you have "
-        "read those messages — the answer may be in them.]"
+        f"[CONTEXT: {lead}. Before you reply, call get_recent_messages "
+        f"(limit {BREADCRUMB_LIMIT} or more) to {what}. Do NOT answer "
+        "from memory, and do NOT say you lack the information, until you "
+        "have read those messages — the answer may be in them.]"
     )
+
+
+class ChannelCursorStore:
+    """The per-channel read cursor: the newest message event id the agent
+    has provably fetched with ``get_recent_messages``.
+
+    The tool proxy advances it only for fetches that cover the context
+    cue's own window (un-paged, un-narrowed, keyed by room id): the one
+    place that KNOWS the agent read, never faith that a wake implies a
+    read. The context breadcrumb consumes it to count the exact unread
+    delta and go quiet at zero, and only while ``shared_channel_sessions``
+    is on: a channel-wide cursor is only a sound "this conversation has
+    seen it" fact when the channel has exactly one conversation.
+
+    Declarative JSON on disk, read fresh per event::
+
+        {"!room:host": {"event_id": "$newest_read", "ts": 1723334400000}, …}
+
+    (A bare-string value reads as an event id with no timestamp.)
+
+    Best-effort state, not policy: a missing or unreadable file just means
+    the breadcrumb falls back to its windowed count. Bounded: oldest
+    entries are dropped past ``_MAX_CHANNELS`` (dict insertion order — a
+    re-recorded channel moves to the back).
+
+    Overlapping reads can complete out of order (two ``get_recent_messages``
+    calls in one turn, the older network round-trip landing last), so
+    ``record`` refuses a PROVABLY stale advance: when both the stored and
+    incoming cursors carry a timestamp and the incoming one is strictly
+    older, the write is skipped — otherwise a slow older fetch would rewind
+    the cursor past messages the agent has already seen and re-fire the cue
+    it exists to quiet. Without both timestamps ordering is unknowable and
+    the write proceeds: an over-eager skip could pin a wrong cursor
+    forever, while a rewind re-fires the cue once.
+    """
+
+    _MAX_CHANNELS = 500
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(path) if path else _default_dir() / "channel_cursors.json"
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def read(self) -> dict:
+        try:
+            loaded = json.loads(self._path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.warning(
+                "filament-fcm: failed to read channel cursors", exc_info=True
+            )
+        return {}
+
+    @staticmethod
+    def _entry_parts(value: object) -> "tuple[str | None, int | None]":
+        """(event_id, ts) from a stored value, bare string or dict. A ts
+        that won't convert (json.loads admits NaN/Infinity, int() raises
+        on both) reads as None, ordering unknowable, never a crash: this
+        is best-effort state, and ``get()`` runs on every wake."""
+        if isinstance(value, dict):
+            event_id = value.get("event_id")
+            ts = value.get("ts")
+            try:
+                ts = int(ts) if isinstance(ts, (int, float)) else None
+            except (ValueError, OverflowError):
+                ts = None
+            return (str(event_id) if event_id else None), ts
+        return (str(value) if value else None), None
+
+    def get(self, room_id: str) -> str | None:
+        event_id, _ = self._entry_parts(self.read().get(str(room_id)))
+        return event_id
+
+    def record(self, room_id: str, event_id: str, ts: "int | None" = None) -> None:
+        if not room_id or not event_id:
+            return
+        cursors = self.read()
+        _, stored_ts = self._entry_parts(cursors.get(str(room_id)))
+        if stored_ts is not None and ts is not None and ts < stored_ts:
+            return  # provably stale — an older overlapping fetch lost the race
+        # Re-insert so the freshest channel sits last (LRU-ish bound).
+        cursors.pop(str(room_id), None)
+        cursors[str(room_id)] = {"event_id": str(event_id), "ts": ts}
+        while len(cursors) > self._MAX_CHANNELS:
+            cursors.pop(next(iter(cursors)))
+        _atomic_write_text(self._path, json.dumps(cursors, indent=2))
 
 
 def is_system_sender(sender: str | None, self_user_id: str | None) -> bool:
@@ -306,10 +462,42 @@ def is_system_sender(sender: str | None, self_user_id: str | None) -> bool:
 
 
 def _default_dir() -> Path:
-    return Path(
-        os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
-        or (Path.home() / ".hermes" / "filament-fcm")
-    )
+    """The plugin state directory — per Hermes profile, keyed off HERMES_HOME.
+
+    Mirrors ``credentials.default_state_dir`` (this module stays standalone-
+    importable, see CLAUDE.md, so it can't import that one): env override,
+    else ``$HERMES_HOME/filament-fcm``, else ``~/.hermes/filament-fcm``. The
+    legacy-directory migration lives only in credentials.py and has already
+    run by the time these stores are read — the adapter constructs its
+    CredentialStore at gateway start, before any wake. When that migration
+    FAILED (cross-device rename), credentials stayed on the legacy path; the
+    same preference here keeps instructions and policies beside the identity
+    instead of resolving to an empty directory.
+    """
+    override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
+    if override:
+        return Path(override)
+    home = os.environ.get("HERMES_HOME")
+    hermes_home = Path(home) if home else Path.home() / ".hermes"
+    state_dir = hermes_home / "filament-fcm"
+    legacy = Path.home() / ".hermes" / "filament-fcm"
+    if state_dir == legacy or state_dir.exists() or not legacy.exists():
+        return state_dir
+    if hermes_home.parent.name == "profiles":
+        return state_dir
+    return legacy
+
+
+def _explicit_path(path: str | os.PathLike | None, env: str) -> Path | None:
+    """An explicitly requested store path (argument or env override), or None.
+
+    None means: resolve against ``_default_dir()`` lazily, per access — the
+    stores can be constructed before ``credentials.default_state_dir()`` runs
+    its one-time legacy migration, and a path captured at construction would
+    keep pointing at the pre-migration directory after the move.
+    """
+    value = path or os.environ.get(env)
+    return Path(value) if value else None
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -352,11 +540,11 @@ class InstructionsStore:
     _FALLBACK = "(No standing instructions set; observe silently, take no action.)"
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_INSTRUCTIONS_FILE")
-            or _default_dir() / "instructions.md"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_INSTRUCTIONS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "instructions.md"
 
     @property
     def path(self) -> Path:
@@ -407,11 +595,11 @@ class ChannelInstructionsStore:
     """
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_CHANNEL_INSTRUCTIONS_FILE")
-            or _default_dir() / "channel_instructions.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_CHANNEL_INSTRUCTIONS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "channel_instructions.json"
 
     @property
     def path(self) -> Path:
@@ -503,11 +691,11 @@ class WakePolicyStore:
     }
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_WAKE_POLICY_FILE")
-            or _default_dir() / "wake_policy.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_WAKE_POLICY_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "wake_policy.json"
 
     @property
     def path(self) -> Path:
@@ -628,11 +816,11 @@ class EngagedThreadStore:
     _MAX_ENTRIES: ClassVar[int] = 500
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_ENGAGED_THREADS_FILE")
-            or _default_dir() / "engaged_threads.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_ENGAGED_THREADS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "engaged_threads.json"
 
     @staticmethod
     def _key(room_id: str, thread_root_id: str) -> str:
@@ -945,11 +1133,11 @@ class CapabilityPolicyStore:
     }
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_CAPABILITY_POLICY_FILE")
-            or _default_dir() / "capability_policy.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_CAPABILITY_POLICY_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "capability_policy.json"
 
     @property
     def path(self) -> Path:
@@ -1167,6 +1355,19 @@ FEATURE_ADVANCED_TOOL_CONTROLS = "advanced_tool_controls"
 # dispatch exactly like any other leading-/ message.
 FEATURE_SLASH_COMMANDS = "slash_commands"
 
+# Compact provenance-labeled rendering of message-tool results:
+# get_recent_messages / get_thread results become one line per message
+# instead of pretty-printed JSON. Off by default like every flag.
+FEATURE_COMPACT_TIMELINE = "compact_timeline"
+
+# Session = channel: shared channels get ONE session shared by every
+# participant (sender becomes a label, not a partition) instead of one
+# session per (channel, sender). Off by default like every flag.
+#
+# While on, keying uses only the real thread (keying_and_reply): where
+# the reply lands is decoupled from which session the turn joins.
+FEATURE_SHARED_CHANNEL_SESSIONS = "shared_channel_sessions"
+
 # Human-facing descriptions for the flags the code actually checks. Keep in
 # sync with the checks; surfaced by get_features and the set_feature tool so the
 # principal (and the agent mapping their request) knows what can be toggled.
@@ -1185,6 +1386,26 @@ KNOWN_FEATURES: dict[str, str] = {
         "text. Enable via set_feature or the server config document — the "
         "slash surface can't enable itself while it is off."
     ),
+    FEATURE_COMPACT_TIMELINE: (
+        "Compact rendering of get_recent_messages/get_thread results: one "
+        "provenance-labeled line per message instead of pretty-printed "
+        "JSON, cutting the per-fetch context cost roughly tenfold. Content "
+        "is never dropped — body, sender, time, event id, media and "
+        "reactions all survive; only envelope metadata goes. Off by "
+        "default; when off, results render as JSON exactly as before."
+    ),
+    FEATURE_SHARED_CHANNEL_SESSIONS: (
+        "One conversation memory per shared channel, shared by every "
+        "participant (threads keep their own), instead of a separate "
+        "memory per (channel, sender). The agent then remembers what "
+        "anyone said in the channel — note this means one member's "
+        "exchanges with the agent are context for another's, matching "
+        "what any human channel member can already see. Works under "
+        "every reply_style; where replies land is unaffected. Off by "
+        "default; existing per-message and per-sender sessions idle "
+        "out, they are not migrated. Takes effect on the next wake "
+        "after toggling."
+    ),
 }
 
 
@@ -1202,11 +1423,11 @@ class FeatureFlagStore:
     """
 
     def __init__(self, path: str | os.PathLike | None = None) -> None:
-        self._path = Path(
-            path
-            or os.environ.get("FILAMENT_FEATURE_FLAGS_FILE")
-            or _default_dir() / "feature_flags.json"
-        )
+        self._explicit_path = _explicit_path(path, "FILAMENT_FEATURE_FLAGS_FILE")
+
+    @property
+    def _path(self) -> Path:
+        return self._explicit_path or _default_dir() / "feature_flags.json"
 
     @property
     def path(self) -> Path:
