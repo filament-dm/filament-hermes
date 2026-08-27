@@ -244,6 +244,42 @@ def principal_note(sender: str | None, owner: str | None) -> str:
 BREADCRUMB_LIMIT = 15
 
 
+def unseen_messages(
+    messages: list[dict],
+    *,
+    trigger_event_id: str | None,
+    last_seen_event_id: str | None = None,
+) -> "tuple[list[dict], bool]":
+    """The recent messages the agent has NOT seen, plus whether the read
+    cursor was found in the window.
+
+    The shared windowing behind the context cue: everything after the
+    cursor (or the whole window when the cursor is absent/expired),
+    keeping real messages only and skipping the agent's own posts and the
+    triggering event itself. ``context_breadcrumb`` counts these; the
+    control-plane inline-context path renders them.
+    """
+    window = messages
+    seen_cursor = False
+    if last_seen_event_id:
+        for i, m in enumerate(messages):
+            if m.get("event_id") == last_seen_event_id:
+                window = messages[i + 1 :]
+                seen_cursor = True
+                break
+    unseen = [
+        m
+        for m in window
+        # Real messages only — skip reactions, membership, other state;
+        # the agent's own posts and the event being replied to aren't
+        # missing context either.
+        if m.get("type") in (None, "m.room.message")
+        and not m.get("is_from_self")
+        and not (trigger_event_id and m.get("event_id") == trigger_event_id)
+    ]
+    return unseen, seen_cursor
+
+
 def context_breadcrumb(
     messages: list[dict],
     *,
@@ -279,26 +315,12 @@ def context_breadcrumb(
     `messages` is the get_recent_messages payload (a list of message dicts),
     oldest first.
     """
-    window = messages
-    seen_cursor = False
-    if last_seen_event_id:
-        for i, m in enumerate(messages):
-            if m.get("event_id") == last_seen_event_id:
-                window = messages[i + 1 :]
-                seen_cursor = True
-                break
-    n = 0
-    for m in window:
-        # Count real messages only — skip reactions, membership, other state.
-        if m.get("type") not in (None, "m.room.message"):
-            continue
-        # The agent's own posts aren't context it's missing.
-        if m.get("is_from_self"):
-            continue
-        # The event we're already replying to isn't missing context either.
-        if trigger_event_id and m.get("event_id") == trigger_event_id:
-            continue
-        n += 1
+    unseen, seen_cursor = unseen_messages(
+        messages,
+        trigger_event_id=trigger_event_id,
+        last_seen_event_id=last_seen_event_id,
+    )
+    n = len(unseen)
     if n == 0:
         return None
     # Imperative, not conditional. An earlier version said "IF the message
