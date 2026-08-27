@@ -69,6 +69,43 @@ def enabled() -> bool:
     return os.environ.get("FILAMENT_STATUS_UPDATES", "1").strip() != "0"
 
 
+# System notices the gateway emits mid-work ("💾 Self-improvement review: …",
+# background-process updates). In a shared channel these are noise as posted
+# messages — the adapter converts them to a transient status line instead
+# (the thinking indicator, expiring on its own). The backchannel keeps them
+# as real posts: it is the principal's durable operational record. Primary
+# signal is the gateway's metadata flag; the regexes are the same upgrade
+# bridge hermes's Discord adapter carries, for emitters predating the flag.
+_NONCONVERSATIONAL_METADATA_KEYS = frozenset(
+    {
+        "non_conversational",
+        "non_conversational_history",
+    }
+)
+_NONCONVERSATIONAL_MESSAGE_PATTERNS = (
+    re.compile(r"^\s*💾\s*Self-improvement review:\s+\S[\s\S]*$", re.IGNORECASE),
+    re.compile(
+        r"^\s*💾\s+Skill\s+['\"].+?['\"]\s+(?:created|updated|improved|patched)\.?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^\s*⏳\s+Working\s+—\s+\d+\s+min(?:\s|$)", re.IGNORECASE),
+    re.compile(
+        r"^\s*\[Background process\s+\S+\s+"
+        r"(?:finished with exit code|is still running~)[\s\S]*\]\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def is_nonconversational_notice(metadata: Any, content: str) -> bool:
+    """Whether a send is a mid-work system notice rather than conversation."""
+    if isinstance(metadata, dict) and any(
+        metadata.get(key) for key in _NONCONVERSATIONAL_METADATA_KEYS
+    ):
+        return True
+    return any(p.match(content or "") for p in _NONCONVERSATIONAL_MESSAGE_PATTERNS)
+
+
 # ── Phrases ──────────────────────────────────────────────────────────
 
 
@@ -198,6 +235,9 @@ _VERBS = {
     "complete": "completing",
     "cancel": "cancelling",
     "check": "checking",
+    "manage": "managing",
+    "connect": "connecting",
+    "wait": "waiting",
 }
 
 # For unmapped tools, the first of these args present is worth quoting.
@@ -214,12 +254,32 @@ def _generic_arg(args: dict | None) -> str:
 
 
 def _mcp_phrase(tool_name: str, args: dict | None) -> str | None:
-    """ "mcp_linear_list_issues" -> "listing issues in Linear"."""
-    parts = tool_name.split("_")
-    if len(parts) < 3 or parts[0] != "mcp":
-        return None
-    server = parts[1].title()
-    verb, rest = parts[2], " ".join(parts[3:])
+    """ "mcp_linear_list_issues" / "mcp__composio__COMPOSIO_SEARCH_TOOLS"
+    -> "listing issues in Linear" / "searching tools in Composio".
+
+    Hermes registers MCP tools under both separators: single underscore
+    throughout, or double underscores around the server segment. The double
+    form must not fall through the single-underscore split — parts[1] comes
+    out empty there, which rendered as a bare "…is using".
+    """
+    if tool_name.startswith("mcp__"):
+        segments = [s for s in tool_name.split("__") if s]
+        if len(segments) < 3:
+            return None
+        server = segments[1].title()
+        words = [w for w in "_".join(segments[2:]).split("_") if w]
+        # Tools often echo the server as a prefix (COMPOSIO_SEARCH_TOOLS);
+        # drop it so the verb lookup sees the real action.
+        if words and words[0].lower() == segments[1].lower():
+            words = words[1:]
+    else:
+        parts = tool_name.split("_")
+        if len(parts) < 3 or parts[0] != "mcp" or not parts[1]:
+            return None
+        server = parts[1].title()
+        words = parts[2:]
+    verb = words[0].lower() if words else ""
+    rest = " ".join(w.lower() for w in words[1:])
     doing = _VERBS.get(verb)
     if doing is None:
         return _clip(f"using {server}", _MAX_LINE_CHARS)
@@ -246,8 +306,12 @@ def phrase_for(
         mcp = _mcp_phrase(tool_name, args)
         if mcp is not None:
             return mcp
-        # e.g. "browser_click" -> "using browser click"
-        return _clip("using " + tool_name.replace("_", " "), _MAX_LINE_CHARS)
+        # e.g. "browser_click" -> "using browser click". Never a bare
+        # "using": with no nameable thing the honest line is "working".
+        label = " ".join(tool_name.replace("_", " ").split())
+        if not label:
+            return "working"
+        return _clip("using " + label, _MAX_LINE_CHARS)
     template, render = entry
     if render is None:
         return template
@@ -364,7 +428,7 @@ class StatusPublisher:
             self._prune()
             entry = _Pending(scope=scope, created=time.monotonic(), api=self._api)
             self._pending[trigger_event_id] = entry
-        self._publish(entry, "reading the conversation")
+        self._publish(entry, "reading a new message")
         # Exempt the first real phrase from the floor, or a single-tool
         # turn's only phrase would be suppressed.
         entry.last_ts = time.monotonic() - MIN_INTERVAL_SECONDS
@@ -374,6 +438,20 @@ class StatusPublisher:
             entry.refresh_task = asyncio.get_running_loop().create_task(
                 self._refresh(entry)
             )
+
+    def ensure_turn(self, trigger_event_id: str, scope: TurnScope) -> None:
+        """Publish the opening line for a turn that dispatch never announced.
+
+        The processing-start hook calls this so the indicator is up the
+        moment work begins even on wake paths that didn't park a scope at
+        dispatch (this replaced the 👀 processing reaction). A turn already
+        pending or bound keeps its line — begin_turn published it.
+        """
+        if trigger_event_id in self._pending:
+            return
+        if self._trigger_session.get(trigger_event_id) in self._bound:
+            return
+        self.begin_turn(trigger_event_id, scope)
 
     async def end_turn(self, trigger_event_id: str) -> None:
         if not hasattr(self._api, "set_status"):
