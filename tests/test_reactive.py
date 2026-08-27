@@ -1210,9 +1210,7 @@ class TestUnseenMessages:
         ]
 
     def test_no_cursor_returns_all_countable(self):
-        unseen, seen = reactive.unseen_messages(
-            self._msgs(), trigger_event_id="$trig"
-        )
+        unseen, seen = reactive.unseen_messages(self._msgs(), trigger_event_id="$trig")
         assert [m["event_id"] for m in unseen] == ["$a", "$d"]
         assert seen is False
 

@@ -606,9 +606,6 @@ def _register_capability_gate(ctx: Any) -> None:
     try:
         ctx.register_hook("pre_tool_call", _capability_pre_tool_call)
         logger.info("filament-fcm: capability gate registered (pre_tool_call)")
-        if status_enabled():
-            ctx.register_hook("pre_tool_call", status_pre_tool_call)
-            logger.info("filament-fcm: status narrator registered (pre_tool_call)")
     except Exception:
         # A Hermes without the pre_tool_call hook point would leave data turns
         # protected by framing only (the prior behavior) — degrade loudly, don't
@@ -618,6 +615,20 @@ def _register_capability_gate(ctx: Any) -> None:
             "data-plane tool capabilities are NOT hard-enforced on this Hermes",
             exc_info=True,
         )
+
+    # Registered separately from the gate: the narrator is cosmetic, and a
+    # failure here must not print the gate's security warning, which would
+    # send an operator hunting a gate that is working.
+    if status_enabled():
+        try:
+            ctx.register_hook("pre_tool_call", status_pre_tool_call)
+            logger.info("filament-fcm: status narrator registered (pre_tool_call)")
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not register the status narrator; turns "
+                "will run without a status line",
+                exc_info=True,
+            )
 
 
 def _wake_policy_error(policy: dict) -> str | None:

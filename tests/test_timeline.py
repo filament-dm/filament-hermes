@@ -438,3 +438,36 @@ def test_clean_preserves_falsy_values_and_lone_cr():
     assert "⟨score: 0⟩" in line
     line = timeline.render_message_line(_msg(body="first\rsecond"))
     assert "first ⏎ second" in line
+
+
+class TestRechatKeepsEveryField:
+    """`rechat` is in _RENDERED_KEYS, so nothing else can surface its
+    contents: whatever the annotation drops is hidden from the model
+    while the result still counts as rendered."""
+
+    def test_non_source_fields_survive(self):
+        line = timeline.render_message_line(
+            _msg(rechat={"source_channel_name": "#eng", "warning": "partial history"})
+        )
+        assert "⟨rechat from #eng" in line
+        assert "warning=partial history" in line
+
+    def test_the_unselected_source_field_survives(self):
+        line = timeline.render_message_line(
+            _msg(rechat={"source_channel_name": "#eng", "source_channel_id": "!c:hs"})
+        )
+        assert "#eng" in line and "!c:hs" in line
+
+    def test_unnamed_source_still_reads_plainly(self):
+        line = timeline.render_message_line(_msg(rechat={"note": "n"}))
+        assert "⟨rechat from another channel note=n⟩" in line
+
+
+class TestTimestampOverflow:
+    def test_infinite_timestamp_degrades_to_none(self):
+        # JSON `1e309` parses to float inf, which int() refuses. The
+        # message is still the newest one; only its timestamp is unusable.
+        newest = timeline.newest_message(
+            {"messages": [{"event_id": "$e", "timestamp": float("inf")}]}
+        )
+        assert newest == ("$e", None)
