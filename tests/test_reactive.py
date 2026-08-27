@@ -1197,3 +1197,40 @@ def test_channel_cursor_bounded_drops_oldest():
         store.record("!r1:s", "$e1b")
         store.record("!r9:s", "$e9")
         assert store.get("!r1:s") == "$e1b"
+
+
+class TestUnseenMessages:
+    def _msgs(self):
+        return [
+            {"event_id": "$a", "type": "m.room.message", "body": "one"},
+            {"event_id": "$b", "type": "m.room.message", "is_from_self": True},
+            {"event_id": "$c", "type": "m.reaction"},
+            {"event_id": "$d", "type": "m.room.message", "body": "two"},
+            {"event_id": "$trig", "type": "m.room.message", "body": "trigger"},
+        ]
+
+    def test_no_cursor_returns_all_countable(self):
+        unseen, seen = reactive.unseen_messages(self._msgs(), trigger_event_id="$trig")
+        assert [m["event_id"] for m in unseen] == ["$a", "$d"]
+        assert seen is False
+
+    def test_cursor_cuts_window_and_reports_seen(self):
+        unseen, seen = reactive.unseen_messages(
+            self._msgs(), trigger_event_id="$trig", last_seen_event_id="$a"
+        )
+        assert [m["event_id"] for m in unseen] == ["$d"]
+        assert seen is True
+
+    def test_expired_cursor_falls_back_to_full_window(self):
+        unseen, seen = reactive.unseen_messages(
+            self._msgs(), trigger_event_id="$trig", last_seen_event_id="$gone"
+        )
+        assert [m["event_id"] for m in unseen] == ["$a", "$d"]
+        assert seen is False
+
+    def test_breadcrumb_matches_unseen_count(self):
+        msgs = self._msgs()
+        crumb = reactive.context_breadcrumb(msgs, trigger_event_id="$trig")
+        assert crumb is not None and "2 " in crumb
+        unseen, _ = reactive.unseen_messages(msgs, trigger_event_id="$trig")
+        assert len(unseen) == 2

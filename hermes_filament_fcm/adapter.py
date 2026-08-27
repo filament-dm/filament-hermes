@@ -34,7 +34,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, slash, turn_context
+from . import framing, slash, timeline, turn_context
 from ._version import PLUGIN_VERSION
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -76,6 +76,7 @@ from .reactive import (
     principal_note,
     reply_thread_for_send,
     sender_is_agent_in_thread,
+    unseen_messages,
 )
 from .server_config import ServerConfigSync
 from .status import TurnScope
@@ -640,8 +641,53 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._greet_pending = False
 
         try:
-            greet_id = new_id("greet")
-            trigger_id = f"greet:{self._cc_room_id}"
+            # Deterministic, not a model turn: the hello is the connect flow's
+            # finish line (the app literally waits for it), so it should land
+            # the moment the gateway is up — an LLM round added ~6 seconds of
+            # pure wait and could say anything. Personality gets its chance on
+            # the first real exchange.
+            logger.info(
+                "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
+            )
+            with bound_context(
+                installation_id=self._installation_id,
+                gateway_instance_id=self._gateway_instance_id,
+                call_origin="first_contact_greet",
+            ):
+                slog.info(
+                    "filament_fcm.greet.dispatch",
+                    channel_id=self._cc_room_id,
+                    principal_id=self._owner_id,
+                )
+                await self._filament_api.post_message(
+                    channel=self._cc_room_id,
+                    markdown_body=(
+                        "👋 Connected and ready. This is our private channel — "
+                        "give me a task, ask me anything, or invite me into a "
+                        "channel."
+                    ),
+                )
+                slog.info(
+                    "filament_fcm.greet.dispatched",
+                    channel_id=self._cc_room_id,
+                    principal_id=self._owner_id,
+                )
+            # Fire-and-forget capabilities intro: a short model turn in the
+            # backchannel session. Two jobs — a genuinely useful second
+            # message, and priming the session + provider prompt cache so the
+            # principal's FIRST real message answers warm (~3s faster,
+            # measured). Never awaited and never gates readiness.
+            with contextlib.suppress(RuntimeError):
+                task = asyncio.get_running_loop().create_task(self._greet_intro_turn())
+                self._background_greet_task = task
+        except Exception:
+            logger.exception("filament-fcm: greet post failed")
+            slog.exception("filament_fcm.greet.failed")
+
+    async def _greet_intro_turn(self) -> None:
+        """Background capabilities intro (see _maybe_greet). Best-effort."""
+        try:
+            trigger_id = f"greet-intro:{self._cc_room_id}"
             source = self.build_source(
                 chat_id=self._cc_room_id,
                 chat_name="backchannel",
@@ -650,45 +696,29 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 user_name=self._owner_name or self._owner_id,
                 message_id=trigger_id,
             )
+            with contextlib.suppress(AttributeError):
+                source.channel_prompt = framing.TOOL_MAP_PROMPT
             event = MessageEvent(
                 text=(
-                    "[system: You have just connected to Filament and are now in "
-                    "your backchannel with your principal. Reply with a short, "
-                    "friendly one-line hello introducing yourself so they know "
-                    "you're connected. Just write the reply directly — it is "
-                    "delivered to them automatically. Do not call any tools.]"
+                    "[system: You just connected and posted a canned hello in "
+                    "your backchannel. Follow it with ONE short line (no "
+                    "greeting, no tools) telling your principal two or three "
+                    "concrete things you can do for them.]"
                 ),
                 message_type=MessageType.TEXT,
                 source=source,
                 message_id=trigger_id,
                 raw_message=None,
             )
-            logger.info(
-                "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
-            )
             with bound_context(
                 installation_id=self._installation_id,
                 gateway_instance_id=self._gateway_instance_id,
-                turn_id=greet_id,
                 call_origin="first_contact_greet",
                 trigger_event_id=trigger_id,
             ):
-                slog.info(
-                    "filament_fcm.greet.dispatch",
-                    channel_id=self._cc_room_id,
-                    principal_id=self._owner_id,
-                    synthetic_event_id=trigger_id,
-                )
                 await self.handle_message(event)
-                slog.info(
-                    "filament_fcm.greet.dispatched",
-                    channel_id=self._cc_room_id,
-                    principal_id=self._owner_id,
-                    synthetic_event_id=trigger_id,
-                )
         except Exception:
-            logger.exception("filament-fcm: greet turn failed")
-            slog.exception("filament_fcm.greet.failed")
+            logger.debug("filament-fcm: greet intro turn failed", exc_info=True)
 
     def _note_reserved(self) -> None:
         """Mark this connect attempt blocked on an unfinalized agent, and tell
@@ -1712,7 +1742,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     async def _context_breadcrumb(
-        self, channel: str, trigger_event_id: str | None, thread_id: str | None = None
+        self,
+        channel: str,
+        trigger_event_id: str | None,
+        thread_id: str | None = None,
+        inline: bool = False,
     ) -> str | None:
         """Read a bounded recent-message window and build the counted context
         cue (see reactive.context_breadcrumb). Best-effort: any failure — no
@@ -1742,13 +1776,70 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # per-sender sessions: another conversation's fetch must not
         # silence this one's cue.
         cursors = getattr(self, "_channel_cursors", None)
+        # Inline mode (control plane only): the backchannel is a single
+        # conversation with the principal by construction, so the channel
+        # cursor is sound there regardless of the per-conversation rule.
         cursor_applies = bool(
-            cursors and self._cursor_channel_for_turn(channel, thread_id)
+            cursors and (inline or self._cursor_channel_for_turn(channel, thread_id))
         )
+        cursor = cursors.get(channel) if cursor_applies else None
+        if inline:
+            # Control plane: deliver the unseen messages themselves instead
+            # of a count-and-fetch order — backchannel content is already
+            # command-authority, so inlining bodies adds no trust surface,
+            # and it saves the model a whole tool round on every wake. The
+            # DATA plane must keep the count-only cue (bodies from a shared
+            # channel are untrusted and never ride in the prompt frame).
+            unseen, _ = unseen_messages(
+                messages,
+                trigger_event_id=trigger_event_id,
+                last_seen_event_id=cursor,
+            )
+            block: str | None = None
+            if unseen:
+                try:
+                    rendered = timeline.render_recent_messages(
+                        {"messages": unseen}, channel=channel
+                    )
+                    block = (
+                        "[RECENT BACKCHANNEL MESSAGES — read for you just "
+                        "now; with these you are caught up, no need to call "
+                        f"get_recent_messages]\n{rendered}"
+                    )
+                except Exception:
+                    # Renderer surprise: fall back to the counted cue rather
+                    # than lose the context signal entirely.
+                    block = context_breadcrumb(
+                        messages,
+                        trigger_event_id=trigger_event_id,
+                        last_seen_event_id=cursor,
+                    )
+            # The adapter itself fetched this window: advance the cursor so
+            # the next wake's delta is exact (same "provably fetched"
+            # semantics as the tool-proxy advance).
+            if cursors:
+                newest = next(
+                    (
+                        m.get("event_id")
+                        for m in reversed(messages)
+                        if m.get("event_id")
+                    ),
+                    None,
+                )
+                if newest:
+                    cursors.record(channel, newest)
+            logger.info(
+                "filament-fcm: inline context for %s: %d unseen of %d read",
+                channel,
+                len(unseen),
+                len(messages),
+            )
+            return block
+
         crumb = context_breadcrumb(
             messages,
             trigger_event_id=trigger_event_id,
-            last_seen_event_id=(cursors.get(channel) if cursor_applies else None),
+            last_seen_event_id=cursor,
         )
         logger.info(
             "filament-fcm: context breadcrumb for %s: %d messages read, cue=%s",
@@ -1857,12 +1948,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             message_id=msg.event_id,
         )
+        # Ephemeral tool map (system prompt, never persisted): saves the
+        # model the tool_search/tool_describe discovery rounds. See framing.
+        # suppress: test doubles build plain dict sources.
+        with contextlib.suppress(AttributeError):
+            source.channel_prompt = framing.TOOL_MAP_PROMPT
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel
         # timeline may hold context this session never saw. Flag the count so
         # the agent reads it instead of answering "I don't see that" from an
         # empty memory. The framework prepends channel_context to the body.
-        breadcrumb = await self._context_breadcrumb(msg.room_id, msg.event_id)
+        breadcrumb = await self._context_breadcrumb(
+            msg.room_id, msg.event_id, inline=True
+        )
         event = MessageEvent(
             text=body,
             message_type=MessageType.TEXT,
@@ -2293,6 +2391,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             message_id=message_id,
         )
+        # Same ephemeral tool map as the control path — the discovery-round
+        # tax is per session, and shared channels start sessions too.
+        with contextlib.suppress(AttributeError):
+            source.channel_prompt = framing.TOOL_MAP_PROMPT
         # Reinforce the envelope's get_recent_messages hint with a concrete
         # count of channel history this reactive turn can't see — the counted
         # cue is what reliably drives the fetch (the static hint alone doesn't).
