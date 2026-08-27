@@ -37,7 +37,7 @@ The package imports `gateway.*`, `agent.*`, and `hermes_cli.*` from hermes-agent
 
 `filament_api.py` — `FilamentAPI`, the MCP-over-HTTP client (JSON-RPC). One instance is shared by the adapter and every tool handler. Its httpx client is recreated per event loop because calls arrive from both the gateway loop and the firebase-messaging thread.
 
-`credentials.py` — persists FCM credentials and received persistent ids under `~/.hermes/filament-fcm/` (`FILAMENT_FCM_CREDENTIALS_DIR` to override). The persistent ids seed the next MCS login so Google doesn't redeliver already-handled pushes after a restart.
+`credentials.py` — persists FCM credentials and received persistent ids under `$HERMES_HOME/filament-fcm/` (`~/.hermes/filament-fcm/` when HERMES_HOME is unset; `FILAMENT_FCM_CREDENTIALS_DIR` to override). Per-HERMES_HOME so every Hermes *profile* — each its own HERMES_HOME — gets its own FCM identity; `default_state_dir()` migrates the pre-profile `~/.hermes/filament-fcm` forward for the root profile only. The persistent ids seed the next MCS login so Google doesn't redeliver already-handled pushes after a restart.
 
 `server_config.py` — server-side agent config sync (see the dedicated section below). Stdlib-only; the HTTP client is injected (`FilamentAPI.get_config` / `put_config` / `post_tools`), so it is unit-testable without Hermes.
 

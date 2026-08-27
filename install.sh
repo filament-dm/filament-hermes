@@ -18,6 +18,11 @@
 #                        default branch — used to test unreleased plugin changes)
 #   VIRTUAL_ENV          Hermes venv (default: auto-detected, see below)
 #   HERMES_HOME          Hermes home (default: ~/.hermes)
+#   FILAMENT_PROFILE     install into this named Hermes profile instead of the
+#                        one HERMES_HOME points at, creating it if missing.
+#                        Each profile is an independent HERMES_HOME with its
+#                        own gateway and FCM identity — how one Hermes
+#                        instance hosts several Filament agents.
 #
 # This plugin installs as a Hermes *directory plugin*: its Python dependencies
 # go into the Hermes venv, and the plugin code is git-cloned into
@@ -134,6 +139,20 @@ UV="$HERMES_HOME/bin/uv"
 [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
 [ -n "$UV" ] || err "uv not found — install Hermes Agent first (expected $HERMES_HOME/bin/uv)."
 
+# Make `hermes` resolvable for everything below (profile creation, the wizard's
+# gateway-restart step), without shadowing an existing launcher (the Docker
+# shim must stay first on PATH so root `docker exec` sessions keep dropping
+# privileges). When PATH is stripped enough that even the shim is missing, put
+# the shim dir ahead of $VENV/bin — the raw venv entry point run as root would
+# litter $HERMES_HOME with root-owned files and break the supervised gateway.
+if ! command -v hermes >/dev/null 2>&1; then
+  HERMES_PATH_PREFIX="$HERMES_HOME/bin:$VENV/bin"
+  if [ "$VENV" = /opt/hermes/.venv ] && [ -x /opt/hermes/bin/hermes ]; then
+    HERMES_PATH_PREFIX="/opt/hermes/bin:$HERMES_PATH_PREFIX"
+  fi
+  export PATH="$HERMES_PATH_PREFIX:$PATH"
+fi
+
 # --- Install dependencies ----------------------------------------------------
 # Only the Python dependencies go into the venv here — NOT the plugin package
 # (which is cloned as a directory plugin below). Sealed images (Docker / cloud)
@@ -217,6 +236,56 @@ elif [ "$SEALED" = 1 ]; then
   err "Hermes venv at $VENV is sealed (read-only or lazy installs disabled) and HERMES_LAZY_INSTALL_TARGET is not set — nowhere to install."
 else
   info "Installing dependencies into $VENV ..."
+fi
+
+# --- Optional: install into a named Hermes profile ----------------------------
+# FILAMENT_PROFILE targets a named profile (creating it if missing) instead of
+# the profile HERMES_HOME already points at. Each profile is an independent
+# HERMES_HOME under <root>/profiles/<name> — own config.yaml, .env, gateway,
+# and (via the plugin's HERMES_HOME-derived state dir) its own FCM identity —
+# which is how one Hermes instance hosts several Filament agents.
+#
+# Everything below (plugin clone into $HERMES_HOME/plugins, setup wizard, s6
+# restart) keys off HERMES_HOME, so re-pointing it here is the whole
+# mechanism. Deliberately AFTER the lazy-target computation above: venv deps
+# (and the lazy-target .pth on sealed images) are shared machine-wide, and a
+# per-profile lazy dir would clobber the previous profile's .pth on every
+# attach.
+if [ -n "${FILAMENT_PROFILE:-}" ] && [ "$FILAMENT_PROFILE" != default ]; then
+  case "$FILAMENT_PROFILE" in
+    [!a-z0-9]* | *[!a-z0-9_-]*)
+      err "FILAMENT_PROFILE must match [a-z0-9][a-z0-9_-]* (got '$FILAMENT_PROFILE')."
+      ;;
+  esac
+  # HERMES_HOME may itself point INTO a named profile (a re-run from a
+  # profile's environment). Profiles are siblings under the root home, never
+  # nested — climb to the root before creating or targeting one.
+  while [ "$(basename "$(dirname "$HERMES_HOME")")" = profiles ]; do
+    HERMES_HOME="$(dirname "$(dirname "$HERMES_HOME")")"
+  done
+  if [ ! -d "$HERMES_HOME/profiles/$FILAMENT_PROFILE" ]; then
+    command -v hermes >/dev/null 2>&1 \
+      || err "hermes CLI not found — needed to create profile '$FILAMENT_PROFILE'."
+    info "Creating Hermes profile '$FILAMENT_PROFILE' ..."
+    # --clone: the new agent starts as a copy of the instance's DEFAULT
+    # profile. Under the Filament-provisioned flow the default profile is
+    # never itself a connected agent — it is the instance's baseline (the
+    # image's managed provisioning: metered provider, Composio/Brave MCP
+    # surfaces, the managed plugins that teach the agent to use them, plus
+    # any operator customization) — so cloning inherits instance-level
+    # defaults, not another agent's identity. The setup step below
+    # overwrites the cloned Filament identity slots with this agent's own.
+    # --no-alias: no shell wrapper script; this profile is driven by its
+    # supervised gateway, not interactively. On s6 images, creation also
+    # registers the profile's gateway-<name> service, which the restart at
+    # the end of this script then bounces.
+    hermes profile create "$FILAMENT_PROFILE" --no-alias --clone \
+      || err "could not create Hermes profile '$FILAMENT_PROFILE'."
+  fi
+  ROOT_HERMES_HOME="$HERMES_HOME"
+  HERMES_HOME="$HERMES_HOME/profiles/$FILAMENT_PROFILE"
+  export HERMES_HOME
+  info "Installing into Hermes profile '$FILAMENT_PROFILE' ($HERMES_HOME)."
 fi
 
 # --- Install the plugin (as a Hermes directory plugin) -----------------------
@@ -360,26 +429,16 @@ if [ -n "$LAZY_TARGET" ] && [ -d "$LAZY_TARGET" ]; then
   rm -rf "$LAZY_TARGET"/hermes_filament_fcm "$LAZY_TARGET"/hermes_filament_fcm-*.dist-info 2>/dev/null || true
 fi
 
-# Make `hermes` resolvable so the wizard's gateway-restart step works, without
-# shadowing an existing launcher (the Docker shim must stay first on PATH so
-# root `docker exec` sessions keep dropping privileges). When PATH is stripped
-# enough that even the shim is missing, put the shim dir ahead of $VENV/bin —
-# the raw venv entry point run as root would litter $HERMES_HOME with
-# root-owned files and break the supervised gateway.
-if ! command -v hermes >/dev/null 2>&1; then
-  HERMES_PATH_PREFIX="$HERMES_HOME/bin:$VENV/bin"
-  if [ "$VENV" = /opt/hermes/.venv ] && [ -x /opt/hermes/bin/hermes ]; then
-    HERMES_PATH_PREFIX="/opt/hermes/bin:$HERMES_PATH_PREFIX"
-  fi
-  export PATH="$HERMES_PATH_PREFIX:$PATH"
-fi
-
 info "Connecting to Filament ..."
 # Run the setup wizard with the venv Python and the plugin dir (plus any durable
 # dep target) on PYTHONPATH, so `hermes_filament_fcm` imports from the clone.
 # The package is not pip-installed, so there is no console script to run.
 run_setup() {
+  # In the profile (hosted) flow this script owns the gateway restart — an
+  # s6 bounce or the direct spawn below — so the wizard's own restart would
+  # only spend two extra CLI startups getting replaced moments later.
   PYTHONPATH="$PLUGIN_DIR${PYPATH_PREFIX:+:$PYPATH_PREFIX}${PYTHONPATH:+:$PYTHONPATH}" \
+    FILAMENT_SETUP_SKIP_RESTART="${FILAMENT_PROFILE:+1}" \
     "$PY" -m hermes_filament_fcm.setup_cli "$@"
 }
 
@@ -390,6 +449,54 @@ if [ -t 1 ] && [ -r /dev/tty ]; then
   run_setup < /dev/tty
 else
   run_setup
+fi
+
+# For a cloned profile, repair the config after setup: enabling the plugin
+# rewrites config.yaml through Hermes's config layer, which has been seen to
+# drop cloned keys it doesn't own (e.g. custom_providers). Merge back any
+# root-config key the profile lost and union plugins.enabled with the root's
+# (the managed agent37-* plugins carry the guidance for the instance's
+# integrations). No-op when the rewrite preserved everything.
+if [ -n "${FILAMENT_PROFILE:-}" ] && [ -n "${ROOT_HERMES_HOME:-}" ]; then
+  "$PY" - "$ROOT_HERMES_HOME" "$HERMES_HOME" <<'PYEOF' \
+    || warn "could not merge the default profile's config into '$FILAMENT_PROFILE' — \
+its managed integrations may be missing; compare config.yaml against the root profile's."
+import sys
+
+import yaml
+
+root, prof = sys.argv[1], sys.argv[2]
+try:
+    with open(f"{root}/config.yaml") as f:
+        root_cfg = yaml.safe_load(f) or {}
+except OSError:
+    root_cfg = {}
+path = f"{prof}/config.yaml"
+try:
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+except OSError:
+    cfg = {}
+changed = False
+# Per-profile state the clone-repair must never overwrite from the root.
+for key in root_cfg:
+    if key in ("plugins", "onboarding"):
+        continue
+    if key not in cfg:
+        cfg[key] = root_cfg[key]
+        changed = True
+root_enabled = (root_cfg.get("plugins") or {}).get("enabled") or []
+plugins = cfg.setdefault("plugins", {})
+enabled = plugins.setdefault("enabled", [])
+for name in root_enabled:
+    if name not in enabled:
+        enabled.append(name)
+        changed = True
+if changed:
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    print("merged root config keys the setup rewrite had dropped")
+PYEOF
 fi
 
 # --- Force a supervised restart ------------------------------------------
@@ -418,10 +525,18 @@ fi
 restart_slot() {
   [ -d "$1" ] && [ -p "$1/supervise/control" ] || return 1
   info "Restarting supervised gateway ($(basename "$1")) so the plugin loads ..."
+  # -u first: the slot a fresh `hermes profile create` registers is down
+  # until told to start, and -t alone is a no-op on a down service. On an
+  # already-running slot -u is the no-op and -t does the restart.
+  "$S6_SVC" -u "$1" 2>/dev/null || true
   "$S6_SVC" -t "$1" \
     || warn "could not restart $(basename "$1") — restart it manually: $S6_SVC -t $1"
 }
 
+# Whether some live s6 slot took the restart. s6-svc merely being installed
+# is not enough — with no supervised slot for this gateway the direct-spawn
+# and hook paths below must still run, or the profile never starts.
+SUPERVISED=0
 if [ -n "$S6_SVC" ]; then
   # Each profile is an independent HERMES_HOME (the default profile at the
   # root, named ones under <root>/profiles/<name>), and the wizard only
@@ -432,15 +547,60 @@ if [ -n "$S6_SVC" ]; then
     HERMES_PROFILE=default
   fi
 
-  RESTARTED=0
   for SVCDIR in "/run/service/gateway-$HERMES_PROFILE" "/run/service/hermes-gateway-$HERMES_PROFILE"; do
-    if restart_slot "$SVCDIR"; then RESTARTED=1; fi
+    if restart_slot "$SVCDIR"; then SUPERVISED=1; fi
   done
-  if [ "$RESTARTED" = 0 ]; then
+  if [ "$SUPERVISED" = 0 ]; then
     # This provider names its slots differently — restart every live
     # gateway rather than leave the plugin unloaded.
     for SVCDIR in /run/service/gateway-* /run/service/hermes-gateway-*; do
-      restart_slot "$SVCDIR" || true
+      if restart_slot "$SVCDIR"; then SUPERVISED=1; fi
     done
   fi
+fi
+
+# --- Start the profile gateway (no supervised slot) ---------------------------
+# The wizard's restart was skipped above (FILAMENT_SETUP_SKIP_RESTART): with
+# no supervisor, `hermes gateway restart` is two CLI startups (restart, then
+# run) where one will do. Spawn the gateway directly, detached from this
+# session; --replace hands over cleanly if one is somehow already up.
+if [ "$SUPERVISED" = 0 ] && [ -n "${FILAMENT_PROFILE:-}" ]; then
+  SETSID="$(command -v setsid 2>/dev/null || true)"
+  info "Starting the gateway ..."
+  # shellcheck disable=SC2086  # $SETSID intentionally word-splits away when absent
+  $SETSID nohup hermes gateway run --replace \
+    > "$HERMES_HOME/logs/gateway-detached.log" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+fi
+
+# --- Keep profile gateways alive across restarts (no supervised slot) --------
+# Without s6 there is no supervisor for a named profile's gateway: the setup
+# wizard starts it as a plain background process, which dies with the
+# container (restart, sleep/wake, update) while the image's entrypoint only
+# revives the DEFAULT profile's gateway. Agent37's image runs
+# ~/.agent37/hooks/post-restart.sh on every container start for exactly this —
+# install one managed block there that revives the gateway of every Hermes
+# profile connected to Filament. The loop covers all such profiles, so one
+# block serves every agent ever attached; other non-s6 hosts (no hooks dir)
+# are skipped — their operators own gateway supervision.
+AGENT37_HOOK="${AGENT37_HOOKS_DIR:-$HOME/.agent37/hooks}/post-restart.sh"
+if [ "$SUPERVISED" = 0 ] && [ -n "${FILAMENT_PROFILE:-}" ] \
+    && [ -d "$(dirname "$AGENT37_HOOK")" ] \
+    && ! grep -q "filament-hermes profile gateways" "$AGENT37_HOOK" 2>/dev/null; then
+  cat >> "$AGENT37_HOOK" <<'HOOKEOF'
+
+# >>> filament-hermes profile gateways (managed block; do not edit)
+# Revive the gateway of every Hermes profile connected to Filament: their
+# background gateways die with the container, and the entrypoint only
+# supervises the default profile's.
+command -v hermes >/dev/null 2>&1 \
+  || PATH="/usr/local/bin:/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes/hermes-agent/venv/bin:$PATH"
+for _fil_plugin_dir in "${HERMES_HOME:-$HOME/.hermes}"/profiles/*/plugins/filament; do
+  [ -d "$_fil_plugin_dir" ] || continue
+  HERMES_HOME="$(dirname "$(dirname "$_fil_plugin_dir")")" \
+    hermes gateway restart >/dev/null 2>&1 || true
+done
+# <<< filament-hermes profile gateways
+HOOKEOF
+  info "Installed post-restart hook: profile gateways revive on container restarts."
 fi
