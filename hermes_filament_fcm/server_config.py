@@ -122,6 +122,45 @@ def derive_tool_health(
     return None
 
 
+# The server-side inventory store rejects a report over 512 tools or 128 KiB
+# serialized — and an invalid report is dropped whole, names included, not just
+# descriptions. Descriptions borrowed from the Hermes registry (an external MCP
+# server's can run to paragraphs) are therefore truncated per tool, and shed
+# entirely if the assembled report still overflows the byte budget, so a
+# description can never cost the report itself.
+DESCRIPTION_MAX_CHARS = 200
+INVENTORY_BYTE_BUDGET = 120 * 1024  # headroom under the server's 128 KiB cap
+
+
+def truncate_description(text: str, limit: int = DESCRIPTION_MAX_CHARS) -> str:
+    """``text`` with whitespace collapsed, cut to ``limit`` chars on overflow."""
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1].rstrip() + "…"
+
+
+def shed_descriptions_to_budget(
+    entries: "list[dict]", sheddable: "list[dict]", budget: int = INVENTORY_BYTE_BUDGET
+) -> bool:
+    """Drop ``sheddable`` entries' descriptions when ``entries`` overflow ``budget``.
+
+    ``sheddable`` holds the entry dicts (aliases into ``entries``) whose
+    description was borrowed from the registry rather than authored by this
+    plugin — the ones to sacrifice first. All-or-nothing rather than partial:
+    the report is only oversized when several servers' worth of tools are
+    connected, and shedding a fraction would leave which tools keep their
+    description an accident of sort order. Returns True when shedding happened.
+    """
+    if not sheddable:
+        return False
+    if len(json.dumps(entries).encode("utf-8")) <= budget:
+        return False
+    for entry in sheddable:
+        entry.pop("description", None)
+    return True
+
+
 def server_config_disabled() -> bool:
     """True if the ``FILAMENT_SERVER_CONFIG=off`` escape hatch is set.
 
