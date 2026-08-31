@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 
 from ._version import DIST_NAME, PLUGIN_VERSION, version_headers
-from .observability import Stopwatch, get_logger
+from .observability import Stopwatch, current_context, get_logger
 
 logger = logging.getLogger("gateway.filament_fcm")
 slog = get_logger()
