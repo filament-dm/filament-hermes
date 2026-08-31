@@ -35,7 +35,7 @@ from gateway.platforms.base import (
 )
 
 from . import framing, slash, timeline, turn_context
-from ._version import PLUGIN_VERSION
+from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
     FCMConfig,
@@ -77,6 +77,18 @@ from .reactive import (
     reply_thread_for_send,
     sender_is_agent_in_thread,
     unseen_messages,
+)
+from .self_update import (
+    PendingUpgradeStore,
+    build_complete_notice,
+    build_failure_notice,
+    build_start_notice,
+    git_pull,
+    is_git_checkout,
+    on_a_tracking_branch,
+    request_gateway_restart,
+    version_on_disk,
+    working_tree_is_clean,
 )
 from .server_config import ServerConfigSync
 from .status import TurnScope, is_nonconversational_notice
@@ -291,6 +303,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._heartbeat_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task | None = None
         self._update_checker = UpdateChecker(self._credentials)
+        self._pending_upgrade = PendingUpgradeStore(self._credentials)
         # The gateway's event loop, captured in connect(). FCM callbacks (which
         # fire from the firebase-messaging thread) are bridged onto it so all
         # handling — and the shared httpx client — stay on one loop.
@@ -592,6 +605,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # admin nothing to approve until the next restart. _accept_vouch
             # dedupes the overlap this ordering creates instead.
             await self._accept_pending_vouches()
+            await self._announce_completed_upgrade()
 
             self._mark_connected()
 
@@ -1249,6 +1263,156 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # any version seen in that window is marked and will not re-announce
         # after enablement — the next release announces normally.
         self._update_checker.mark_notified(latest)
+
+    # ── Upgrade ─────────────────────────────────────────────────────
+
+    async def _post_backchannel(self, text: str, room_id: str | None = None) -> bool:
+        """Post one plain message to the backchannel. Never raises.
+
+        Returns whether it landed. ``call_tool`` reports a server-side
+        rejection as a returned ``{"error": ...}`` envelope rather than a
+        raise, so ignoring the result would count a rejected post as
+        delivered.
+        """
+        room = room_id or self._cc_room_id
+        if not room:
+            return False
+        try:
+            result = await self._filament_api.post_message(room, text)
+        except Exception:
+            logger.warning("filament-fcm: backchannel post failed", exc_info=True)
+            return False
+        if isinstance(result, dict) and result.get("error"):
+            logger.warning(
+                "filament-fcm: backchannel post rejected: %s", result.get("error")
+            )
+            return False
+        return True
+
+    async def _run_upgrade(self) -> None:
+        """Pull the plugin tree and restart the gateway into it.
+
+        Returns after the restart is requested, and the process that comes
+        back posts the result: succeeding means this one stops existing, so
+        it cannot report its own success.
+        """
+        # No version is named in these: nothing has been pulled yet, so there
+        # is no version to name, and inventing one reads as a real target.
+        if not is_git_checkout():
+            await self._post_backchannel(
+                build_failure_notice(
+                    None,
+                    "this plugin was installed from a package, "
+                    "so there is no repository to pull",
+                )
+            )
+            return
+
+        for precondition in (on_a_tracking_branch, working_tree_is_clean):
+            ok, why = await asyncio.to_thread(precondition)
+            if not ok:
+                await self._post_backchannel(build_failure_notice(None, why))
+                return
+
+        ok, output = await asyncio.to_thread(git_pull)
+        if not ok:
+            logger.error("filament-fcm: upgrade git pull failed: %s", output)
+            await self._post_backchannel(build_failure_notice(None, output))
+            return
+        logger.info("filament-fcm: upgrade pulled: %s", output)
+
+        # What the tree holds now, not what was advertised: a pull that left
+        # us where we were (already current, or a checkout tracking something
+        # other than main) means restarting would change nothing.
+        pulled = version_on_disk()
+        if not pulled or not is_newer(pulled, PLUGIN_VERSION):
+            await self._post_backchannel(
+                f"Already on the latest plugin (v{PLUGIN_VERSION}); nothing to upgrade."
+                if pulled == PLUGIN_VERSION
+                else build_failure_notice(
+                    pulled or "the latest version",
+                    f"the pull left the plugin on v{pulled or 'unknown'} "
+                    "(is this checkout tracking main?)",
+                )
+            )
+            return
+
+        await self._post_backchannel(build_start_notice(pulled))
+        # Written before the restart is requested: after it, there is no "we"
+        # left to write it. The room travels with the marker so the next
+        # process announces where this one announced.
+        if not self._pending_upgrade.save(pulled, self._cc_room_id):
+            # Restarting now would leave the principal with the start notice
+            # and then silence: the process that comes back has nothing to
+            # read. The pulled code is on disk and loads on the next restart.
+            await self._post_backchannel(
+                build_failure_notice(
+                    pulled,
+                    "the new code is installed but the upgrade marker could not "
+                    "be saved, so the restart was left for you to make",
+                )
+            )
+            return
+        if not request_gateway_restart():
+            self._pending_upgrade.clear()
+            await self._post_backchannel(
+                build_failure_notice(
+                    pulled, "the new code is installed but the gateway wouldn't restart"
+                )
+            )
+            return
+        logger.info("filament-fcm: upgrade to v%s staged — gateway restarting", pulled)
+
+    async def _announce_completed_upgrade(self) -> None:
+        """Post the result of an upgrade that restarted us. No-op otherwise.
+
+        Runs on connect, after the send path is live. The marker is cleared
+        whatever the outcome: it describes exactly one restart, and a marker
+        that survived its restart would re-announce on every start.
+        """
+        try:
+            pending = self._pending_upgrade.load()
+        except Exception:
+            # Announcing an upgrade is never worth failing a connect over.
+            logger.warning(
+                "filament-fcm: could not read the pending-upgrade marker",
+                exc_info=True,
+            )
+            return
+        if not pending:
+            return
+        target = pending.get("target_version")
+        room_id = pending.get("room_id") or self._cc_room_id
+        # Cleared unconditionally, before the post: the marker describes
+        # exactly one restart, and one that outlived its restart re-announces
+        # on every connect forever. A lost notice costs the principal one
+        # message they can also read off the agent's version.
+        self._pending_upgrade.clear()
+        # isinstance, not truthiness: a dict-shaped marker holding a non-string
+        # target reaches is_newer, which calls .strip() on it and raises out of
+        # the connect path — every reconnect would fail while the file sat there.
+        if not isinstance(target, str) or not target:
+            return
+        if is_newer(target, PLUGIN_VERSION):
+            # Restarted, but into the old code — the tree was pulled, so this
+            # is a load problem (stale bytecode, a second copy winning on
+            # sys.path), not something a retry fixes.
+            logger.error(
+                "filament-fcm: upgrade to v%s did not take effect — still running v%s",
+                target,
+                PLUGIN_VERSION,
+            )
+            await self._post_backchannel(
+                build_failure_notice(
+                    target, f"after restarting, this agent still runs v{PLUGIN_VERSION}"
+                ),
+                room_id=room_id,
+            )
+            return
+        logger.info("filament-fcm: upgrade to v%s complete", PLUGIN_VERSION)
+        await self._post_backchannel(
+            build_complete_notice(PLUGIN_VERSION), room_id=room_id
+        )
 
     # ── Disconnect ──────────────────────────────────────────────────
 
@@ -1954,10 +2118,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # config document (a /fil- message can't reach this layer to enable
         # it), while opt-out works from slash itself
         # (/fil-config feature slash_commands off).
+        # /fil-upgrade is exempt from the slash_commands flag. The flag is
+        # off by default and turns on through set_feature, which needs a
+        # model turn on a build new enough to have the tool - an agent too
+        # old to be asked is exactly the agent upgrade exists for.
         if (
             slash_body
             and slash.is_fil_command(slash_body)
-            and self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+            and (
+                self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+                or slash.is_always_on(slash_body)
+            )
         ):
             await self._handle_slash_command(msg, slash_body)
             return
@@ -2155,6 +2326,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 other_sources=_other_tool_sources(),
                 features=KNOWN_FEATURES,
             )
+        elif isinstance(result, slash.UpgradeRequest):
+            # Returns after the restart has been requested, so there is no
+            # reply to send here: the process that comes back announces the
+            # result (see _announce_completed_upgrade).
+            await self._run_upgrade()
+            return
         elif isinstance(result, slash.Redirect):
             # A retired old-form invocation: reply-only pointer to the new
             # /fil-config spelling.

@@ -150,7 +150,7 @@ FILLER_WORDS: frozenset[str] = frozenset({"in", "for", "the"})
 # The live command surface, plus the retired pre-consolidation commands —
 # still recognized (exact + fuzzy) so an old-form invocation gets a one-line
 # redirect to the `/fil-config` spelling instead of "unknown command".
-COMMANDS: tuple[str, ...] = ("help", "config")
+COMMANDS: tuple[str, ...] = ("help", "config", "upgrade")
 OLD_COMMANDS: tuple[str, ...] = ("tools", "wake", "guidance", "feature")
 
 LIST_WORD = "list"
@@ -176,6 +176,8 @@ FUZZY_CUTOFF = 0.75
 AMBIGUITY_MARGIN = 0.08
 
 USAGE: dict[str, str] = {
+    "upgrade": "`/fil-upgrade` — pull the latest plugin and restart the "
+    "gateway into it",
     "config": "`/fil-config list` · `/fil-config <channel>` · "
     "`/fil-config <channel> <tool> <on|off>` — `/fil-config help` "
     "for every form",
@@ -199,6 +201,23 @@ def is_fil_command(body: str | None) -> bool:
     software's slash namespace and must fall through to the normal LLM path —
     the adapter's intercept boundary is exactly this predicate."""
     return (body or "").strip().lower().startswith(PREFIX)
+
+
+# Commands that work whether or not the slash surface is switched on. The
+# flag turns on through set_feature, which needs a model turn on a build new
+# enough to have that tool; an agent too old to be asked is the agent
+# upgrade exists for. Upgrade neither reads nor writes agent config, so
+# there is nothing here for the flag to be protecting.
+ALWAYS_ON: tuple[str, ...] = ("upgrade",)
+
+
+def is_always_on(body: str | None) -> bool:
+    """True for a ``/fil-`` command that runs regardless of the feature flag."""
+    text = (body or "").strip().lower()
+    if not text.startswith(PREFIX):
+        return False
+    word = text[len(PREFIX) :].split(maxsplit=1)[0] if text[len(PREFIX) :] else ""
+    return word in ALWAYS_ON
 
 
 def _sanitize(value: str, limit: int = 80) -> str:
@@ -236,6 +255,13 @@ class HelpRequest:
     usable — the adapter answers with the matching help text (``help_for``)."""
 
     command: str | None  # None → the index
+
+
+@dataclass(frozen=True)
+class UpgradeRequest:
+    """``/fil-upgrade`` — pull the plugin tree and restart the gateway into
+    it. Takes no arguments: there is one thing to upgrade to, whatever is on
+    main, and a version argument would only invite a downgrade."""
 
 
 @dataclass(frozen=True)
@@ -786,6 +812,11 @@ def parse(
         )
     if command == "help":
         return HelpRequest(None)
+    if command == "upgrade":
+        # Arguments are not silently ignored: "/fil-upgrade to 0.9" reads
+        # like it pins a version, and answering with help is cheaper than
+        # upgrading to something the principal did not ask for.
+        return UpgradeRequest() if not rest.strip() else HelpRequest("upgrade")
     if command in OLD_COMMANDS:
         return _redirect_old(command, rest.strip(), channels)
     bc_entries = _channel_entries([backchannel]) if backchannel else []
@@ -1287,6 +1318,7 @@ def help_index() -> str:
             "- `/fil-config list` — all channels at a glance",
             "- `/fil-config <channel>` — one channel's full config",
             "- `/fil-config tools list` — the full tool catalog",
+            "- `/fil-upgrade` — pull the latest plugin and restart into it",
             "Say `/fil-config help` for every form.",
         ]
     )
@@ -1399,7 +1431,20 @@ def help_for(
         return help_guidance(channels)
     if command == "feature":
         return help_feature(features)
+    if command == "upgrade":
+        return help_upgrade()
     return help_index()
+
+
+def help_upgrade() -> str:
+    return "\n".join(
+        [
+            "`/fil-upgrade` — pull the latest plugin and restart the gateway into it.",
+            "",
+            "Takes no arguments. I'll tell you when it starts, and again "
+            "once I'm back up on the new version.",
+        ]
+    )
 
 
 # ── Mutation compilation ─────────────────────────────────────────────
