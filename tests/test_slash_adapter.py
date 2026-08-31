@@ -190,12 +190,12 @@ def _make_adapter(tmp_path, monkeypatch, slash_enabled=True):
     return a, api, sync, dispatched
 
 
-def _control_msg(body):
+def _control_msg(body, sender="@irena:fil"):
     return fcm_client.PushMessage(
         event_id="$evt",
         room_id=_CC_ROOM,
         room_name="backchannel",
-        sender="@irena:fil",
+        sender=sender,
         sender_display_name="Irena",
         body=body,
         is_direct=True,
@@ -387,16 +387,84 @@ def test_slash_flag_off_falls_through_to_llm(tmp_path, monkeypatch):
     assert not (tmp_path / "capability_policy.json").exists()
 
 
-def test_non_fil_slash_message_falls_through_to_llm(tmp_path, monkeypatch):
+def test_non_fil_slash_message_is_handed_over_verbatim(tmp_path, monkeypatch):
     # The other direction of the intercept boundary: leading-/ messages
-    # outside the /fil- namespace belong to other software's slash commands
-    # and must NOT be swallowed — they take the normal LLM control path.
+    # outside the /fil- namespace belong to Hermes, which dispatches its own
+    # gateway commands off the raw text before any model turn. They must not
+    # be swallowed, and they must arrive unchanged — a speaker line above the
+    # body, or a breadcrumb prepended to it, and the text is no longer a
+    # command at all.
     a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
-    for body in ("/tools #welcome post off", "/help", "/filament status"):
+    for body in ("/restart", "/tools #welcome post off", "/help"):
         asyncio.run(a._handle_control_message(_control_msg(body)))
-    assert len(dispatched) == 3  # every one reached the LLM path
+    assert len(dispatched) == 3  # every one was handed over
+    assert [e.text for e in dispatched] == [
+        "/restart",
+        "/tools #welcome post off",
+        "/help",
+    ]
     assert api.posted == []  # no deterministic reply
     assert sync.written_back == []  # and no config writes
+
+
+def test_handed_over_command_carries_no_context_of_its_own(tmp_path, monkeypatch):
+    # channel_context is prepended to the body by the framework, so a
+    # breadcrumb would push the slash off the front just as framing would.
+    # An ordinary control message still gets one - that is what stops a cold
+    # session answering "I don't see that" from an empty memory.
+    a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+
+    async def _breadcrumb(room_id, event_id, inline=False):
+        return "[12 earlier messages]"
+
+    a._context_breadcrumb = _breadcrumb
+    asyncio.run(a._handle_control_message(_control_msg("/restart")))
+    asyncio.run(a._handle_control_message(_control_msg("what did I miss?")))
+    assert dispatched[0].channel_context is None
+    assert dispatched[1].channel_context == "[12 earlier messages]"
+
+
+def test_a_leading_mention_does_not_hide_the_command(tmp_path, monkeypatch):
+    # Addressing the agent by name is how people talk to it; the command is
+    # still a command underneath, and Hermes only sees a command when the
+    # slash leads.
+    a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    a._user_id = "@a_bot:fil"
+    asyncio.run(a._handle_control_message(_control_msg("@a_bot:fil /restart")))
+    assert dispatched[0].text == "/restart"
+
+
+def test_only_the_principal_hands_a_command_over(tmp_path, monkeypatch):
+    # The backchannel is the control plane by room, not by speaker: anyone
+    # the principal invites here inherits that authority. A model turn can
+    # decline what it is asked; a gateway command cannot, and it reconfigures
+    # the agent on every platform it serves. So a guest's slash takes the
+    # ordinary path and arrives as prose.
+    a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(
+        a._handle_control_message(_control_msg("/restart", sender="@guest:fil"))
+    )
+    assert dispatched[0].text != "/restart"
+    assert dispatched[0].text.endswith("/restart")
+
+
+def test_an_unknown_owner_hands_nothing_over(tmp_path, monkeypatch):
+    # Before get_self lands there is no owner to compare against; fail
+    # closed rather than treat an unidentified sender as the principal.
+    a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    a._owner_id = None
+    asyncio.run(a._handle_control_message(_control_msg("/restart")))
+    assert dispatched[0].text != "/restart"
+
+
+def test_ordinary_control_message_is_still_framed(tmp_path, monkeypatch):
+    # The hand-over is only for foreign slashes: a normal instruction still
+    # gets the speaker line that tells the model who is talking.
+    a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(a._handle_control_message(_control_msg("restart the gateway")))
+    text = dispatched[0].text
+    assert text != "restart the gateway"
+    assert text.endswith("restart the gateway")
 
 
 if __name__ == "__main__":
