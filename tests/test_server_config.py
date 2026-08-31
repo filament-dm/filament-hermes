@@ -701,3 +701,47 @@ def test_pending_write_back_rides_along_with_the_next_push(tmp_path):
     assert cfg["instructions"] == "Local truth."
     assert cfg["feature_flags"] == {"advanced_tool_controls": True}
     assert (tmp_path / "instructions.md").read_text() == "Local truth."
+
+
+# ── Inventory description budget ─────────────────────────────────────
+
+
+def test_truncate_description_collapses_whitespace_and_cuts():
+    short = "Fetch a thread (root + replies) by the root message id."
+    assert server_config.truncate_description(short) == short
+
+    messy = "Line one.\n\n    Line   two."
+    assert server_config.truncate_description(messy) == "Line one. Line two."
+
+    long = "word " * 100
+    cut = server_config.truncate_description(long)
+    assert len(cut) <= server_config.DESCRIPTION_MAX_CHARS
+    assert cut.endswith("…")
+
+
+def test_shed_descriptions_noop_under_budget():
+    entries = [{"name": "a", "origin": "mcp-x", "description": "d"}]
+    sheddable = [entries[0]]
+    assert server_config.shed_descriptions_to_budget(entries, sheddable) is False
+    assert entries[0]["description"] == "d"
+
+
+def test_shed_descriptions_strips_only_borrowed_on_overflow():
+    own = {"name": "post_message", "origin": "filament", "description": "ours"}
+    borrowed = [
+        {"name": f"t{i}", "origin": "mcp-x", "description": "x" * 200}
+        for i in range(700)
+    ]
+    entries = [own, *borrowed]
+    assert server_config.shed_descriptions_to_budget(entries, borrowed) is True
+    assert all("description" not in e for e in borrowed)
+    # This plugin's own descriptions are never shed.
+    assert own["description"] == "ours"
+
+
+def test_shed_descriptions_noop_without_sheddable_entries():
+    # Nothing borrowed → nothing to shed, even over budget (matches today's
+    # report, which the server demonstrably accepts).
+    entries = [{"name": "a", "origin": "filament", "description": "x" * 300000}]
+    assert server_config.shed_descriptions_to_budget(entries, []) is False
+    assert "description" in entries[0]

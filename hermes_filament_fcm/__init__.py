@@ -54,7 +54,12 @@ from .reactive import (
     capability_denies,
     is_auto_bundle_name,
 )
-from .server_config import ServerConfigSync, derive_tool_health
+from .server_config import (
+    ServerConfigSync,
+    derive_tool_health,
+    shed_descriptions_to_budget,
+    truncate_description,
+)
 from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
 from .status import enabled as status_enabled
 from .status import pre_tool_call_hook as status_pre_tool_call
@@ -312,8 +317,9 @@ def register(ctx: Any) -> None:
     api = FilamentAPI(mcp_url, mcp_token)
 
     # Descriptions of every tool this plugin registers, collected as they are
-    # registered below. Feeds the tool-inventory report to the server (the
-    # registry knows only names) and the registry-less fallback inventory.
+    # registered below. Feeds the tool-inventory report to the server (taking
+    # precedence over the registry's copy for our own tools) and the
+    # registry-less fallback inventory.
     tool_descriptions: dict[str, str] = {}
 
     # Server-held config document sync: ONE instance shared by the adapter
@@ -497,12 +503,17 @@ def _tool_inventory(
     Enumerates every tool name the process has registered via the same
     registry read ``get_capabilities`` uses — Filament tools and any other
     plugin's alike. Origin is "filament" for this plugin's own toolset, the
-    toolset name otherwise; descriptions ride along where this plugin knows
-    them (the registry itself stores only names per toolset). Connector-backed
-    tools also carry ``health`` (see ``derive_tool_health``): the Filament
-    toolset from this plugin's own session state, MCP toolsets from Hermes'
-    per-server status. If the registry is unreadable, fall back to the tools
-    this plugin registered itself.
+    toolset name otherwise. Descriptions come from this plugin's own records
+    for the tools it registered, and from the registry's ``ToolEntry`` for
+    every other toolset — external MCP servers' included, whose registration
+    carries the server-advertised description. Borrowed descriptions are
+    truncated, and shed entirely if the report would overflow the server's
+    size cap (an oversize report is rejected whole — losing every name, not
+    just descriptions). Connector-backed tools also carry ``health`` (see
+    ``derive_tool_health``): the Filament toolset from this plugin's own
+    session state, MCP toolsets from Hermes' per-server status. If the
+    registry is unreadable, fall back to the tools this plugin registered
+    itself.
     """
     filament_connected: bool | None = None
     if api is not None:
@@ -516,6 +527,7 @@ def _tool_inventory(
         from tools.registry import registry  # noqa: PLC0415
 
         entries: list[dict] = []
+        borrowed: list[dict] = []
         for ts in sorted(registry.get_registered_toolset_names()):
             origin = "filament" if ts == "filament" else str(ts)
             for name in sorted(registry.get_tool_names_for_toolset(ts)):
@@ -523,10 +535,21 @@ def _tool_inventory(
                 desc = descriptions.get(name)
                 if desc:
                     entry["description"] = desc
+                else:
+                    reg_desc = _registry_description(registry, name)
+                    if reg_desc:
+                        entry["description"] = reg_desc
+                        borrowed.append(entry)
                 health = derive_tool_health(str(ts), statuses, filament_connected)
                 if health is not None:
                     entry["health"] = health
                 entries.append(entry)
+        if shed_descriptions_to_budget(entries, borrowed):
+            logger.warning(
+                "filament-fcm: tool inventory over size budget — dropped %d "
+                "registry-sourced descriptions",
+                len(borrowed),
+            )
         return entries
     except Exception:
         logger.debug(
@@ -543,6 +566,25 @@ def _tool_inventory(
                 entry["health"] = fallback_health
             entries.append(entry)
         return entries
+
+
+def _registry_description(registry: Any, name: str) -> "str | None":
+    """A foreign tool's description from the Hermes registry, truncated.
+
+    ``ToolEntry`` stores the description passed at registration — for MCP
+    toolsets that is the server-advertised one — so tools this plugin did not
+    register still report a usable description. External descriptions can run
+    to paragraphs while the report only labels a settings row, hence the
+    truncation. Defensive like the registry read in ``_tool_inventory``: any
+    incompatibility yields ``None``, a name-only entry as before.
+    """
+    try:
+        raw = getattr(registry.get_entry(name), "description", None)
+    except Exception:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return truncate_description(raw)
 
 
 def _mcp_server_statuses() -> dict[str, Any]:
