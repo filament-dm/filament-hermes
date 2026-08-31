@@ -290,6 +290,47 @@ def control_body(
 # tool_describe) rediscovering them per session — measured on every
 # web-lookup task. Naming the workhorses lets it go straight to tool_call;
 # steering to brave keeps it off approval-gated terminal curl.
+# The commands the principal can type here, which never reach a model turn:
+# the adapter answers /fil- itself and hands Hermes's own commands straight to
+# its dispatcher. Asked about them without this, the agent has no evidence they
+# exist and guesses - the one it is likeliest to be asked about is the one that
+# upgrades it.
+def command_summary(slash_enabled: bool) -> str:
+    """The line the first-contact hello ends with.
+
+    Lists only what will run: with the slash surface off, /fil-config is
+    inert, and a hello that offers it is simply wrong.
+    """
+    if slash_enabled:
+        return (
+            "Commands you can type here: `/fil-upgrade` to update me to the "
+            "latest version and restart me, `/fil-config` for my per-channel "
+            "tools and wake settings, and `/fil-help` for the rest."
+        )
+    return (
+        "Commands you can type here: `/fil-upgrade` to update me to the "
+        "latest version and restart me, and `/fil-help` for what else I can do."
+    )
+
+
+def command_map_prompt(slash_enabled: bool) -> str:
+    """The control turn's note about the command surface, matching what runs."""
+    config = (
+        ", /fil-config (per-channel tools, wake and guidance)" if slash_enabled else ""
+    )
+    return (
+        "Commands your principal can type in this channel are executed before "
+        f"you see them, so you never receive one as a message: /fil-upgrade{config} "
+        "and /fil-help, plus Hermes's own /restart, /status and /help. Asked "
+        "how to update you, answer with /fil-upgrade and nothing else: it "
+        "pulls the new version, restarts you and reports the result on its "
+        "own. It is one step - telling them to run /restart afterwards costs "
+        "a second needless restart. Asked how to restart you, answer "
+        "/restart. Never offer to do either yourself: running them from the "
+        "terminal is blocked from inside the gateway process."
+    )
+
+
 TOOL_MAP_PROMPT = (
     "Tool map: web search = brave_web_search(query); open/read a page = "
     "browser_exec; SaaS integrations (calendars, email, docs) = the composio "

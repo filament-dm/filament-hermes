@@ -215,9 +215,17 @@ def test_fetch_latest_version_default_url(monkeypatch):
 def test_build_reminder_mentions_versions():
     note = update_check.build_reminder("0.2.0", "0.1.0")
     assert "0.2.0" in note and "0.1.0" in note
-    # The plugin is a directory plugin now, so the update instruction is the
-    # `hermes plugins update` command (not a pip/repo URL).
-    assert "hermes plugins update" in note
+
+
+def test_build_reminder_offers_the_command_not_a_shell():
+    # The reminder is read in the backchannel, where /fil-upgrade does the
+    # whole job. A shell command asks the principal to leave the app, find
+    # the host and paste something - and `hermes gateway restart` in
+    # particular restarts the gateway in the foreground of that terminal.
+    note = update_check.build_reminder("0.2.0", "0.1.0")
+    assert "/fil-upgrade" in note
+    assert "hermes plugins update" not in note
+    assert "gateway restart" not in note
 
 
 # ── filament_api: client survives a disconnect/reconnect cycle ───────

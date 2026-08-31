@@ -206,18 +206,39 @@ def is_fil_command(body: str | None) -> bool:
 # Commands that work whether or not the slash surface is switched on. The
 # flag turns on through set_feature, which needs a model turn on a build new
 # enough to have that tool; an agent too old to be asked is the agent
-# upgrade exists for. Upgrade neither reads nor writes agent config, so
-# there is nothing here for the flag to be protecting.
-ALWAYS_ON: tuple[str, ...] = ("upgrade",)
+# upgrade exists for. Help belongs here for the same reason from the other
+# side: it is what tells the principal the surface exists, and the
+# first-contact hello points at it. Neither reads nor writes agent config,
+# so there is nothing here for the flag to be protecting.
+ALWAYS_ON: tuple[str, ...] = ("upgrade", "help")
+
+
+def offered_commands(slash_enabled: bool) -> tuple[str, ...]:
+    """The ``/fil-`` commands that will actually run right now.
+
+    With the surface switched off only the exempt ones do, so anything that
+    tells the principal what they can type has to ask. Naming a command that
+    silently does nothing is worse than not naming it.
+    """
+    return COMMANDS if slash_enabled else ALWAYS_ON
 
 
 def is_always_on(body: str | None) -> bool:
-    """True for a ``/fil-`` command that runs regardless of the feature flag."""
+    """True for a ``/fil-`` command that runs regardless of the feature flag.
+
+    Resolved through the same fuzzy matcher ``parse`` uses: the parser accepts
+    ``/fil-upgrad``, so a stricter gate here would send exactly that spelling
+    to the model while the exact one ran deterministically.
+    """
     text = (body or "").strip().lower()
     if not text.startswith(PREFIX):
         return False
-    word = text[len(PREFIX) :].split(maxsplit=1)[0] if text[len(PREFIX) :] else ""
-    return word in ALWAYS_ON
+    rest = text[len(PREFIX) :]
+    word = rest.split(maxsplit=1)[0] if rest else ""
+    if not word:
+        return False
+    command, _candidates = _match_word(word, COMMANDS + OLD_COMMANDS)
+    return command in ALWAYS_ON
 
 
 def _sanitize(value: str, limit: int = 80) -> str:

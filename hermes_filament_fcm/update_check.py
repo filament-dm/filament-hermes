@@ -48,14 +48,12 @@ def update_check_disabled() -> bool:
 def build_reminder(latest: str, current: str) -> str:
     """The small backchannel note shown to the principal."""
     return (
-        f"📦 A new version of the Filament↔Hermes plugin is available: "
-        f"v{latest} (this agent runs v{current}). To update, run on the "
-        f"machine hosting this agent:\n"
-        f"```\nhermes plugins update filament && hermes gateway restart\n```\n"
-        f"That pulls the plugin's vendored dependencies along with its code, so "
-        f"it is the whole update. If it reports any problem, re-run the connect "
-        f"command from the Filament app instead — it replaces the plugin outright "
-        f"rather than updating it in place, so it recovers from any state."
+        f"📦 Filament↔Hermes plugin v{latest} is available (this agent runs "
+        f"v{current}). Reply `/fil-upgrade` and I'll pull it, restart, and "
+        f"tell you when I'm back.\n\n"
+        f"If that reports a problem, re-run the connect command from the "
+        f"Filament app instead — it replaces the plugin outright rather than "
+        f"updating it in place, so it recovers from any state."
     )
 
 

@@ -88,9 +88,29 @@ class TestFeatureFlagExemption:
     def test_upgrade_runs_with_the_flag_off(self):
         assert slash.is_always_on("/fil-upgrade") is True
 
+    def test_help_runs_with_the_flag_off_too(self):
+        # It is what tells the principal the surface exists, and the
+        # first-contact hello points at it - inert by default makes that
+        # hello a lie.
+        assert slash.is_always_on("/fil-help") is True
+
     def test_the_config_surface_does_not(self):
         assert slash.is_always_on("/fil-config #welcome post off") is False
-        assert slash.is_always_on("/fil-help") is False
+
+    def test_a_fuzzy_spelling_is_exempt_too(self):
+        # parse() accepts /fil-upgrad, so a stricter gate here would send
+        # exactly that spelling to the model while the exact one ran
+        # deterministically.
+        assert slash.is_always_on("/fil-upgrad") is True
+        assert isinstance(slash.parse("/fil-upgrad", channels=[]), slash.UpgradeRequest)
+
+    def test_the_exemption_is_gated_on_the_owner(self):
+        # /fil-upgrade pulls code and restarts the gateway. The backchannel
+        # is the control plane by room, not by speaker, so a guest must not
+        # inherit a deterministic command that cannot decline.
+        body = _adapter_body("_handle_control_message")
+        assert "slash.is_always_on(slash_body) and is_owner" in body
+        assert body.index("is_owner =") < body.index("slash.is_always_on")
 
     def test_a_foreign_slash_is_not_ours_to_exempt(self):
         assert slash.is_always_on("/restart") is False
@@ -250,6 +270,162 @@ class TestPostResult:
         body = _adapter_body("_post_backchannel")
         assert 'result.get("error")' in body
         assert "return False" in body
+
+
+class TestTheAgentKnowsTheSurfaceExists:
+    """A /fil- command is answered before any turn, so the model never sees
+    one and has no evidence the surface exists. Asked "can you upgrade
+    yourself", it guesses - and the observed guess was "that's not a command
+    I run", about the command that upgrades it."""
+
+    def _prompt(self, slash_enabled: bool = False) -> str:
+        framing = _load("framing")
+        return framing.command_map_prompt(slash_enabled)
+
+    def test_it_names_the_upgrade_command(self):
+        assert "/fil-upgrade" in self._prompt()
+
+    def test_it_names_the_restart_command(self):
+        assert "/restart" in self._prompt()
+
+    def test_it_says_upgrade_is_one_step(self):
+        # Observed live: the agent advised /fil-upgrade "then /restart".
+        # /fil-upgrade already restarts, so that is a second needless bounce
+        # at the moment an agent is least robust.
+        prompt = self._prompt()
+        assert "one step" in prompt
+        assert "restarts you" in prompt
+
+    def test_it_says_the_terminal_is_not_the_route(self):
+        # The terminal is blocked from inside the gateway, and an agent that
+        # tries anyway either refuses confusingly or claims a restart it did
+        # not perform.
+        assert "terminal" in self._prompt()
+
+    def test_the_control_turn_carries_it(self):
+        body = _adapter_body("_handle_control_message")
+        assert "command_map_prompt" in body
+
+    def test_a_handed_over_command_does_not_carry_it(self):
+        # Nothing about a gateway command reaches a model turn, so there is
+        # no prompt to attach.
+        body = _adapter_body("_handle_control_message")
+        assert body.index("if not gateway_command:") < body.index("command_map_prompt")
+
+    def test_it_offers_config_only_when_config_works(self):
+        # /fil-config is inert while the surface is off; naming it would have
+        # the agent recommend a command that does nothing.
+        assert "/fil-config" in self._prompt(slash_enabled=True)
+        assert "/fil-config" not in self._prompt(slash_enabled=False)
+
+
+class TestFailureMessages:
+    """What the principal reads when an upgrade cannot run. Observed live: a
+    failed pull printed several hundred "[new branch]" lines into the
+    backchannel with the real error buried at the bottom, under the heading
+    "Couldn't upgrade to vthe latest version"."""
+
+    def test_no_version_is_named_when_none_is_known(self):
+        # Nothing has been pulled yet, so there is no version to name.
+        notice = build_failure_notice(None, "no repository to pull")
+        assert "vthe latest" not in notice
+        assert "Couldn't upgrade:" in notice
+
+    def test_a_known_version_is_still_named(self):
+        assert "v0.11.0" in build_failure_notice("0.11.0", "something broke")
+
+    def test_fetch_chatter_is_stripped(self):
+        noisy = "\n".join(
+            ["From https://github.com/filament-dm/filament-hermes"]
+            + [f" * [new branch] b{i} -> origin/b{i}" for i in range(400)]
+            + ["You are not currently on a branch.", "See git-pull(1) for details."]
+        )
+        summary = self_update.git_error_summary(noisy)
+        assert "[new branch]" not in summary
+        assert "not currently on a branch" in summary
+
+    def test_the_reason_is_capped(self):
+        assert len(self_update.git_error_summary("x" * 5000)) <= 300
+
+    def test_a_failure_notice_stays_readable(self):
+        noisy = "\n".join(f" * [new branch] b{i} -> origin/b{i}" for i in range(400))
+        notice = build_failure_notice(None, noisy + "\nfatal: refusing to merge")
+        assert len(notice) < 600
+        assert "refusing to merge" in notice
+
+
+class TestDetachedHead:
+    """FILAMENT_FCM_REF accepts a commit as well as a branch, and installing
+    at a commit leaves a detached HEAD where git pull cannot work at all."""
+
+    def _repo(self, tmp_path, detach: bool):
+        def git(*a):
+            subprocess.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "T")
+        (tmp_path / "pyproject.toml").write_text('version = "0.1.0"\n')
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        if detach:
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=tmp_path,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            git("checkout", "-q", head)
+        return tmp_path
+
+    def test_a_branch_checkout_can_pull(self, tmp_path):
+        ok, _why = self_update.on_a_tracking_branch(self._repo(tmp_path, False))
+        assert ok is True
+
+    def test_a_detached_head_is_named_not_attempted(self, tmp_path):
+        ok, why = self_update.on_a_tracking_branch(self._repo(tmp_path, True))
+        assert ok is False
+        assert "fixed commit" in why
+
+    def test_the_upgrade_checks_it_before_pulling(self):
+        body = _adapter_body("_run_upgrade")
+        assert "on_a_tracking_branch" in body
+        assert body.index("on_a_tracking_branch") < body.index("git_pull")
+
+
+class TestWhereTheCommandsAreNamed:
+    """The commands are handled before any turn, so the model never sees one
+    and cannot be relied on to describe them. The two messages every
+    principal reads - the first hello, and the update alert - state them
+    directly instead."""
+
+    def test_the_first_hello_names_them(self):
+        framing = _load("framing")
+        for enabled in (True, False):
+            line = framing.command_summary(enabled)
+            assert "/fil-upgrade" in line
+            assert "/fil-help" in line
+
+    def test_the_hello_offers_config_only_when_it_works(self):
+        framing = _load("framing")
+        assert "/fil-config" in framing.command_summary(True)
+        assert "/fil-config" not in framing.command_summary(False)
+
+    def test_the_hello_asks_the_flag(self):
+        body = _adapter_body("_maybe_greet")
+        assert "command_summary" in body
+        assert "FEATURE_SLASH_COMMANDS" in body
+
+    def test_the_update_alert_offers_the_command(self):
+        update_check = _load("update_check")
+        note = update_check.build_reminder("0.2.0", "0.1.0")
+        assert "/fil-upgrade" in note
+
+    def test_the_update_alert_does_not_send_them_to_a_shell(self):
+        update_check = _load("update_check")
+        note = update_check.build_reminder("0.2.0", "0.1.0")
+        assert "gateway restart" not in note
 
 
 class TestNotices:

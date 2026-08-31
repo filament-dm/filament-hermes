@@ -684,7 +684,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     markdown_body=(
                         "👋 Connected and ready. This is our private channel — "
                         "give me a task, ask me anything, or invite me into a "
-                        "channel."
+                        "channel.\n\n"
+                        # Named here rather than left for the model to
+                        # remember: they are handled before any turn, so the
+                        # one place they are certain to be stated correctly
+                        # is a message the model does not write. Which ones
+                        # depends on the flag - offering an inert command is
+                        # worse than not offering it.
+                        + framing.command_summary(
+                            self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+                        )
                     ),
                 )
                 slog.info(
@@ -2122,12 +2131,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # off by default and turns on through set_feature, which needs a
         # model turn on a build new enough to have the tool - an agent too
         # old to be asked is exactly the agent upgrade exists for.
+        # The backchannel is the control plane by room, not by speaker.
+        # /fil-upgrade pulls code and restarts the gateway, so the always-on
+        # exemption is gated the same way the gateway hand-over below is: a
+        # guest keeps exactly the authority they had, which is to ask a model
+        # that can decline.
+        is_owner = self._owner_id is not None and msg.sender == self._owner_id
         if (
             slash_body
             and slash.is_fil_command(slash_body)
             and (
                 self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
-                or slash.is_always_on(slash_body)
+                or (slash.is_always_on(slash_body) and is_owner)
             )
         ):
             await self._handle_slash_command(msg, slash_body)
@@ -2148,7 +2163,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # a gateway command cannot, and reconfigures the agent on every
         # platform it serves. So the hand-over asks who is speaking, and a
         # sender we cannot identify as the owner takes the ordinary path.
-        is_owner = self._owner_id is not None and msg.sender == self._owner_id
         gateway_command = (
             slash_body.startswith("/")
             and not slash.is_fil_command(slash_body)
@@ -2190,7 +2204,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # suppress: test doubles build plain dict sources.
         if not gateway_command:
             with contextlib.suppress(AttributeError):
-                source.channel_prompt = framing.TOOL_MAP_PROMPT
+                source.channel_prompt = (
+                    f"{framing.TOOL_MAP_PROMPT}\n\n"
+                    + framing.command_map_prompt(
+                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+                    )
+                )
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel
         # timeline may hold context this session never saw. Flag the count so
