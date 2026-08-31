@@ -1961,20 +1961,45 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         ):
             await self._handle_slash_command(msg, slash_body)
             return
-        body = self._strip_mention(msg.body) if msg.body else msg.body
-        # The push never includes attachments (ENG-603): describe any media on
-        # the event so the agent knows it exists (an uncaptioned image would
-        # otherwise arrive as an empty message).
-        body = framing.append_note(body, await self._media_note(msg))
-        # Name the speaker in the turn's framing (see framing.control_body:
-        # the principal is recognized by server-attributed id, never by
-        # display name).
-        body = framing.control_body(
-            body=body,
-            sender=msg.sender,
-            sender_display_name=msg.sender_display_name,
-            owner_id=self._owner_id,
+        # A leading-slash body that is not ours belongs to Hermes: it
+        # dispatches its own gateway commands (/restart, /status, ...) off the
+        # raw text, before any model turn. Those only work while the text is
+        # still exactly what the principal typed - a speaker line above it,
+        # or a context breadcrumb prepended to it, and the body stops being a
+        # command and becomes prose for the model. So this path adds none of
+        # it. The check is independent of the slash_commands flag: /fil- is
+        # ours whether or not the flag is on, and Hermes has no such command.
+        #
+        # The principal only. This room is the control plane by virtue of
+        # being the backchannel, not by who is speaking - anyone the
+        # principal invites here inherits that authority. Everything else in
+        # the control plane still passes through a model that can decline;
+        # a gateway command cannot, and reconfigures the agent on every
+        # platform it serves. So the hand-over asks who is speaking, and a
+        # sender we cannot identify as the owner takes the ordinary path.
+        is_owner = self._owner_id is not None and msg.sender == self._owner_id
+        gateway_command = (
+            slash_body.startswith("/")
+            and not slash.is_fil_command(slash_body)
+            and is_owner
         )
+        if gateway_command:
+            body = slash_body
+        else:
+            body = self._strip_mention(msg.body) if msg.body else msg.body
+            # The push never includes attachments (ENG-603): describe any media
+            # on the event so the agent knows it exists (an uncaptioned image
+            # would otherwise arrive as an empty message).
+            body = framing.append_note(body, await self._media_note(msg))
+            # Name the speaker in the turn's framing (see framing.control_body:
+            # the principal is recognized by server-attributed id, never by
+            # display name).
+            body = framing.control_body(
+                body=body,
+                sender=msg.sender,
+                sender_display_name=msg.sender_display_name,
+                owner_id=self._owner_id,
+            )
         # In the backchannel we default to replying on the main timeline: a
         # top-level message (msg.thread_id is None) gets a normal channel reply,
         # while a message the principal posted *inside* a thread keeps the reply
@@ -1992,15 +2017,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Ephemeral tool map (system prompt, never persisted): saves the
         # model the tool_search/tool_describe discovery rounds. See framing.
         # suppress: test doubles build plain dict sources.
-        with contextlib.suppress(AttributeError):
-            source.channel_prompt = framing.TOOL_MAP_PROMPT
+        if not gateway_command:
+            with contextlib.suppress(AttributeError):
+                source.channel_prompt = framing.TOOL_MAP_PROMPT
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel
         # timeline may hold context this session never saw. Flag the count so
         # the agent reads it instead of answering "I don't see that" from an
         # empty memory. The framework prepends channel_context to the body.
-        breadcrumb = await self._context_breadcrumb(
-            msg.room_id, msg.event_id, inline=True
+        breadcrumb = (
+            None
+            if gateway_command
+            else await self._context_breadcrumb(msg.room_id, msg.event_id, inline=True)
         )
         event = MessageEvent(
             text=body,
