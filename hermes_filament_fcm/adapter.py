@@ -738,14 +738,23 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 user_name=self._owner_name or self._owner_id,
                 message_id=trigger_id,
             )
+            policy, policy_set_keys = self._wake_policy.read_with_provenance()
             with contextlib.suppress(AttributeError):
-                source.channel_prompt = framing.TOOL_MAP_PROMPT
+                source.channel_prompt = (
+                    f"{framing.TOOL_MAP_PROMPT}\n\n"
+                    + framing.wake_policy_prompt(policy, policy_set_keys)
+                )
             event = MessageEvent(
                 text=(
                     "[system: You just connected and posted a canned hello in "
-                    "your backchannel. Follow it with ONE short line (no "
-                    "greeting, no tools) telling your principal two or three "
-                    "concrete things you can do for them.]"
+                    "your backchannel. Follow it with ONE short message (no "
+                    "greeting, no tools): a line with two or three concrete "
+                    "things you can do for your principal; then, from the "
+                    "wake policy in your system prompt, one plain sentence on "
+                    "when you wake in shared channels; then one offer — they "
+                    "can have emoji reactions wake you, or set any of it per "
+                    "channel, just by asking here (e.g. 'wake on 🐞 reactions "
+                    "in the bug channel').]"
                 ),
                 message_type=MessageType.TEXT,
                 source=source,
@@ -2258,14 +2267,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         # Ephemeral tool map (system prompt, never persisted): saves the
         # model the tool_search/tool_describe discovery rounds. See framing.
+        # The wake-policy rendering rides along, read fresh like every other
+        # policy consumer, so questions about wake behavior are answered from
+        # the values in force this turn — control plane only: on a data turn
+        # it would hand the trigger configuration to every participant.
         # suppress: test doubles build plain dict sources.
         if not gateway_command:
+            policy, policy_set_keys = self._wake_policy.read_with_provenance()
             with contextlib.suppress(AttributeError):
                 source.channel_prompt = (
                     f"{framing.TOOL_MAP_PROMPT}\n\n"
                     + framing.command_map_prompt(
                         self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
                     )
+                    + "\n\n"
+                    + framing.wake_policy_prompt(policy, policy_set_keys)
                 )
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel

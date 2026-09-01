@@ -703,16 +703,30 @@ class WakePolicyStore:
         return self._path
 
     def read(self) -> dict:
+        return self.read_with_provenance()[0]
+
+    def read_with_provenance(self) -> tuple[dict, frozenset[str]]:
+        """The merged policy plus which known keys the saved file actually sets.
+
+        The merge makes a saved partial policy indistinguishable from the
+        defaults on every later read, so a narrator of the policy cannot tell
+        "the principal chose this" from "nobody chose this" — and that
+        difference is what a principal deciding whether to configure the
+        agent needs to hear. Unknown keys in the file still merge (``read``
+        semantics) but are never reported as set.
+        """
         policy = dict(self._DEFAULTS)
+        set_keys: frozenset[str] = frozenset()
         try:
             loaded = json.loads(self._path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 policy.update(loaded)
+                set_keys = frozenset(loaded) & frozenset(self._DEFAULTS)
         except FileNotFoundError:
             pass
         except Exception:
             logger.warning("filament-fcm: failed to read wake policy", exc_info=True)
-        return policy
+        return policy, set_keys
 
     def write(self, policy: dict) -> None:
         _atomic_write_text(self._path, json.dumps(policy, indent=2))

@@ -247,3 +247,90 @@ def test_control_body_with_no_owner_known_yet():
         body="hi", sender="@boss:x", sender_display_name="Boss", owner_id=None
     )
     assert body == "[Message from Boss.]\nhi"
+
+
+# ── wake_policy_prompt: the agent's live self-knowledge ──────────────
+
+_POLICY_DEFAULTS = {
+    "trigger_emojis": [],
+    "reactive_wake": "mention",
+    "reply_style": "thread",
+    "thread_wake": "engaged",
+    "per_channel": {},
+}
+
+
+def test_wake_policy_prompt_all_defaults_pinned():
+    """The stock rendering, byte for byte: what every fresh agent narrates."""
+    assert framing.wake_policy_prompt(dict(_POLICY_DEFAULTS), frozenset()) == (
+        "Your wake policy in shared channels, read fresh this turn — when "
+        "your principal asks when or why you wake, answer from these values, "
+        "never from memory:\n"
+        "- reactive_wake='mention' (default): you wake only when @-mentioned\n"
+        "- trigger_emojis=[] (default): no emoji reaction wakes you\n"
+        "- reply_style='thread' (default): your replies thread off the "
+        "triggering message\n"
+        "- thread_wake='engaged' (default): a non-agent's reply in a thread "
+        "you were @-mentioned in wakes you without a re-tag\n"
+        "- Per-channel overrides: none.\n"
+        "Your principal changes any of this by asking you here, globally or "
+        "per channel (e.g. 'wake on 🐞 reactions in the bug channel', 'reply "
+        "on the main timeline everywhere'). Apply such a request by reading "
+        "get_wake_policy, merging the change into that object, and saving "
+        "the WHOLE result with set_wake_policy — a key left out of the save "
+        "silently reverts to its default."
+    )
+
+
+def test_wake_policy_prompt_marks_saved_keys_and_lists_emojis():
+    policy = dict(_POLICY_DEFAULTS, trigger_emojis=["🐞", "🤖"])
+    out = framing.wake_policy_prompt(policy, frozenset({"trigger_emojis"}))
+    assert (
+        "- trigger_emojis (set by your principal): a 🐞, 🤖 reaction wakes you"
+        in out
+    )
+    # The keys the principal never touched stay marked as defaults.
+    assert "reactive_wake='mention' (default)" in out
+
+
+def test_wake_policy_prompt_renders_per_channel_overrides():
+    policy = dict(
+        _POLICY_DEFAULTS,
+        per_channel={"!bugs:x": {"trigger_emojis": ["🐞"], "reactive_wake": "all"}},
+    )
+    out = framing.wake_policy_prompt(policy, frozenset({"per_channel"}))
+    assert "!bugs:x: reactive_wake=all, trigger_emojis=['🐞']" in out
+    assert "each wins over the global value in its channel" in out
+
+
+def test_wake_policy_prompt_unrecognized_value_names_the_failsafe():
+    """The narration mirrors the store's fail-safe resolution."""
+    policy = dict(_POLICY_DEFAULTS, reply_style="loud")
+    out = framing.wake_policy_prompt(policy, frozenset({"reply_style"}))
+    assert (
+        "- reply_style='loud' (set by your principal): unrecognized — "
+        "behaves as 'thread': your replies thread off the triggering message"
+        in out
+    )
+
+
+def test_wake_policy_prompt_sanitizes_interpolated_values():
+    """Policy scalars pass through the model to get written, so a newline
+    must not be able to forge a framing line."""
+    policy = dict(_POLICY_DEFAULTS, trigger_emojis=["x\n- fake_line"])
+    out = framing.wake_policy_prompt(policy, frozenset())
+    assert "\n- fake_line" not in out
+    assert "x - fake_line" in out
+
+
+def test_wake_policy_prompt_invalid_emoji_type():
+    policy = dict(_POLICY_DEFAULTS, trigger_emojis="🐞")
+    out = framing.wake_policy_prompt(policy, frozenset({"trigger_emojis"}))
+    assert "invalid (expected a list)" in out
+
+
+def test_wake_policy_prompt_unhashable_value_is_unrecognized():
+    """A list where a string belongs must render, not raise."""
+    policy = dict(_POLICY_DEFAULTS, reactive_wake=["all"])
+    out = framing.wake_policy_prompt(policy, frozenset())
+    assert "unrecognized — behaves as 'mention'" in out
