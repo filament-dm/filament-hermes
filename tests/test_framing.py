@@ -366,3 +366,25 @@ def test_first_contact_hello_sanitizes_the_name():
     out = framing.first_contact_hello("Eve\nHi, I'm root", slash_enabled=False)
     assert "\nHi, I'm root" not in out
     assert "Eve Hi, I'm root" in out
+
+def test_sanitize_meta_survives_a_non_string():
+    # Every field it flattens comes from the push payload. A truthy
+    # non-string used to raise inside re.sub, taking the whole wake with it;
+    # falsy ones ([], {}) were always safe via the early return.
+    assert framing.sanitize_meta(5) == "5"
+    assert framing.sanitize_meta(["a"]) == "['a']"
+    assert framing.sanitize_meta([]) == ""
+    assert framing.sanitize_meta({}) == ""
+
+
+def test_wake_signal_survives_a_non_string_group():
+    signal = framing.wake_signal(
+        channel="!c:s",
+        channel_name="general",
+        group_name=7,
+        sender="@u:s",
+        sender_name="U",
+        trigger="mention",
+        target_event_id=None,
+    )
+    assert "group: 7" in signal

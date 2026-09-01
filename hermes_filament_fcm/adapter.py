@@ -60,6 +60,7 @@ from .reactive import (
     FEATURE_SHARED_CHANNEL_SESSIONS,
     FEATURE_SLASH_COMMANDS,
     KNOWN_FEATURES,
+    SERVER_GUIDE_POINTER,
     CapabilityPolicyStore,
     ChannelCursorStore,
     ChannelInstructionsStore,
@@ -78,6 +79,7 @@ from .reactive import (
     reply_thread_for_send,
     sender_is_agent_in_thread,
     unseen_messages,
+    write_server_guide_skill,
 )
 from .self_update import (
     PendingUpgradeStore,
@@ -339,6 +341,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # reconnects. See _maybe_greet.
         self._greet_pending: bool = False
         self._cc_room_id: str | None = None
+
+        # Whether the filament-links skill is on disk and current for the
+        # server we are connected to. Set by _initialize_api on every connect;
+        # gates the one-line pointer in the turn envelope. Lives as long as the
+        # connection: the guide is static for it, and every reactive turn after
+        # the first needs the pointer just as much as the first did.
+        self._server_guide_ready: bool = False
 
         # ENG-429 two-phase: the connect token is valid before the agent account
         # exists ("reserved"). While reserved, every tool returns -32002 and
@@ -790,13 +799,22 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             logger.info("filament-fcm: [Stage 1] MCP session established")
             slog.info("filament_fcm.stage.complete", stage="initialize_api")
 
-            # First-contact greeting is server-gated: the initialize response
-            # carries a one-shot directive in `instructions` only while a hello
-            # is due. Detect it here; act on it after connect (see _maybe_greet).
+            # The initialize response's `instructions` is the server describing
+            # itself: how Filament is organized, and how to write member and
+            # channel links so the agent never has to hand a principal a raw
+            # id. It also carries a one-shot first-contact directive while a
+            # hello is due. Keep the text for the turn framing (see
+            # _server_guidance) and read the greeting gate off it.
             instructions = ""
             if isinstance(init, dict):
                 instructions = (init.get("result") or {}).get("instructions", "") or ""
             self._greet_pending = "First contact:" in instructions
+            # Static reference: written once as a skill, whose index line the
+            # system prompt carries. Not into the envelope, which repeats in
+            # session history on every wake.
+            self._server_guide_ready = write_server_guide_skill(
+                self._server_guidance_text(instructions)
+            )
 
             # Learn our own user ID (for mention stripping), the
             # principal's user ID (for the sender allowlist), and the
@@ -1956,17 +1974,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         ):
             logger.info(
                 "filament-fcm: skipping message in %s (wake policy: not woken; "
-                "mention=%s, everyone=%s, thread_follow_up=%s)",
+                "mention=%s, everyone=%s, thread_follow_up=%s, "
+                "reply_to_me=%s)",
                 msg.room_name,
                 mentioned,
                 msg.is_everyone_mention,
                 thread_follow_up,
+                msg.is_reply_to_me,
             )
             slog.info(
                 "filament_fcm.turn.skipped",
                 turn_id=turn_id,
                 reason="wake_policy",
                 mentioned=mentioned,
+                is_reply_to_me=msg.is_reply_to_me,
             )
             return
 
@@ -2001,6 +2022,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         await self._wake(
             channel=msg.room_id,
             channel_name=msg.room_name,
+            group_name=msg.loop_name,
             sender=msg.sender,
             sender_name=msg.sender_display_name or msg.sender,
             trigger="message",
@@ -2013,6 +2035,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             raw=msg.raw,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
+
+    @staticmethod
+    def _server_guidance_text(instructions: str) -> str:
+        """The server's self-description, minus the one-shot greeting.
+
+        The initialize text explains how Filament is organized and how to
+        write member and channel links. The first-contact directive is a
+        one-time instruction to say hello, so it is cut: it belongs to a
+        single turn, not to standing reference material.
+        """
+        text = instructions or ""
+        marker = "First contact:"
+        if marker in text:
+            text = text.split(marker, 1)[0]
+        return text.strip()
 
     async def _context_breadcrumb(
         self,
@@ -2639,6 +2676,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         *,
         channel: str,
         channel_name: str,
+        group_name: str | None = None,
         sender: str,
         sender_name: str,
         trigger: str,
@@ -2653,7 +2691,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         standing instructions + any per-channel guidance + the event data,
         framed so the data is acted upon per the instructions but never
         treated as instructions to the agent."""
-        instructions = self._instructions_store.read_effective()
+        instructions = self._instructions_store.read_effective(
+            SERVER_GUIDE_POINTER if self._server_guide_ready else ""
+        )
         # Trusted framing line, present only when the waking sender IS the
         # principal. Both ids are server-attributed (sender from the push
         # payload, owner from get_self at connect) — never message content or
@@ -2664,6 +2704,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         signal = framing.wake_signal(
             channel=channel,
             channel_name=channel_name,
+            group_name=group_name,
             sender=sender,
             sender_name=sender_name,
             trigger=trigger,
