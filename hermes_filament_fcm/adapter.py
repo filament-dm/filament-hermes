@@ -1314,12 +1314,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 latest,
                 self_update.plugin_root().name,
             )
-            self._update_checker.mark_blocked(outcome.disk_version or latest)
-            if self._update_checker.should_remind(latest) and (
+            blocked_version = outcome.disk_version or latest
+            self._update_checker.mark_blocked(blocked_version)
+            # The disabled warning has its own once-per-incident marker: a
+            # generic reminder already sent for this release (an earlier
+            # failed attempt) must not swallow the one note that carries the
+            # re-enable instructions.
+            if self._update_checker.should_warn_blocked(blocked_version) and (
                 await self._post_backchannel_note(
                     build_update_disabled_note(latest, self_update.plugin_root().name)
                 )
             ):
+                self._update_checker.mark_blocked_notified(blocked_version)
+                # The disabled note supersedes the generic reminder for this
+                # release — don't follow it up with "please update manually".
                 self._update_checker.mark_notified(latest)
         else:  # SKIPPED / FAILED — fall back to the manual reminder.
             logger.info(

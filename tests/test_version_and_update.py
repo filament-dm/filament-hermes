@@ -244,6 +244,29 @@ def test_reconcile_blocked_clears_on_newer_running_version(tmp_path):
     assert checker.blocked_version() == "0.2.0"
 
 
+def test_disabled_warning_is_independent_of_the_generic_reminder(tmp_path):
+    # Day 1: auto-update fails transiently and the generic reminder for
+    # 0.2.0 goes out (mark_notified). Day 2: the retry pulls 0.2.0 but the
+    # scan disables the plugin — the security warning with the re-enable
+    # instructions must still be owed, on its own once-per-incident marker.
+    checker, _ = _checker(tmp_path)
+    checker.mark_notified("0.2.0")
+    assert checker.should_warn_blocked("0.2.0")
+
+    checker.mark_blocked("0.2.0")
+    checker.mark_blocked_notified("0.2.0")
+    assert not checker.should_warn_blocked("0.2.0")
+    # Survives a restart (same store).
+    checker2, _ = _checker(tmp_path)
+    assert not checker2.should_warn_blocked("0.2.0")
+
+    # Resolving the incident clears the warning marker with the block, so a
+    # future incident announces again.
+    checker2.reconcile_blocked("0.2.0")
+    assert checker2.blocked_version() is None
+    assert checker2.should_warn_blocked("0.2.0")
+
+
 def test_blocked_marker_survives_unwritable_state_file(tmp_path):
     # If update_notice.json can't be written, the block must still hold for
     # this process's lifetime — losing it would let the next daily check

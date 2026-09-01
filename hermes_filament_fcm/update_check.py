@@ -156,6 +156,10 @@ class UpdateChecker:
         # exactly the window the block protects (once the process restarts
         # externally, a disabled plugin doesn't load and this code is gone).
         self._blocked_in_memory: str | None = None
+        # Same treatment for the "disabled warning already delivered"
+        # marker, so an unwritable file only costs at most one repeat note
+        # per process rather than a daily one.
+        self._blocked_notified_in_memory: str | None = None
 
     async def check(self) -> str | None:
         """The newer version on main, or None. Returns it on EVERY check —
@@ -222,6 +226,22 @@ class UpdateChecker:
         value = self._state().get("blocked_version")
         return value if isinstance(value, str) else None
 
+    def should_warn_blocked(self, version: str) -> bool:
+        """Whether the security-scan-disabled warning for ``version`` is
+        still owed.
+
+        Tracked separately from ``should_remind``: a generic reminder for
+        the same release (from an earlier failed attempt) must not swallow
+        the one note that carries the re-enable instructions.
+        """
+        if self._blocked_notified_in_memory == version:
+            return False
+        return self._state().get("blocked_notified_version") != version
+
+    def mark_blocked_notified(self, version: str) -> None:
+        self._blocked_notified_in_memory = version
+        self._merge_state(blocked_notified_version=version)
+
     def reconcile_blocked(self, running_version: str) -> None:
         """Clear a stale blocked marker.
 
@@ -238,4 +258,5 @@ class UpdateChecker:
             blocked == running_version or is_newer(running_version, blocked)
         ):
             self._blocked_in_memory = None
-            self._merge_state(blocked_version=None)
+            self._blocked_notified_in_memory = None
+            self._merge_state(blocked_version=None, blocked_notified_version=None)
