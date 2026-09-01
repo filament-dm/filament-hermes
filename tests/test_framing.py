@@ -388,3 +388,16 @@ def test_wake_signal_survives_a_non_string_group():
         target_event_id=None,
     )
     assert "group: 7" in signal
+
+
+def test_wake_policy_prompt_channel_gloss_names_the_threaded_exception():
+    """reply_style='channel' still threads a reply whose trigger is already
+    inside a thread (WakePolicyStore.reply_style); the narration must not
+    promise otherwise."""
+    policy = dict(_POLICY_DEFAULTS, reply_style="channel")
+    out = framing.wake_policy_prompt(policy, frozenset({"reply_style"}))
+    assert (
+        "- reply_style='channel' (set by your principal): your replies land "
+        "on the main timeline, unless the triggering message is already "
+        "inside a thread — that reply stays threaded" in out
+    )

@@ -378,7 +378,10 @@ _WAKE_MODE_GLOSS = {
 
 _REPLY_STYLE_GLOSS = {
     "thread": "your replies thread off the triggering message",
-    "channel": "your replies land on the main timeline",
+    "channel": (
+        "your replies land on the main timeline, unless the triggering "
+        "message is already inside a thread — that reply stays threaded"
+    ),
 }
 
 _THREAD_WAKE_GLOSS = {
