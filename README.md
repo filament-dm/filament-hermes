@@ -64,3 +64,12 @@ To update:
 ```
 hermes plugins update filament && hermes gateway restart
 ```
+
+Usually there's nothing to run: the plugin checks for a new version daily and
+updates itself when it safely can — the tree is the installed directory plugin
+on `main` with no local edits — running exactly the command above (so Hermes's
+post-update security scan applies) and restarting the gateway, with a note to
+the principal's backchannel. When it can't update itself, it posts the manual
+reminder instead. Set `FILAMENT_DISABLE_AUTO_UPDATE=true` to keep the reminders
+but never auto-update, or `FILAMENT_DISABLE_UPDATE_CHECK=true` to turn the
+whole check off.

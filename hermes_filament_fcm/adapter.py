@@ -34,8 +34,8 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, slash, timeline, turn_context
-from ._version import PLUGIN_VERSION
+from . import framing, self_update, slash, timeline, turn_context
+from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
     FCMConfig,
@@ -81,7 +81,13 @@ from .reactive import (
 from .server_config import ServerConfigSync
 from .status import TurnScope, is_nonconversational_notice
 from .status import publisher as status_publisher
-from .update_check import UpdateChecker, build_reminder, update_check_disabled
+from .update_check import (
+    UpdateChecker,
+    build_reminder,
+    build_update_disabled_note,
+    build_updated_note,
+    update_check_disabled,
+)
 
 # Use the gateway logger hierarchy so messages appear in gateway.log.
 # Marker written into config.extra alongside the plugin-managed session
@@ -1212,20 +1218,134 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def _update_check_loop(self, interval_seconds: int = 86400) -> None:
         """Once now and then daily: is a newer plugin version on main?
 
-        A newer version always logs a warning (UpdateChecker.check); the
-        backchannel reminder to the principal fires at most once per new
-        version, persisted across restarts (update_notice.json).
+        A newer version always logs a warning (UpdateChecker.check). The
+        plugin then updates itself when it safely can (self_update.py) and
+        restarts the gateway to load the new code; when it can't, the
+        backchannel reminder to the principal fires instead, at most once per
+        new version, persisted across restarts (update_notice.json).
         """
+        # A stale "scan disabled the pulled version" block clears itself once
+        # that version is what's running (a human re-enabled + restarted).
+        self._update_checker.reconcile_blocked(PLUGIN_VERSION)
         while True:
             try:
                 newer = await self._update_checker.check()
                 if newer:
-                    await self._notify_update_available(newer)
+                    await self._handle_update_available(newer)
+                else:
+                    # Heals a pulled-but-never-restarted tree (spawn failed,
+                    # machine died mid-restart): the notified marker keeps
+                    # check() quiet, so re-attempt the restart from here.
+                    await asyncio.to_thread(self._maybe_finish_pending_update)
             except Exception:
                 logger.debug("filament-fcm: update check failed", exc_info=True)
             await asyncio.sleep(interval_seconds)
 
-    async def _notify_update_available(self, latest: str) -> None:
+    async def _handle_update_available(self, latest: str) -> None:
+        """Auto-update to ``latest`` when possible, else post the reminder.
+
+        Ordering on success: note first (the restart kills this process, so
+        it can't be told about afterwards), then the notified marker, then
+        the restart. A DISABLED outcome must never restart — the plugin left
+        Hermes's enabled set, so the running code is all the agent has.
+        """
+        if self_update.auto_update_disabled():
+            await self._notify_update_available(latest)
+            return
+        if self._update_checker.blocked_version():
+            await self._notify_update_available(
+                latest,
+                reason=(
+                    "a previously pulled version was disabled by the Hermes "
+                    "security scan — review and re-enable the plugin first"
+                ),
+            )
+            return
+        outcome = await asyncio.to_thread(
+            self_update.attempt_update, latest, PLUGIN_VERSION
+        )
+        if outcome.status == self_update.UPDATED:
+            logger.warning(
+                "filament-fcm: auto-updated plugin to v%s (running v%s) — "
+                "restarting the gateway to load it",
+                outcome.disk_version,
+                PLUGIN_VERSION,
+            )
+            await self._post_backchannel_note(
+                build_updated_note(outcome.disk_version or latest, PLUGIN_VERSION)
+            )
+            self._update_checker.mark_notified(latest)
+            if not self_update.spawn_gateway_restart():
+                await self._post_backchannel_note(
+                    "⚠️ The update is installed but I couldn't restart the "
+                    "gateway to load it. On the machine hosting this agent, "
+                    "run:\n```\nhermes gateway restart\n```"
+                )
+        elif outcome.status == self_update.DISABLED:
+            logger.error(
+                "filament-fcm: auto-update pulled v%s but the security scan "
+                "disabled the plugin — NOT restarting; re-enable with "
+                "`hermes plugins enable %s`",
+                latest,
+                self_update.plugin_root().name,
+            )
+            self._update_checker.mark_blocked(outcome.disk_version or latest)
+            if await self._post_backchannel_note(
+                build_update_disabled_note(latest, self_update.plugin_root().name)
+            ):
+                self._update_checker.mark_notified(latest)
+        else:  # SKIPPED / FAILED — fall back to the manual reminder.
+            logger.info(
+                "filament-fcm: auto-update not possible (%s) — reminding instead",
+                outcome.reason,
+            )
+            await self._notify_update_available(latest, reason=outcome.reason)
+
+    def _maybe_finish_pending_update(self) -> None:
+        """Restart the gateway when a newer version sits on disk unloaded.
+
+        Blocking (git subprocesses) — runs in a thread. The eligibility gate
+        keeps this away from dev checkouts (where a hand-bumped pyproject
+        must not bounce the gateway), and a scan-blocked pull never restarts.
+        """
+        if self_update.auto_update_disabled():
+            return
+        root = self_update.plugin_root()
+        on_disk = self_update.disk_version(root)
+        if not on_disk or not is_newer(on_disk, PLUGIN_VERSION):
+            return
+        if self._update_checker.blocked_version() == on_disk:
+            return
+        if self_update.eligibility_reason(root) is not None:
+            return
+        logger.warning(
+            "filament-fcm: plugin v%s is on disk but v%s is running — "
+            "restarting the gateway to load it",
+            on_disk,
+            PLUGIN_VERSION,
+        )
+        self_update.spawn_gateway_restart()
+
+    async def _post_backchannel_note(self, text: str) -> bool:
+        """Post an operational note to the principal's backchannel.
+
+        Returns True only on confirmed delivery. Without a backchannel
+        there's nowhere to post — callers fall back to their log lines.
+        """
+        if not self._cc_room_id:
+            return False
+        result = await self._filament_api.post_message(self._cc_room_id, text)
+        if isinstance(result, dict) and result.get("error"):
+            logger.warning(
+                "filament-fcm: backchannel note failed to send: %s",
+                result.get("error"),
+            )
+            return False
+        return True
+
+    async def _notify_update_available(
+        self, latest: str, reason: str | None = None
+    ) -> None:
         """Post the small update reminder to the principal's backchannel.
 
         Marked as notified only after the post succeeds, so a failed
@@ -1233,16 +1353,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         there's nowhere to remind — the warning already logged by
         UpdateChecker.check is the whole reminder then.
         """
-        if not self._cc_room_id:
-            return
-        result = await self._filament_api.post_message(
-            self._cc_room_id, build_reminder(latest, PLUGIN_VERSION)
-        )
-        if isinstance(result, dict) and result.get("error"):
-            logger.warning(
-                "filament-fcm: update reminder failed to send: %s",
-                result.get("error"),
-            )
+        if not await self._post_backchannel_note(
+            build_reminder(latest, PLUGIN_VERSION, reason=reason)
+        ):
             return
         # Only successful delivery is recorded: a failed post retries on the
         # next daily check. While delivery was disabled this still ran, so

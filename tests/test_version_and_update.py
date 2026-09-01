@@ -9,6 +9,7 @@ a declared dependency of the package): run with `uvx --with httpx pytest`.
 import asyncio
 import importlib.util
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -212,12 +213,64 @@ def test_fetch_latest_version_default_url(monkeypatch):
     assert _fetch_with_fake_httpx(monkeypatch) == _version.LATEST_PYPROJECT_URL
 
 
+def test_blocked_state_roundtrip_and_merge(tmp_path):
+    # The blocked marker (scan disabled a pulled version) and the notified
+    # marker share update_notice.json — writing one must not clobber the
+    # other, and both must survive a restart.
+    checker, _ = _checker(tmp_path)
+    checker.mark_notified("0.2.0")
+    checker.mark_blocked("0.2.0")
+    checker2, _ = _checker(tmp_path)
+    assert checker2.blocked_version() == "0.2.0"
+    assert checker2._state().get("notified_version") == "0.2.0"
+
+    # Running a *different* version leaves the block in place ...
+    checker2.reconcile_blocked("0.1.0")
+    assert checker2.blocked_version() == "0.2.0"
+    # ... running the blocked version means a human re-enabled the plugin
+    # and restarted, so the block clears (and the notified marker stays).
+    checker2.reconcile_blocked("0.2.0")
+    assert checker2.blocked_version() is None
+    assert checker2._state().get("notified_version") == "0.2.0"
+
+
+def test_blocked_version_ignores_corrupt_values(tmp_path):
+    (tmp_path / "update_notice.json").write_text('{"blocked_version": 7}')
+    checker, _ = _checker(tmp_path)
+    assert checker.blocked_version() is None
+
+
 def test_build_reminder_mentions_versions():
     note = update_check.build_reminder("0.2.0", "0.1.0")
     assert "0.2.0" in note and "0.1.0" in note
     # The plugin is a directory plugin now, so the update instruction is the
     # `hermes plugins update` command (not a pip/repo URL).
     assert "hermes plugins update" in note
+
+
+def test_build_reminder_carries_the_auto_update_reason():
+    note = update_check.build_reminder(
+        "0.2.0", "0.1.0", reason="the working tree has local changes"
+    )
+    assert "the working tree has local changes" in note
+    # Without a reason the reminder reads exactly as before.
+    assert update_check.build_reminder("0.2.0", "0.1.0", reason=None).endswith(
+        "any state."
+    )
+
+
+def test_build_updated_note_mentions_versions_and_manual_fallback():
+    note = update_check.build_updated_note("0.2.0", "0.1.0")
+    assert "0.2.0" in note and "0.1.0" in note
+    # If the restart never takes, the note is the principal's only pointer.
+    assert "hermes gateway restart" in note
+
+
+def test_build_update_disabled_note_says_not_restarting():
+    note = update_check.build_update_disabled_note("0.2.0", "filament")
+    assert "0.2.0" in note
+    assert "NOT restarting" in note
+    assert "hermes plugins enable filament" in note
 
 
 # ── filament_api: client survives a disconnect/reconnect cycle ───────
@@ -320,12 +373,14 @@ def test_adapter_imports_what_the_reminder_delivery_uses():
     # The delivery block was once commented out and the import cleanup took
     # build_reminder with it; re-enabling then raised a NameError that the
     # update-check loop swallowed at debug level — the reminder silently
-    # never sent. Pin the import to the usage.
+    # never sent. Pin the import to the usage, for every note builder.
     adapter_src = (_PKG_DIR / "adapter.py").read_text()
-    if "build_reminder(" in adapter_src:
-        import_line = next(
-            line
-            for line in adapter_src.splitlines()
-            if line.startswith("from .update_check import")
-        )
-        assert "build_reminder" in import_line
+    match = re.search(
+        r"from \.update_check import \(?([^)]*?)(?:\)|\n\n)", adapter_src, re.DOTALL
+    )
+    assert match, "adapter.py no longer imports from .update_check"
+    imported = match.group(1)
+    builders = ("build_reminder", "build_updated_note", "build_update_disabled_note")
+    for builder in builders:
+        if f"{builder}(" in adapter_src:
+            assert builder in imported, f"{builder} used but not imported"
