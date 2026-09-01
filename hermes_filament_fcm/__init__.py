@@ -1158,8 +1158,7 @@ def _register_reactive_tools(
     )
     _reg(
         "get_wake_policy",
-        "Show the current wake policy. Read this before editing with "
-        "set_wake_policy.",
+        "Show the current wake policy. Read this before editing with set_wake_policy.",
         _empty,
         _get_wake_policy,
     )

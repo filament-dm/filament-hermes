@@ -430,13 +430,11 @@ def wake_policy_prompt(policy: dict, set_keys: frozenset) -> str:
     if isinstance(emojis, list) and emojis:
         shown = ", ".join(sanitize_meta(str(e), limit=16) for e in emojis)
         emoji_line = (
-            f"trigger_emojis ({mark('trigger_emojis')}): a {shown} "
-            "reaction wakes you"
+            f"trigger_emojis ({mark('trigger_emojis')}): a {shown} reaction wakes you"
         )
     elif emojis is None or emojis == []:
         emoji_line = (
-            f"trigger_emojis=[] ({mark('trigger_emojis')}): no emoji "
-            "reaction wakes you"
+            f"trigger_emojis=[] ({mark('trigger_emojis')}): no emoji reaction wakes you"
         )
     else:
         emoji_line = (
