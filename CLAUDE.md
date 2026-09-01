@@ -65,6 +65,18 @@ Load-bearing invariants:
 - Untrusted metadata (display names, room names) interpolated into framing text must be sanitized (`_sanitize_meta`) — it's an injection surface.
 - The boundary has two layers: soft (framing text + zone classification, always on) and hard (the `pre_tool_call` capability gate, **opt-in**). The hard layer is gated behind the `advanced_tool_controls` feature flag (`FeatureFlagStore`, default OFF): a fresh install behaves exactly as before (data turns ungated, full tools, no tool hint). The principal turns it on conversationally from the backchannel ("enable the advanced tool controls feature" → the `set_feature` tool writes `feature_flags.json`); the next turn honors it, no restart. When ON, the adapter pins the turn's capability grant per data turn from `CapabilityPolicyStore.resolve(channel, sender)` and injects the tool hint; the hook denies any tool outside that set. When OFF, the adapter leaves the grant `None` (= ungated) and injects no hint, so the always-registered hook is inert. The grant is also `None` for control turns (full capability). Treat the framing, the zone classification, the feature flag, AND the capability policy/gate as security-sensitive.
 
+## Reading server payloads
+
+Account for the whole payload. When code reads a response the server sends — the
+MCP `initialize` result, a push branch, a tool result, the config document —
+every field is either consumed or named as deliberately ignored. A value read
+only for a substring or boolean test is a discard: say in a comment what else is
+in it and why that part is dropped. This is not style. The `initialize` response
+carries the server's own explanation of Filament plus the link/mention authoring
+guide, and it was read for one substring and thrown away, so agents never learned
+to write `[Name](channel:!id:server)` and asked principals to paste raw ids
+instead.
+
 ## Server-side agent config sync (`server_config.py`)
 
 The server holds one revisioned config document per agent on bearer-authenticated side-channels next to `/mcp/agents/heartbeat` (`GET`/`PUT /mcp/agents/config`, same token). Its only allowed top-level sections map 1:1, **verbatim**, onto the reactive-store files: `capability_policy` / `wake_policy` / `feature_flags` / `channel_instructions` (the JSON file contents; `channel_instructions` maps room id → per-channel guidance string, injected into the data-plane envelope as `[YOUR GUIDANCE FOR THIS CHANNEL]`) and `instructions` (the instructions file text as a string). The sync is **fetch-and-apply**: at startup (before the FCM listener starts, so the first push already runs against server policy) and per wake (TTL-cached, ≤5s) the adapter GETs the document and writes each present section to the corresponding store file atomically, so every read-fresh-per-event consumer picks it up unchanged — resolution semantics are byte-identical whether config came from disk or server, and the local files remain the working copy the turn path actually reads.

@@ -232,3 +232,54 @@ def test_restart_after_stop_rearms_death_detection():
         await client.stop()
 
     asyncio.run(scenario())
+
+
+def test_push_message_carries_reply_and_group_signals():
+    # The server sends both on every channel/DM push; dropping them left the
+    # agent unable to say which group a channel is in, and blind to the
+    # server's own "this is addressed to you" answer.
+    branch = {
+        "type": "channel_message",
+        "event_id": "$e1",
+        "channel": "#welcome",
+        "sender": "Alice",
+        "sender_id": "@alice:fil",
+        "content": {"text": "hi"},
+        "is_mention_of_recipient": False,
+        "is_reply_to_recipient": True,
+        "loop_name": "Morlocks",
+    }
+    msg = fcm_client.PushMessage(
+        event_id="$e1",
+        room_id="!r:fil",
+        room_name="#welcome",
+        sender="@alice:fil",
+        sender_display_name="Alice",
+        body="hi",
+        is_direct=False,
+        branch_type="channel_message",
+        thread_id=None,
+        is_mention=False,
+        is_everyone_mention=False,
+        raw={},
+        is_reply_to_me=bool(branch.get("is_reply_to_recipient", False)),
+        loop_name=branch.get("loop_name"),
+    )
+    assert msg.is_reply_to_me is True
+    assert msg.loop_name == "Morlocks"
+    # Defaults keep older constructors (and the invite/vouch paths) working.
+    bare = fcm_client.PushMessage(
+        event_id="$e2",
+        room_id="!r:fil",
+        room_name="#welcome",
+        sender="@bob:fil",
+        sender_display_name="Bob",
+        body="yo",
+        is_direct=False,
+        branch_type="channel_message",
+        thread_id=None,
+        is_mention=False,
+        is_everyone_mention=False,
+        raw={},
+    )
+    assert bare.is_reply_to_me is False and bare.loop_name is None

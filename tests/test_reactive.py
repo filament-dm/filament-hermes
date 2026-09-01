@@ -1234,3 +1234,116 @@ class TestUnseenMessages:
         assert crumb is not None and "2 " in crumb
         unseen, _ = reactive.unseen_messages(msgs, trigger_event_id="$trig")
         assert len(unseen) == 2
+
+
+def test_server_guide_skill_leaves_a_users_own_file_alone():
+    # The skills directory is the principal's. A file at this name that the
+    # plugin did not author is neither rewritten nor deleted - overwriting it
+    # on every connect, or unlinking it when the server sends nothing, would
+    # destroy their work silently and permanently.
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        skill = home / "skills" / reactive.SERVER_GUIDE_SKILL / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: filament-links\nauthor: Irena\n---\nMine.")
+
+        assert reactive.write_server_guide_skill("server text", home) is False
+        assert skill.read_text().endswith("Mine.")
+
+        # And the empty-response cleanup does not reach it either.
+        assert reactive.write_server_guide_skill("", home) is False
+        assert skill.exists()
+
+
+def test_server_guide_skill_survives_an_undecodable_file():
+    # UnicodeDecodeError is a ValueError, so an OSError-only handler would let
+    # it escape into connect and abort initialization. An unreadable file is
+    # also not ours, so it is left alone rather than replaced.
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        skill = home / "skills" / reactive.SERVER_GUIDE_SKILL / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_bytes(b"\xff\xfe not utf-8 at all")
+
+        assert reactive.write_server_guide_skill("server text", home) is False
+        assert skill.read_bytes().startswith(b"\xff\xfe")
+
+
+def test_server_guide_skill_replaces_its_own_file():
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        assert reactive.write_server_guide_skill("first", home) is True
+        skill = home / "skills" / reactive.SERVER_GUIDE_SKILL / "SKILL.md"
+        assert "first" in skill.read_text()
+        # A rewrite on the next connect is the normal path.
+        assert reactive.write_server_guide_skill("second", home) is True
+        assert "second" in skill.read_text()
+        # An empty response clears the cache it owns.
+        assert reactive.write_server_guide_skill("", home) is False
+        assert not skill.exists()
+
+
+def test_read_effective_carries_a_pointer_not_the_guide():
+    # The envelope is the turn's user message, so it repeats in session
+    # history on every wake: it carries a one-line pointer, and the guide
+    # itself lives in a skill the system prompt indexes once.
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.InstructionsStore(Path(d) / "instructions.md")
+        store.write("Only ever reply with a dad joke.")
+        effective = store.read_effective(reactive.SERVER_GUIDE_POINTER)
+        assert reactive.CORE_RULES in effective
+        assert reactive.SERVER_GUIDE_POINTER in effective
+        assert "dad joke" in effective
+        # Ordering: safety rules first, then the pointer, then the
+        # principal's editable text - a pointer can never displace a rule.
+        assert effective.index(reactive.CORE_RULES) < effective.index(
+            reactive.SERVER_GUIDE_POINTER
+        )
+        assert effective.index(reactive.SERVER_GUIDE_POINTER) < effective.index(
+            "dad joke"
+        )
+        # The pointer is small: the guide it points at is ~1.3KB.
+        assert len(reactive.SERVER_GUIDE_POINTER) < 250
+        # No pointer (pre-skill, or an older server) leaves framing unchanged.
+        assert store.read_effective() == f"{reactive.CORE_RULES}\n\n{store.read()}"
+
+
+def test_server_guide_skill_written_where_the_prompt_indexes_it():
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        guide = "Links and mentions - use [Name](channel:!id:server)."
+        assert reactive.write_server_guide_skill(guide, hermes_home=home) is True
+        skill = home / "skills" / reactive.SERVER_GUIDE_SKILL / "SKILL.md"
+        assert skill.is_file()
+        text = skill.read_text()
+        # Frontmatter is what the skills index reads; the body is the guide.
+        assert text.startswith("---\n")
+        assert f"name: {reactive.SERVER_GUIDE_SKILL}" in text
+        assert "description:" in text
+        assert guide in text
+        # Rewritten on every connect, so a server-side edit lands without an
+        # install step.
+        rewritten = reactive.write_server_guide_skill(f"{guide} v2", hermes_home=home)
+        assert rewritten is True
+        assert "v2" in skill.read_text()
+
+
+def test_empty_guide_removes_a_stale_skill():
+    """A skill this server did not send must not survive the connect.
+
+    The skills index in the system prompt advertises the file whether or not
+    the envelope points at it, so leaving one behind offers another server's
+    syntax as if it were current.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        assert reactive.write_server_guide_skill("old server guide", hermes_home=home)
+        skill = home / "skills" / reactive.SERVER_GUIDE_SKILL / "SKILL.md"
+        assert skill.is_file()
+        assert reactive.write_server_guide_skill("", hermes_home=home) is False
+        assert not skill.exists()
+
+
+def test_empty_guide_is_a_no_op_when_no_skill_exists():
+    with tempfile.TemporaryDirectory() as d:
+        assert reactive.write_server_guide_skill("", hermes_home=Path(d)) is False

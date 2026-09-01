@@ -570,15 +570,121 @@ class InstructionsStore:
         logger.info("filament-fcm: no standing instructions found — using fallback")
         return self._FALLBACK
 
-    def read_effective(self) -> str:
-        """The full instruction text for a reactive turn: core rules composed on
-        top of the editable layer. Use this to frame a turn; use ``read`` when
-        showing or editing the principal's customizable instructions."""
-        return f"{CORE_RULES}\n\n{self.read()}"
+    def read_effective(self, server_pointer: str = "") -> str:
+        """The full instruction text for a reactive turn: core rules and, when
+        present, a one-line pointer to the server's authoring guide, composed
+        on top of the editable layer. Use this to frame a turn; use ``read``
+        when showing or editing the principal's customizable instructions.
+
+        The pointer, not the guide. The envelope is the turn's user message,
+        so everything in it is written into session history and repeats there
+        once per wake; static reference material belongs in a skill, whose
+        index line the system prompt carries once (see
+        ``write_server_guide_skill``)."""
+        layers = [CORE_RULES]
+        if server_pointer:
+            layers.append(server_pointer)
+        layers.append(self.read())
+        return "\n\n".join(layers)
 
     def write(self, text: str) -> None:
         _atomic_write_text(self._path, text)
         logger.info("filament-fcm: standing instructions updated (%d bytes)", len(text))
+
+
+SERVER_GUIDE_SKILL = "filament-links"
+
+# One line in the envelope; the body lives in the skill. Phrased so the model
+# reaches for the skill at the moment it would otherwise invent a format or
+# ask its principal for a raw id.
+SERVER_GUIDE_POINTER = (
+    "[WRITING LINKS] To @-mention a member or link a channel, group or "
+    f"message, read the `{SERVER_GUIDE_SKILL}` skill for the exact syntax. "
+    "Never put a raw room or user id in a message people read."
+)
+
+
+def _is_our_skill(path: Path) -> bool:
+    """Whether the skill file at *path* is one this plugin wrote.
+
+    The skills directory is the principal's, and this is the only file in it
+    the plugin claims. A file it did not author is left alone rather than
+    overwritten or deleted: the frontmatter it writes is the ownership mark,
+    and anything else at that name belongs to whoever put it there.
+    """
+    try:
+        with path.open(encoding="utf-8") as f:
+            # A bounded read: the marker is in the frontmatter, and this runs
+            # on a path someone else may own and may have made arbitrarily
+            # large.
+            head = f.read(400)
+    except (OSError, UnicodeError):
+        # Undecodable or unreadable is not ours, and not ours to destroy.
+        # UnicodeDecodeError is a ValueError, so OSError alone would let it
+        # escape into connect and abort initialization.
+        return False
+    return f"name: {SERVER_GUIDE_SKILL}" in head and "author: Filament" in head
+
+
+def write_server_guide_skill(text: str, hermes_home: Path | None = None) -> bool:
+    """Write the server's self-description as a Hermes skill.
+
+    The MCP initialize handshake returns how Filament is organized and how to
+    write member/channel links. It is static for the life of the connection,
+    so it goes where static reference belongs: a skill, carried in the system
+    prompt as a single index line with the body loaded on demand. Rewritten on
+    every connect, so a server-side edit lands without an install step.
+
+    Returns True when the skill was written.
+    """
+    body = (text or "").strip()
+    home = hermes_home or Path(
+        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
+    )
+    skill_dir = home / "skills" / SERVER_GUIDE_SKILL
+    skill_file = skill_dir / "SKILL.md"
+    if skill_file.exists() and not _is_our_skill(skill_file):
+        # Someone else's skill sits at this name. Neither the rewrite nor the
+        # cleanup below is ours to perform on it.
+        logger.warning(
+            "filament-fcm: %s exists and was not written by this plugin — "
+            "leaving it alone",
+            skill_file,
+        )
+        return False
+    if not body:
+        # The skill is a cache of this server's guidance, and the skills index
+        # in the system prompt lists it whether or not the envelope points at
+        # it. Leaving a file behind that this server did not send would offer
+        # another server's syntax as if it were current, so remove it.
+        with contextlib.suppress(OSError):
+            skill_file.unlink()
+        return False
+    front = (
+        "---\n"
+        f"name: {SERVER_GUIDE_SKILL}\n"
+        'description: "Writing Filament links: @-mention a member, link a '
+        'channel, group or message, and the ids each one takes."\n'
+        "version: 1.0.0\n"
+        "author: Filament\n"
+        "---\n\n"
+        "# Writing links in Filament\n\n"
+        "Supplied by the Filament server on connect.\n\n"
+    )
+    try:
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(skill_file, front + body + "\n")
+    except OSError:
+        logger.warning(
+            "filament-fcm: could not write the %s skill",
+            SERVER_GUIDE_SKILL,
+            exc_info=True,
+        )
+        return False
+    logger.info(
+        "filament-fcm: wrote the %s skill (%d bytes)", SERVER_GUIDE_SKILL, len(body)
+    )
+    return True
 
 
 class ChannelInstructionsStore:
