@@ -349,6 +349,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._reserved_notified: bool = False
         self._owner_id: str | None = None
         self._owner_name: str | None = None
+        # The agent's own display name (from get_self), for the hello.
+        self._self_name: str | None = None
 
         # Event deduplication — bounded deque + set so memory stays flat.
         self._seen_events: deque[str] = deque(maxlen=2000)
@@ -694,19 +696,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 )
                 await self._filament_api.post_message(
                     channel=self._cc_room_id,
-                    markdown_body=(
-                        "👋 Connected and ready. This is our private channel — "
-                        "give me a task, ask me anything, or invite me into a "
-                        "channel.\n\n"
-                        # Named here rather than left for the model to
-                        # remember: they are handled before any turn, so the
-                        # one place they are certain to be stated correctly
-                        # is a message the model does not write. Which ones
-                        # depends on the flag - offering an inert command is
-                        # worse than not offering it.
-                        + framing.command_summary(
-                            self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
-                        )
+                    markdown_body=framing.first_contact_hello(
+                        self._self_name,
+                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS),
                     ),
                 )
                 slog.info(
@@ -821,6 +813,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 data = self._filament_api.parse_tool_result(self_info)
                 if isinstance(data, dict):
                     self._user_id = data.get("mxid") or data.get("user_id")
+                    self._self_name = data.get("display_name") or None
 
                     # Backchannel + owner, so a first-contact hello has
                     # somewhere to go (see _maybe_greet).

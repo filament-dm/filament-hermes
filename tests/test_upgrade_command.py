@@ -413,9 +413,14 @@ class TestWhereTheCommandsAreNamed:
         assert "/fil-config" not in framing.command_summary(False)
 
     def test_the_hello_asks_the_flag(self):
+        # The hello text lives in framing.first_contact_hello, which ends
+        # with command_summary; the adapter's job is to ask the flag and
+        # pass it through.
         body = _adapter_body("_maybe_greet")
-        assert "command_summary" in body
+        assert "first_contact_hello" in body
         assert "FEATURE_SLASH_COMMANDS" in body
+        framing = _load("framing")
+        assert "/fil-upgrade" in framing.first_contact_hello("A", False)
 
     def test_the_update_alert_offers_the_command(self):
         update_check = _load("update_check")

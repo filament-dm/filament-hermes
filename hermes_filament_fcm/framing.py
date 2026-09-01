@@ -313,6 +313,25 @@ def command_summary(slash_enabled: bool) -> str:
     )
 
 
+def first_contact_hello(agent_name: str | None, slash_enabled: bool) -> str:
+    """The canned first-contact hello — the connect flow's finish line.
+
+    Deterministic, not a model turn: the app waits for this message, so it
+    must land the moment the gateway is up and say exactly what it says.
+    The agent's name comes from get_self; when it is unknown the hello
+    simply drops the name clause. The command list
+    rides along because commands are handled before any turn — the one
+    place they are certain to be stated correctly is a message the model
+    does not write."""
+    name = f", I'm {sanitize_meta(agent_name)}" if agent_name else ""
+    return (
+        f"Hi{name}! In this Chat you can ask me questions, give me tasks, "
+        "or direct my behavior. You may add me to other Chats where I will "
+        "limit my responses until you tell me here what you'd like me to "
+        "do.\n\n" + command_summary(slash_enabled)
+    )
+
+
 def command_map_prompt(slash_enabled: bool) -> str:
     """The control turn's note about the command surface, matching what runs."""
     config = (

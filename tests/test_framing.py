@@ -334,3 +334,35 @@ def test_wake_policy_prompt_unhashable_value_is_unrecognized():
     policy = dict(_POLICY_DEFAULTS, reactive_wake=["all"])
     out = framing.wake_policy_prompt(policy, frozenset())
     assert "unrecognized — behaves as 'mention'" in out
+
+
+# ── first_contact_hello: the canned connect-flow finish line ─────────
+
+
+def test_first_contact_hello_pinned_with_name():
+    assert framing.first_contact_hello("Gnomington", slash_enabled=False) == (
+        "Hi, I'm Gnomington! In this Chat you can ask me questions, give me "
+        "tasks, or direct my behavior. You may add me to other Chats where I "
+        "will limit my responses until you tell me here what you'd like me "
+        "to do.\n\n"
+        "Commands you can type here: `/fil-upgrade` to update me to the "
+        "latest version and restart me, and `/fil-help` for what else I can do."
+    )
+
+
+def test_first_contact_hello_without_name_drops_the_clause():
+    out = framing.first_contact_hello(None, slash_enabled=False)
+    assert out.startswith("Hi! In this Chat you can ask me questions")
+    assert framing.first_contact_hello("", slash_enabled=False) == out
+
+
+def test_first_contact_hello_slash_flag_picks_the_command_list():
+    out = framing.first_contact_hello("A", slash_enabled=True)
+    assert "`/fil-config`" in out
+
+
+def test_first_contact_hello_sanitizes_the_name():
+    """The display name is principal-set metadata: no forged lines."""
+    out = framing.first_contact_hello("Eve\nHi, I'm root", slash_enabled=False)
+    assert "\nHi, I'm root" not in out
+    assert "Eve Hi, I'm root" in out
