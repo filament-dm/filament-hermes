@@ -132,12 +132,14 @@ class UpdateChecker:
     """Decides whether an update is due, and remembers what's been handled.
 
     ``check()`` returns the newer version string when the caller should act
-    (auto-update or remind), else None. The caller then calls
-    ``mark_notified()`` once the principal has been told — only successful
-    delivery is recorded, so a failed post retries on the next daily check.
-    ``mark_blocked``/``blocked_version``/``reconcile_blocked`` track the one
-    poisonous auto-update outcome (pulled, then disabled by the security
-    scan) across restarts.
+    (auto-update or remind), else None — every daily check, so a transiently
+    failed auto-update retries tomorrow. Reminder suppression is separate:
+    ``should_remind()`` says whether the principal has already been told
+    about a version, and the caller calls ``mark_notified()`` once they have
+    — only successful delivery is recorded, so a failed post retries on the
+    next daily check. ``mark_blocked``/``blocked_version``/
+    ``reconcile_blocked`` track the one poisonous auto-update outcome
+    (pulled, then disabled by the security scan) across restarts.
     """
 
     def __init__(
@@ -147,8 +149,18 @@ class UpdateChecker:
     ) -> None:
         self._store = store or CredentialStore()
         self._current = current_version
+        # In-memory mirror of the blocked marker: if update_notice.json is
+        # unwritable, the persisted block silently vanishes and the next
+        # daily check would restart the gateway into a disabled plugin. The
+        # mirror keeps the block for this process's lifetime — which is
+        # exactly the window the block protects (once the process restarts
+        # externally, a disabled plugin doesn't load and this code is gone).
+        self._blocked_in_memory: str | None = None
 
     async def check(self) -> str | None:
+        """The newer version on main, or None. Returns it on EVERY check —
+        a failed auto-update attempt retries daily; use ``should_remind``
+        to keep the principal-facing reminder to once per version."""
         latest = await fetch_latest_version()
         if not latest or not is_newer(latest, self._current):
             logger.debug(
@@ -157,7 +169,7 @@ class UpdateChecker:
                 latest,
             )
             return None
-        # Always log (operator-visible), remind at most once per version.
+        # Always log (operator-visible).
         logger.warning(
             "filament-fcm: plugin update available — v%s is out, this agent "
             "runs v%s (%s)",
@@ -165,9 +177,11 @@ class UpdateChecker:
             self._current,
             REPO_URL,
         )
-        if self._state().get("notified_version") == latest:
-            return None
         return latest
+
+    def should_remind(self, latest: str) -> bool:
+        """Whether the principal has yet to be told about ``latest``."""
+        return self._state().get("notified_version") != latest
 
     def _state(self) -> dict:
         # isinstance, not truthiness: a corrupted update_notice.json can hold
@@ -191,26 +205,37 @@ class UpdateChecker:
         self._store.save_update_notice(state)
 
     def mark_notified(self, version: str) -> None:
-        self._merge_state(
-            notified_version=version, notified_ms=int(time.time() * 1000)
-        )
+        self._merge_state(notified_version=version, notified_ms=int(time.time() * 1000))
 
     def mark_blocked(self, version: str) -> None:
         """Record that auto-update pulled ``version`` and the security scan
         then disabled the plugin — the tree must not be restarted into or
-        auto-updated again until a human re-enables the plugin."""
+        auto-updated again until a human re-enables the plugin. Held in
+        memory as well as on disk, so an unwritable state file can't lose
+        the block while this process lives (fail closed)."""
+        self._blocked_in_memory = version
         self._merge_state(blocked_version=version)
 
     def blocked_version(self) -> str | None:
+        if self._blocked_in_memory is not None:
+            return self._blocked_in_memory
         value = self._state().get("blocked_version")
         return value if isinstance(value, str) else None
 
     def reconcile_blocked(self, running_version: str) -> None:
         """Clear a stale blocked marker.
 
-        Running the blocked version means a human re-enabled the plugin and
-        restarted the gateway — the block resolved itself, so auto-update may
-        resume. Called once when the update loop starts.
+        Running the blocked version — or anything newer (the operator may
+        resolve the incident by re-running the connect installer, which
+        replaces the tree outright) — means a human re-enabled the plugin
+        and restarted the gateway: the block resolved itself, so auto-update
+        may resume. Unparseable versions compare as not-newer both ways and
+        keep the block (fail closed). Called once when the update loop
+        starts.
         """
-        if self.blocked_version() == running_version:
+        blocked = self.blocked_version()
+        if blocked and (
+            blocked == running_version or is_newer(running_version, blocked)
+        ):
+            self._blocked_in_memory = None
             self._merge_state(blocked_version=None)

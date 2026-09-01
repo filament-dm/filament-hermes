@@ -94,7 +94,10 @@ def _checker(tmp_path, current="0.1.0"):
     return update_check.UpdateChecker(store, current_version=current), store
 
 
-def test_update_checker_reminds_then_stays_quiet(tmp_path, monkeypatch):
+def test_update_checker_returns_newer_every_check(tmp_path, monkeypatch):
+    # check() reports a newer version on EVERY check — the auto-update
+    # attempt retries daily after a transient failure. Reminder suppression
+    # is should_remind's job, not check()'s.
     checker, _ = _checker(tmp_path)
 
     async def fake_fetch(timeout=10.0):
@@ -102,14 +105,13 @@ def test_update_checker_reminds_then_stays_quiet(tmp_path, monkeypatch):
 
     monkeypatch.setattr(update_check, "fetch_latest_version", fake_fetch)
 
-    # Newer version, never notified → remind.
     assert asyncio.run(checker.check()) == "0.2.0"
-    # Delivery failed (mark_notified not called) → remind again.
-    assert asyncio.run(checker.check()) == "0.2.0"
+    assert checker.should_remind("0.2.0")
 
     checker.mark_notified("0.2.0")
-    # Same version already notified → quiet.
-    assert asyncio.run(checker.check()) is None
+    # Still reported (retry eligibility) — but no longer remind-worthy.
+    assert asyncio.run(checker.check()) == "0.2.0"
+    assert not checker.should_remind("0.2.0")
 
     # An even newer version → remind again.
     async def fake_fetch2(timeout=10.0):
@@ -117,6 +119,7 @@ def test_update_checker_reminds_then_stays_quiet(tmp_path, monkeypatch):
 
     monkeypatch.setattr(update_check, "fetch_latest_version", fake_fetch2)
     assert asyncio.run(checker.check()) == "0.3.0"
+    assert checker.should_remind("0.3.0")
 
 
 def test_update_checker_quiet_when_current_or_unknown(tmp_path, monkeypatch):
@@ -130,34 +133,26 @@ def test_update_checker_quiet_when_current_or_unknown(tmp_path, monkeypatch):
         assert asyncio.run(checker.check()) is None
 
 
-def test_notified_state_survives_restart(tmp_path, monkeypatch):
+def test_notified_state_survives_restart(tmp_path):
     checker, _ = _checker(tmp_path)
-
-    async def fake_fetch(timeout=10.0):
-        return "0.2.0"
-
-    monkeypatch.setattr(update_check, "fetch_latest_version", fake_fetch)
     checker.mark_notified("0.2.0")
 
-    # A fresh checker over the same store (= gateway restart) stays quiet.
+    # A fresh checker over the same store (= gateway restart) stays quiet
+    # on the reminder side.
     checker2, _ = _checker(tmp_path)
-    assert asyncio.run(checker2.check()) is None
+    assert not checker2.should_remind("0.2.0")
+    assert checker2.should_remind("0.3.0")
 
 
-def test_corrupted_notice_file_still_reminds(tmp_path, monkeypatch):
+def test_corrupted_notice_file_still_reminds(tmp_path):
     # A valid-JSON-but-non-dict update_notice.json must not kill the check
     # with AttributeError — it reads as "never notified" and gets rewritten
     # by the next mark_notified.
     (tmp_path / "update_notice.json").write_text('["not", "a", "dict"]')
     checker, _ = _checker(tmp_path)
-
-    async def fake_fetch(timeout=10.0):
-        return "0.2.0"
-
-    monkeypatch.setattr(update_check, "fetch_latest_version", fake_fetch)
-    assert asyncio.run(checker.check()) == "0.2.0"
+    assert checker.should_remind("0.2.0")
     checker.mark_notified("0.2.0")
-    assert asyncio.run(checker.check()) is None
+    assert not checker.should_remind("0.2.0")
 
 
 def test_update_check_disabled_env(monkeypatch):
@@ -224,7 +219,7 @@ def test_blocked_state_roundtrip_and_merge(tmp_path):
     assert checker2.blocked_version() == "0.2.0"
     assert checker2._state().get("notified_version") == "0.2.0"
 
-    # Running a *different* version leaves the block in place ...
+    # Running an *older* version leaves the block in place ...
     checker2.reconcile_blocked("0.1.0")
     assert checker2.blocked_version() == "0.2.0"
     # ... running the blocked version means a human re-enabled the plugin
@@ -232,6 +227,38 @@ def test_blocked_state_roundtrip_and_merge(tmp_path):
     checker2.reconcile_blocked("0.2.0")
     assert checker2.blocked_version() is None
     assert checker2._state().get("notified_version") == "0.2.0"
+
+
+def test_reconcile_blocked_clears_on_newer_running_version(tmp_path):
+    # The operator may resolve a blocked update by re-running the connect
+    # installer, which replaces the tree with a NEWER version — that must
+    # clear the block too, or auto-update stays reminder-only forever.
+    checker, _ = _checker(tmp_path)
+    checker.mark_blocked("0.2.0")
+    checker.reconcile_blocked("0.3.0")
+    assert checker.blocked_version() is None
+
+    # Unparseable running versions keep the block (fail closed).
+    checker.mark_blocked("0.2.0")
+    checker.reconcile_blocked("unknown")
+    assert checker.blocked_version() == "0.2.0"
+
+
+def test_blocked_marker_survives_unwritable_state_file(tmp_path):
+    # If update_notice.json can't be written, the block must still hold for
+    # this process's lifetime — losing it would let the next daily check
+    # restart the gateway into a disabled plugin.
+    checker, store = _checker(tmp_path)
+    # CredentialStore swallows write errors itself; simulate the outcome by
+    # making the save a no-op at the store level.
+    store.save_update_notice = lambda data: None
+    checker.mark_blocked("0.2.0")
+    assert checker.blocked_version() == "0.2.0"  # in-memory mirror
+    # A fresh checker over the same (never-written) store has no block —
+    # acceptable: a new process only exists after an external restart, at
+    # which point a disabled plugin doesn't load this code at all.
+    checker2, _ = _checker(tmp_path)
+    assert checker2.blocked_version() is None
 
 
 def test_blocked_version_ignores_corrupt_values(tmp_path):

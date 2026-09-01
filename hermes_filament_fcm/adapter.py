@@ -297,6 +297,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._heartbeat_task: asyncio.Task | None = None
         self._update_check_task: asyncio.Task | None = None
         self._update_checker = UpdateChecker(self._credentials)
+        # Set by disconnect(). Cancelling _update_check_task can't stop an
+        # asyncio.to_thread worker already inside attempt_update /
+        # _maybe_finish_pending_update — this flag keeps such a straggler
+        # from posting notes or spawning a gateway restart during/after
+        # teardown (read from the worker thread; a plain bool is enough).
+        self._update_teardown = False
         # The gateway's event loop, captured in connect(). FCM callbacks (which
         # fire from the firebase-messaging thread) are bridged onto it so all
         # handling — and the shared httpx client — stay on one loop.
@@ -1213,6 +1219,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return
         if self._update_check_task and not self._update_check_task.done():
             return
+        # The reconnect watcher reuses this adapter (disconnect → connect):
+        # a fresh loop means teardown is over.
+        self._update_teardown = False
         self._update_check_task = asyncio.create_task(self._update_check_loop())
 
     async def _update_check_loop(self, interval_seconds: int = 86400) -> None:
@@ -1221,11 +1230,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         A newer version always logs a warning (UpdateChecker.check). The
         plugin then updates itself when it safely can (self_update.py) and
         restarts the gateway to load the new code; when it can't, the
-        backchannel reminder to the principal fires instead, at most once per
-        new version, persisted across restarts (update_notice.json).
+        backchannel reminder to the principal fires instead. The *attempt*
+        repeats every check (so a transient failure — dirty tree, network —
+        heals on its own), while the reminder and the "I updated" note stay
+        at most once per new version, persisted across restarts
+        (update_notice.json).
         """
         # A stale "scan disabled the pulled version" block clears itself once
-        # that version is what's running (a human re-enabled + restarted).
+        # that version (or newer) is what's running — a human re-enabled and
+        # restarted, or replaced the tree via the connect installer.
         self._update_checker.reconcile_blocked(PLUGIN_VERSION)
         while True:
             try:
@@ -1233,9 +1246,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 if newer:
                     await self._handle_update_available(newer)
                 else:
-                    # Heals a pulled-but-never-restarted tree (spawn failed,
-                    # machine died mid-restart): the notified marker keeps
-                    # check() quiet, so re-attempt the restart from here.
+                    # Heals a pulled-but-never-restarted tree when the
+                    # version check itself can't see it (fetch failed):
+                    # re-attempt the restart from here.
                     await asyncio.to_thread(self._maybe_finish_pending_update)
             except Exception:
                 logger.debug("filament-fcm: update check failed", exc_info=True)
@@ -1245,9 +1258,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """Auto-update to ``latest`` when possible, else post the reminder.
 
         Ordering on success: note first (the restart kills this process, so
-        it can't be told about afterwards), then the notified marker, then
-        the restart. A DISABLED outcome must never restart — the plugin left
-        Hermes's enabled set, so the running code is all the agent has.
+        it can't be told about afterwards), then the notified marker (only on
+        confirmed delivery, so a failed post retries), then the restart. A
+        DISABLED outcome must never restart — the plugin left Hermes's
+        enabled set, so the running code is all the agent has.
         """
         if self_update.auto_update_disabled():
             await self._notify_update_available(latest)
@@ -1264,6 +1278,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         outcome = await asyncio.to_thread(
             self_update.attempt_update, latest, PLUGIN_VERSION
         )
+        if self._update_teardown:
+            # disconnect() ran while the attempt was in flight — the pull (if
+            # any) stands, but don't message or restart from a dead adapter;
+            # the next process's first check picks the state up.
+            return
         if outcome.status == self_update.UPDATED:
             logger.warning(
                 "filament-fcm: auto-updated plugin to v%s (running v%s) — "
@@ -1271,16 +1290,22 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 outcome.disk_version,
                 PLUGIN_VERSION,
             )
-            await self._post_backchannel_note(
-                build_updated_note(outcome.disk_version or latest, PLUGIN_VERSION)
-            )
-            self._update_checker.mark_notified(latest)
-            if not self_update.spawn_gateway_restart():
-                await self._post_backchannel_note(
-                    "⚠️ The update is installed but I couldn't restart the "
-                    "gateway to load it. On the machine hosting this agent, "
-                    "run:\n```\nhermes gateway restart\n```"
-                )
+            # The note goes out once per version (a pulled=False outcome is a
+            # daily restart re-attempt, not news), but the restart is spawned
+            # every time — that's the self-healing.
+            if outcome.pulled or self._update_checker.should_remind(latest):
+                if await self._post_backchannel_note(
+                    build_updated_note(outcome.disk_version or latest, PLUGIN_VERSION)
+                ):
+                    self._update_checker.mark_notified(latest)
+                if not self_update.spawn_gateway_restart():
+                    await self._post_backchannel_note(
+                        "⚠️ The update is installed but I couldn't restart the "
+                        "gateway to load it. On the machine hosting this agent, "
+                        "run:\n```\nhermes gateway restart\n```"
+                    )
+            else:
+                self_update.spawn_gateway_restart()
         elif outcome.status == self_update.DISABLED:
             logger.error(
                 "filament-fcm: auto-update pulled v%s but the security scan "
@@ -1290,8 +1315,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 self_update.plugin_root().name,
             )
             self._update_checker.mark_blocked(outcome.disk_version or latest)
-            if await self._post_backchannel_note(
-                build_update_disabled_note(latest, self_update.plugin_root().name)
+            if self._update_checker.should_remind(latest) and (
+                await self._post_backchannel_note(
+                    build_update_disabled_note(latest, self_update.plugin_root().name)
+                )
             ):
                 self._update_checker.mark_notified(latest)
         else:  # SKIPPED / FAILED — fall back to the manual reminder.
@@ -1306,17 +1333,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         Blocking (git subprocesses) — runs in a thread. The eligibility gate
         keeps this away from dev checkouts (where a hand-bumped pyproject
-        must not bounce the gateway), and a scan-blocked pull never restarts.
+        must not bounce the gateway), and ANY blocked marker suppresses the
+        restart — the disk may hold a version other than the blocked one,
+        but while the plugin is disabled a restart loads nothing.
         """
-        if self_update.auto_update_disabled():
+        if self_update.auto_update_disabled() or self._update_teardown:
+            return
+        if self._update_checker.blocked_version():
             return
         root = self_update.plugin_root()
         on_disk = self_update.disk_version(root)
         if not on_disk or not is_newer(on_disk, PLUGIN_VERSION):
             return
-        if self._update_checker.blocked_version() == on_disk:
-            return
         if self_update.eligibility_reason(root) is not None:
+            return
+        if self._update_teardown:
             return
         logger.warning(
             "filament-fcm: plugin v%s is on disk but v%s is running — "
@@ -1348,11 +1379,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     ) -> None:
         """Post the small update reminder to the principal's backchannel.
 
-        Marked as notified only after the post succeeds, so a failed
-        delivery retries on the next daily check. Without a backchannel
-        there's nowhere to remind — the warning already logged by
-        UpdateChecker.check is the whole reminder then.
+        At most once per version (should_remind), marked as notified only
+        after the post succeeds, so a failed delivery retries on the next
+        daily check. Without a backchannel there's nowhere to remind — the
+        warning already logged by UpdateChecker.check is the whole reminder
+        then.
         """
+        if not self._update_checker.should_remind(latest):
+            return
         if not await self._post_backchannel_note(
             build_reminder(latest, PLUGIN_VERSION, reason=reason)
         ):
@@ -1367,6 +1401,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop listening and clean up."""
+        # Before anything else: an in-flight auto-update worker survives the
+        # task cancellation below and must not restart the gateway or post
+        # notes once teardown has begun.
+        self._update_teardown = True
         self._mark_disconnected()
 
         # The publisher is module-global and outlives this adapter: drop

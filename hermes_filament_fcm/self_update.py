@@ -180,9 +180,7 @@ def attempt_update(
             # never took — nothing to pull, the restart is the missing step.
             return UpdateOutcome(UPDATED, "already on disk", on_disk, pulled=False)
 
-        proc = _run(
-            ["hermes", "plugins", "update", root.name], timeout=_UPDATE_TIMEOUT
-        )
+        proc = _run(["hermes", "plugins", "update", root.name], timeout=_UPDATE_TIMEOUT)
         output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
         if proc.returncode != 0:
             tail = output.strip().splitlines()[-1] if output.strip() else "no output"
