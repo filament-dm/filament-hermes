@@ -500,6 +500,20 @@ class FilamentAPI:
         """
         await self._side_channel_post("/heartbeat")
 
+    async def request_probe(self) -> dict[str, Any]:
+        """POST /mcp/agents/probe-request — ask the server to ping us.
+
+        The inverse of every other call in this class. Those all prove we can
+        reach the server, and keep proving it while our own push listener is
+        dead; this asks the server to send one ``io.filament.ping`` push so the
+        inbound path is exercised too. The nonce comes back down that push and
+        goes home via ``pong``, so asking is not the same as passing.
+
+        The server applies its own minimum interval and answers
+        ``{"probed": false, "reason": "too_soon"}`` rather than erroring.
+        """
+        return await self._side_channel_post("/probe-request")
+
     async def pong(self, nonce: str) -> dict[str, Any]:
         """POST /mcp/agents/pong — acknowledge a liveness ping.
 
