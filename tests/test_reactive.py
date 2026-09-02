@@ -116,6 +116,38 @@ def test_wake_policy_per_channel_override():
         assert wp.should_wake_message("!other", is_mention=False) is False
 
 
+def test_wake_policy_provenance_unwritten_file():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        policy, set_keys = wp.read_with_provenance()
+        # No file: every value is a default nobody chose.
+        assert policy == wp._DEFAULTS
+        assert set_keys == frozenset()
+
+
+def test_wake_policy_provenance_marks_only_saved_known_keys():
+    with tempfile.TemporaryDirectory() as d:
+        wp = reactive.WakePolicyStore(Path(d) / "wake.json")
+        wp.write({"trigger_emojis": ["🐞"], "not_a_policy_key": 1})
+        policy, set_keys = wp.read_with_provenance()
+        # The saved key is marked; unknown keys merge but are never "set";
+        # the untouched keys keep their defaults and stay unmarked.
+        assert set_keys == frozenset({"trigger_emojis"})
+        assert policy["trigger_emojis"] == ["🐞"]
+        assert policy["not_a_policy_key"] == 1
+        assert policy["reactive_wake"] == "mention"
+
+
+def test_wake_policy_provenance_unreadable_file_reads_as_defaults():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "wake.json"
+        path.write_text("{not json", encoding="utf-8")
+        wp = reactive.WakePolicyStore(path)
+        policy, set_keys = wp.read_with_provenance()
+        assert policy == wp._DEFAULTS
+        assert set_keys == frozenset()
+
+
 def test_wake_policy_off():
     with tempfile.TemporaryDirectory() as d:
         wp = reactive.WakePolicyStore(Path(d) / "wake.json")

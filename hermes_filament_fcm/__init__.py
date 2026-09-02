@@ -1136,7 +1136,11 @@ def _register_reactive_tools(
     _reg(
         "set_wake_policy",
         "Set the wake policy that decides whether a shared-channel event wakes "
-        "the agent. Object with: trigger_emojis (list of emoji that wake on "
+        "the agent. The principal edits this CONVERSATIONALLY: read "
+        "get_wake_policy, apply their request to that object, and save the "
+        "whole result here. This REPLACES the policy - a key you leave out "
+        "reverts to its default, silently. 'policy' is an object with: "
+        "trigger_emojis (list of emoji that wake on "
         "reaction), reactive_wake ('mention' | 'all' | 'off'), reply_style "
         "('thread' to thread each reply off the triggering message, the "
         "default | 'channel' to post replies on the main timeline like the "
@@ -1152,7 +1156,12 @@ def _register_reactive_tools(
         },
         _set_wake_policy,
     )
-    _reg("get_wake_policy", "Show the current wake policy.", _empty, _get_wake_policy)
+    _reg(
+        "get_wake_policy",
+        "Show the current wake policy. Read this before editing with set_wake_policy.",
+        _empty,
+        _get_wake_policy,
+    )
     _reg(
         "get_capabilities",
         "Show which tools the agent may use in shared (data-plane) channels: the "

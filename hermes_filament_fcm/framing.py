@@ -318,6 +318,25 @@ def command_summary(slash_enabled: bool) -> str:
     )
 
 
+def first_contact_hello(agent_name: str | None, slash_enabled: bool) -> str:
+    """The canned first-contact hello — the connect flow's finish line.
+
+    Deterministic, not a model turn: the app waits for this message, so it
+    must land the moment the gateway is up and say exactly what it says.
+    The agent's name comes from get_self; when it is unknown the hello
+    simply drops the name clause. The command list
+    rides along because commands are handled before any turn — the one
+    place they are certain to be stated correctly is a message the model
+    does not write."""
+    name = f", I'm {sanitize_meta(agent_name)}" if agent_name else ""
+    return (
+        f"Hi{name}! In this Chat you can ask me questions, give me tasks, "
+        "or direct my behavior. You may add me to other Chats where I will "
+        "limit my responses until you tell me here what you'd like me to "
+        "do.\n\n" + command_summary(slash_enabled)
+    )
+
+
 def command_map_prompt(slash_enabled: bool) -> str:
     """The control turn's note about the command surface, matching what runs."""
     config = (
@@ -346,3 +365,117 @@ TOOL_MAP_PROMPT = (
     "simple lookups answer from the FIRST successful result: no second tool "
     "to double-check, no browser when a search snippet already answers it."
 )
+
+
+# Glosses for the wake-policy rendering. Keys mirror the values the stores
+# accept; the fallback entries mirror the stores' fail-safe resolution, so the
+# narration and the behavior can't drift apart silently.
+_WAKE_MODE_GLOSS = {
+    "mention": "you wake only when @-mentioned",
+    "all": "every message wakes you",
+    "off": "no message wakes you, not even a mention",
+}
+
+_REPLY_STYLE_GLOSS = {
+    "thread": "your replies thread off the triggering message",
+    "channel": (
+        "your replies land on the main timeline, unless the triggering "
+        "message is already inside a thread — that reply stays threaded"
+    ),
+}
+
+_THREAD_WAKE_GLOSS = {
+    "engaged": (
+        "a non-agent's reply in a thread you were @-mentioned in wakes you "
+        "without a re-tag"
+    ),
+    "off": "a thread reply without an @-mention never wakes you",
+}
+
+
+def wake_policy_prompt(policy: dict, set_keys: frozenset) -> str:
+    """The control turn's rendering of the live wake policy.
+
+    The principal's only view of the wake policy is asking the agent, so the
+    agent must narrate from the values in force this turn, never from memory
+    of the conversation that shaped them. Injected into the control-plane
+    system prompt alongside the tool map — and only there: on a data-plane
+    turn it would hand the agent's trigger configuration to every channel
+    participant.
+
+    ``set_keys`` (from ``WakePolicyStore.read_with_provenance``) marks the
+    keys the principal actually saved. Everything else is a default nobody
+    chose, and the rendering says so — the "default" markers are what tell
+    the principal there is something left to configure.
+
+    Policy values are principal-authored, but they pass through the model to
+    get written, so scalars are sanitized like any other metadata before
+    being interpolated into framing text.
+    """
+
+    def mark(key: str) -> str:
+        return "set by your principal" if key in set_keys else "default"
+
+    def gloss(key: str, table: dict, fallback: str) -> str:
+        value = policy.get(key)
+        text = table.get(value) if isinstance(value, str) else None
+        if text is None:
+            return (
+                f"{key}='{sanitize_meta(str(value))}' ({mark(key)}): "
+                f"unrecognized — behaves as '{fallback}': {table[fallback]}"
+            )
+        return f"{key}='{value}' ({mark(key)}): {text}"
+
+    emojis = policy.get("trigger_emojis")
+    if isinstance(emojis, list) and emojis:
+        shown = ", ".join(sanitize_meta(str(e), limit=16) for e in emojis)
+        emoji_line = (
+            f"trigger_emojis ({mark('trigger_emojis')}): a {shown} reaction wakes you"
+        )
+    elif emojis is None or emojis == []:
+        emoji_line = (
+            f"trigger_emojis=[] ({mark('trigger_emojis')}): no emoji reaction wakes you"
+        )
+    else:
+        emoji_line = (
+            f"trigger_emojis='{sanitize_meta(str(emojis))}' "
+            f"({mark('trigger_emojis')}): invalid (expected a list) — "
+            "fix it with set_wake_policy"
+        )
+
+    per = policy.get("per_channel")
+    if isinstance(per, dict) and per:
+        entries = []
+        for room_id, overrides in sorted(per.items()):
+            if isinstance(overrides, dict) and overrides:
+                pairs = ", ".join(
+                    f"{sanitize_meta(str(k))}={sanitize_meta(str(v))}"
+                    for k, v in sorted(overrides.items())
+                )
+            else:
+                pairs = "(empty)"
+            entries.append(f"{sanitize_meta(str(room_id))}: {pairs}")
+        per_line = (
+            "Per-channel overrides — each wins over the global value in its "
+            "channel (look the ids up with get_channel_details when naming "
+            "them): " + "; ".join(entries)
+        )
+    else:
+        per_line = "Per-channel overrides: none."
+
+    return (
+        "Your wake policy in shared channels, read fresh this turn — when "
+        "your principal asks when or why you wake, answer from these values, "
+        "never from memory:\n"
+        f"- {gloss('reactive_wake', _WAKE_MODE_GLOSS, 'mention')}\n"
+        f"- {emoji_line}\n"
+        f"- {gloss('reply_style', _REPLY_STYLE_GLOSS, 'thread')}\n"
+        f"- {gloss('thread_wake', _THREAD_WAKE_GLOSS, 'engaged')}\n"
+        f"- {per_line}\n"
+        "Your principal changes any of this by asking you here, globally or "
+        "per channel (e.g. 'wake on 🐞 reactions in the bug channel', 'reply "
+        "on the main timeline everywhere'). Apply such a request by reading "
+        "get_wake_policy, merging the change into that object, and saving "
+        "the WHOLE result with set_wake_policy — a key left out of the save "
+        "silently reverts to its default."
+    )

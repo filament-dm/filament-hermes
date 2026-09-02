@@ -358,6 +358,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._reserved_notified: bool = False
         self._owner_id: str | None = None
         self._owner_name: str | None = None
+        # The agent's own display name (from get_self), for the hello.
+        self._self_name: str | None = None
 
         # Event deduplication — bounded deque + set so memory stays flat.
         self._seen_events: deque[str] = deque(maxlen=2000)
@@ -703,19 +705,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 )
                 await self._filament_api.post_message(
                     channel=self._cc_room_id,
-                    markdown_body=(
-                        "👋 Connected and ready. This is our private channel — "
-                        "give me a task, ask me anything, or invite me into a "
-                        "channel.\n\n"
-                        # Named here rather than left for the model to
-                        # remember: they are handled before any turn, so the
-                        # one place they are certain to be stated correctly
-                        # is a message the model does not write. Which ones
-                        # depends on the flag - offering an inert command is
-                        # worse than not offering it.
-                        + framing.command_summary(
-                            self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
-                        )
+                    markdown_body=framing.first_contact_hello(
+                        self._self_name,
+                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS),
                     ),
                 )
                 slog.info(
@@ -747,14 +739,23 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 user_name=self._owner_name or self._owner_id,
                 message_id=trigger_id,
             )
+            policy, policy_set_keys = self._wake_policy.read_with_provenance()
             with contextlib.suppress(AttributeError):
-                source.channel_prompt = framing.TOOL_MAP_PROMPT
+                source.channel_prompt = (
+                    f"{framing.TOOL_MAP_PROMPT}\n\n"
+                    + framing.wake_policy_prompt(policy, policy_set_keys)
+                )
             event = MessageEvent(
                 text=(
                     "[system: You just connected and posted a canned hello in "
-                    "your backchannel. Follow it with ONE short line (no "
-                    "greeting, no tools) telling your principal two or three "
-                    "concrete things you can do for them.]"
+                    "your backchannel. Follow it with ONE short message (no "
+                    "greeting, no tools): a line with two or three concrete "
+                    "things you can do for your principal; then, from the "
+                    "wake policy in your system prompt, one plain sentence on "
+                    "when you wake in shared channels; then one offer — they "
+                    "can have emoji reactions wake you, or set any of it per "
+                    "channel, just by asking here (e.g. 'wake on 🐞 reactions "
+                    "in the bug channel').]"
                 ),
                 message_type=MessageType.TEXT,
                 source=source,
@@ -830,6 +831,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 data = self._filament_api.parse_tool_result(self_info)
                 if isinstance(data, dict):
                     self._user_id = data.get("mxid") or data.get("user_id")
+                    self._self_name = data.get("display_name") or None
 
                     # Backchannel + owner, so a first-contact hello has
                     # somewhere to go (see _maybe_greet).
@@ -2295,14 +2297,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         # Ephemeral tool map (system prompt, never persisted): saves the
         # model the tool_search/tool_describe discovery rounds. See framing.
+        # The wake-policy rendering rides along, read fresh like every other
+        # policy consumer, so questions about wake behavior are answered from
+        # the values in force this turn — control plane only: on a data turn
+        # it would hand the trigger configuration to every participant.
         # suppress: test doubles build plain dict sources.
         if not gateway_command:
+            policy, policy_set_keys = self._wake_policy.read_with_provenance()
             with contextlib.suppress(AttributeError):
                 source.channel_prompt = (
                     f"{framing.TOOL_MAP_PROMPT}\n\n"
                     + framing.command_map_prompt(
                         self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
                     )
+                    + "\n\n"
+                    + framing.wake_policy_prompt(policy, policy_set_keys)
                 )
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel

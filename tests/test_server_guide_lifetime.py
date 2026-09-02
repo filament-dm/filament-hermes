@@ -124,6 +124,10 @@ def _greet_stub(guide_ready: bool):
         _server_guide_ready=guide_ready,
         _owner_id="@principal:server",
         _owner_name="Principal",
+        _self_name="Agent",
+        _wake_policy=types.SimpleNamespace(
+            read_with_provenance=lambda: ({}, frozenset())
+        ),
         _installation_id="inst",
         _gateway_instance_id="gw",
         _filament_api=_Api(),
