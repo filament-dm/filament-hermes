@@ -45,6 +45,7 @@ def _main_with(ready, monkeypatch):
         "migrate_legacy_install": _noop,
         "_run_interactive_setup": lambda: ready,
         "_restart_gateway": lambda: restarts.append(True),
+        "_find_hermes_home": lambda: Path("/tmp/hermes-home"),
     }
     return _extract("main", ns), restarts
 

@@ -457,7 +457,7 @@ def _run_interactive_setup() -> bool | None:
         remove_env_value("FILAMENT_CONTROL_USERS")
 
     print()
-    print_success("Configuration saved to ~/.hermes/.env")
+    print_success(f"Configuration saved to {_find_hermes_home() / '.env'}")
 
     return True
 
@@ -665,7 +665,9 @@ def main() -> None:
     else:
         print_info("Setup incomplete.")
     print_info("Check status: hermes gateway status")
-    print_info("View logs:    tail -f ~/.hermes/logs/gateway.log")
+    # Print the resolved home, not the ~/.hermes default: on Docker/cloud
+    # images HERMES_HOME is /opt/data and ~/.hermes does not exist.
+    print_info(f"View logs:    tail -f {_find_hermes_home() / 'logs' / 'gateway.log'}")
     print()
     if ready is False:
         # Exit nonzero so a scripted install (the hosted-attach exec pipes
