@@ -201,6 +201,50 @@ def _enable_plugin() -> None:
         print_info(f"Enabled {PLUGIN_ID} in {config_path}")
 
 
+# Hermes ships CLI-shaped display defaults: a message sent mid-run interrupts
+# the task and posts an "Interrupting current task" ack, and mid-turn assistant
+# text ("I'll check the recent messages first.") is relayed as messages. In a
+# chat room both read as noise, so an install gets quieter values. Only absent
+# keys are written, so an explicit choice survives re-running setup. The
+# interim gate is scoped to our platform; the busy knobs have no per-platform
+# form in Hermes, and the gateway reads them at start.
+PLATFORM_NAME = "filament-fcm"
+_BUSY_DEFAULTS = {"busy_input_mode": "queue", "busy_ack_enabled": False}
+_PLATFORM_DISPLAY_DEFAULTS = {"interim_assistant_messages": False}
+
+
+def _subdict(parent: dict, key: str) -> dict:
+    child = parent.get(key)
+    if not isinstance(child, dict):
+        child = parent[key] = {}
+    return child
+
+
+def seed_display_defaults() -> None:
+    """Fill in the chat-friendly display settings config.yaml doesn't set yet."""
+    config_path = _find_hermes_home() / "config.yaml"
+    config: dict = {}
+    if config_path.exists():
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+
+    display = _subdict(config, "display")
+    ours = _subdict(_subdict(display, "platforms"), PLATFORM_NAME)
+    missing = {k: v for k, v in _BUSY_DEFAULTS.items() if k not in display}
+    missing_ours = {
+        k: v for k, v in _PLATFORM_DISPLAY_DEFAULTS.items() if k not in ours
+    }
+    if not missing and not missing_ours:
+        return
+
+    display.update(missing)
+    ours.update(missing_ours)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False)
+    print_info(f"Set chat display defaults in {config_path}")
+
+
 # JSON-RPC codes from the agents MCP. -32002: token valid but the account
 # doesn't exist yet ("reserved" — the principal hasn't finished the connect
 # flow). Anything else (e.g. -32001) means the token isn't usable.
@@ -647,6 +691,7 @@ def main() -> None:
     print_header("filament-fcm-setup")
 
     migrate_legacy_install()
+    seed_display_defaults()
     print()
     ready = _run_interactive_setup()
     print()

@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "prek",
     "pytest",
+    "pyyaml>=6.0.3",
     "ruff",
 ]
 

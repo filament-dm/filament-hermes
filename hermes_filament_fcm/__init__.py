@@ -60,7 +60,12 @@ from .server_config import (
     shed_descriptions_to_budget,
     truncate_description,
 )
-from .setup_cli import PLUGIN_ID, _run_interactive_setup, migrate_legacy_install
+from .setup_cli import (
+    PLUGIN_ID,
+    _run_interactive_setup,
+    migrate_legacy_install,
+    seed_display_defaults,
+)
 from .status import enabled as status_enabled
 from .status import pre_tool_call_hook as status_pre_tool_call
 from .turn_context import Zone
@@ -287,6 +292,7 @@ def interactive_setup() -> None:
     Delegates to ``setup_cli`` which owns the shared implementation.
     """
     migrate_legacy_install()
+    seed_display_defaults()
     _run_interactive_setup()
 
 
