@@ -23,7 +23,7 @@ _SETUP_CLI = (
 )
 
 _WANTED_FUNCS = {"_exchange_connect_token", "_pasted_token_if_alive"}
-_WANTED_ASSIGNS = {"_TOKEN_EXCHANGE_GRANT", "_ACCESS_TOKEN_TYPE"}
+_WANTED_ASSIGNS = {"_TOKEN_EXCHANGE_GRANT", "_ACCESS_TOKEN_TYPE", "_AUTH_REQUIRED_CODE"}
 
 
 class _Response:
@@ -137,6 +137,28 @@ def test_lost_reply_with_dead_paste_returns_none():
     fake = _FakeHttpx(OSError("read timeout"), _Response(401, {}))
     exchange = _load_exchange(fake)
     assert exchange("fmcp_pasted", URL) is None
+
+
+def test_lost_reply_with_enveloped_auth_error_returns_none():
+    """Some JSON-RPC-over-HTTP servers signal auth failures as -32001 inside
+    a 200 envelope rather than an HTTP 401 — that is still a dead paste."""
+    fake = _FakeHttpx(
+        OSError("read timeout"),
+        _Response(200, {"error": {"code": -32001, "message": "auth required"}}),
+    )
+    exchange = _load_exchange(fake)
+    assert exchange("fmcp_pasted", URL) is None
+
+
+def test_lost_reply_with_enveloped_transient_error_keeps_the_paste():
+    """A non-auth JSON-RPC error (e.g. internal error) says nothing about the
+    token — the paste authenticated, so it is still the credential to keep."""
+    fake = _FakeHttpx(
+        OSError("read timeout"),
+        _Response(200, {"error": {"code": -32603, "message": "internal error"}}),
+    )
+    exchange = _load_exchange(fake)
+    assert exchange("fmcp_pasted", URL) == "fmcp_pasted"
 
 
 def test_lost_reply_with_failed_probe_returns_none():

@@ -205,8 +205,10 @@ def _enable_plugin() -> None:
 
 # JSON-RPC codes from the agents MCP. -32002: token valid but the account
 # doesn't exist yet ("reserved" — the principal hasn't finished the connect
-# flow). Anything else (e.g. -32001) means the token isn't usable.
+# flow). -32001: auth required — the token itself is bad and retrying won't
+# help. Everything else is transient.
 _RESERVED_CODE = -32002
+_AUTH_REQUIRED_CODE = -32001
 
 # How long to keep trying an endpoint that never answers before giving up.
 # Generous, because a laptop waking from sleep or a VPN reconnecting can take
@@ -232,9 +234,6 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     instead — a bad URL never resolves itself. Any reply resets that budget. An
     endpoint that answers but errs is retried forever; only -32001 aborts.
     """
-    # Only this specific error code means the token itself is bad and
-    # retrying won't help. Everything else is transient or reserved.
-    _AUTH_REQUIRED_CODE = -32001
 
     async def _poll() -> tuple[bool, str | None]:
         api = FilamentAPI(url, token)
@@ -363,7 +362,17 @@ def _pasted_token_if_alive(token: str, url: str) -> str | None:
             headers={"Authorization": f"Bearer {token}", **version_headers()},
             timeout=15.0,
         )
-        alive = resp.status_code != 401
+        # Our server 401s a dead token, but JSON-RPC-over-HTTP servers also
+        # signal auth failures as -32001 inside a 200 envelope — honor both
+        # before trusting a credential enough to persist it.
+        try:
+            error = resp.json().get("error")
+        except Exception:
+            error = None
+        auth_rejected = (
+            isinstance(error, dict) and error.get("code") == _AUTH_REQUIRED_CODE
+        )
+        alive = resp.status_code != 401 and not auth_rejected
     except Exception:
         alive = False
     if alive:
