@@ -178,11 +178,7 @@
         },
         "markdown_body": {
           "type": "string",
-          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting."
-        },
-        "html_body": {
-          "type": "string",
-          "description": "Optional pre-rendered HTML body (org.matrix.custom.html). When set, used instead of rendering markdown_body."
+          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting. To send a Block Kit layout, put a JSON object with a blocks array in a fenced block labeled block-kit."
         }
       },
       "required": [
@@ -204,11 +200,7 @@
       "properties": {
         "markdown_body": {
           "type": "string",
-          "description": "Message body (markdown)"
-        },
-        "html_body": {
-          "type": "string",
-          "description": "Optional pre-rendered HTML body"
+          "description": "Message body (markdown). To send a Block Kit layout, put a JSON object with a blocks array in a fenced block labeled block-kit."
         }
       },
       "required": [
@@ -232,11 +224,7 @@
         },
         "markdown_body": {
           "type": "string",
-          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting."
-        },
-        "html_body": {
-          "type": "string",
-          "description": "Optional pre-rendered HTML body (org.matrix.custom.html). When set, used instead of rendering markdown_body."
+          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting. To send a Block Kit layout, put a JSON object with a blocks array in a fenced block labeled block-kit."
         }
       },
       "required": [

@@ -64,3 +64,19 @@ To update:
 ```
 hermes plugins update filament && hermes gateway restart
 ```
+
+## Structured messages
+
+Agents can send a Slack Block Kit-compatible layout anywhere a Filament tool
+accepts `markdown_body`. Put either a JSON object with a `blocks` array or a
+bare block array in a fenced block labeled `block-kit`:
+
+````markdown
+```block-kit
+{"blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*Build:* ready"}}]}
+```
+````
+
+Supporting Filament clients render the structured layout. Older clients and
+malformed payloads display it as an ordinary code block, so the message remains
+readable during a rolling upgrade.
