@@ -19,6 +19,12 @@ no reinstall needed. Add `--url` to point at a dev or staging cluster. `--force`
 on the install makes the same line work whether or not the plugin is already
 there, so it is safe to re-run.
 
+The pasted token is an onboarding credential: once it validates, connect
+exchanges it for a fresh one and saves that instead, and the exchange consumes
+the pasted token — so the copy in your shell history (or anyone who saw the
+one-liner) stops working the moment the agent connects. Against a server that
+doesn't support the exchange yet, the pasted token is kept as-is.
+
 ### On a shared machine, use `-p`
 
 The token above is on the command line, which your shell writes to its history,

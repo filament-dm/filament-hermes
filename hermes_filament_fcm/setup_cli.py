@@ -22,6 +22,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 import yaml
 from hermes_cli.setup import (
     get_env_value,
@@ -35,6 +36,7 @@ from hermes_cli.setup import (
     save_env_value,
 )
 
+from ._version import version_headers
 from .filament_api import FilamentAPI
 
 # The Firebase project the gateway registers with. It must be the same project
@@ -331,6 +333,55 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
         return False, None
 
 
+# RFC 8693 token exchange, with the connect token itself as the subject —
+# the server consumes it and returns a fresh bearer (ENG-893).
+_TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
+_ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+
+def _exchange_connect_token(token: str, url: str) -> str:
+    """Swap the pasted connect token for a fresh bearer; return what to persist.
+
+    The connect token rode the copy-pasted one-liner, so it lives in shell
+    history and the process environment of everything the installer ran. The
+    server's token-exchange grant consumes it (single-use) and returns a
+    replacement that never left the TLS channel — that replacement is what we
+    save. Call this only after the token validated (the agent is finalized):
+    the server refuses to consume a reservation.
+
+    Best-effort on purpose: any failure returns the original token so setup
+    still completes against a server that predates the exchange (its token
+    endpoint rejects an fmcp_ subject as an invalid Matrix token; nothing is
+    consumed).
+    """
+    try:
+        resp = httpx.post(
+            f"{url}/oauth/token",
+            data={
+                "grant_type": _TOKEN_EXCHANGE_GRANT,
+                "subject_token": token,
+                "subject_token_type": _ACCESS_TOKEN_TYPE,
+            },
+            headers=version_headers(),
+            timeout=30.0,
+        )
+        if resp.status_code == 200:
+            fresh = resp.json().get("access_token")
+            if isinstance(fresh, str) and fresh.startswith("fmcp_"):
+                print_info(
+                    "Exchanged the connect token for a fresh credential "
+                    "(the pasted one no longer works)."
+                )
+                return fresh
+    except Exception:
+        pass
+    print_info(
+        "Keeping the pasted token (this server doesn't rotate connect "
+        "tokens, or the exchange didn't go through)."
+    )
+    return token
+
+
 def _run_interactive_setup() -> bool | None:
     """Run the interactive setup prompts.
 
@@ -390,7 +441,9 @@ def _run_interactive_setup() -> bool | None:
     if not ready:
         return False
 
-    # Token validated — persist all configuration.
+    # Retire the pasted (shell-history-exposed) token for a fresh one, then
+    # persist all configuration.
+    token = _exchange_connect_token(token, url)
     save_env_value("FILAMENT_MCP_TOKEN", token)
     save_env_value("FILAMENT_MCP_URL", url)
     # A token names an identity; a FILAMENT_HOME_ROOM carried over from a
@@ -564,6 +617,9 @@ def connect(
         return 1
 
     migrate_legacy_install()
+    # Retire the pasted (shell-history-exposed) token for a fresh one, as
+    # late as possible so a failure above never strands an unsaved credential.
+    token = _exchange_connect_token(token, resolved)
     _persist(token, resolved, principal_id)
     print_success("Connected. Configuration saved.")
 
