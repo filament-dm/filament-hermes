@@ -783,6 +783,21 @@ def test_feature_flag_default_off_and_toggle():
         assert store.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
 
 
+def test_compact_timeline_is_on_unless_turned_off():
+    # The one default-on flag: it changes only how much context a history read
+    # costs, never what the agent does.
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.FeatureFlagStore(Path(d) / "feature_flags.json")
+        assert reactive.FEATURE_COMPACT_TIMELINE in reactive.DEFAULT_ON_FEATURES
+        assert store.is_enabled(reactive.FEATURE_COMPACT_TIMELINE) is True
+        store.set(reactive.FEATURE_COMPACT_TIMELINE, False)
+        assert store.is_enabled(reactive.FEATURE_COMPACT_TIMELINE) is False
+        store.set(reactive.FEATURE_COMPACT_TIMELINE, True)
+        assert store.is_enabled(reactive.FEATURE_COMPACT_TIMELINE) is True
+        # Every other flag still ships dark.
+        assert store.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
+
+
 def test_feature_flag_set_preserves_other_flags():
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "feature_flags.json"

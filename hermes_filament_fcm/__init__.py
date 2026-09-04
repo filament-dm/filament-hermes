@@ -474,6 +474,7 @@ def register(ctx: Any) -> None:
         registered,
         skipped,
     )
+    _keep_visible({t.get("name", "") for t in all_tools} & set(ALWAYS_VISIBLE_TOOLS))
 
     # Media bytes never flow through MCP tools/call (results are JSON) — they
     # come from the /mcp/agents/media side-channel. Register a local
@@ -493,6 +494,43 @@ def register(ctx: Any) -> None:
     _register_reactive_tools(ctx, server_sync, tool_descriptions)
     _register_capability_gate(ctx)
     register_cli(ctx)
+
+
+# The Filament tools the standing instructions and the tool map name. Hermes'
+# tool search defers every plugin tool behind tool_search/tool_describe, so a
+# reactive turn spent two model rounds rediscovering message_principal's
+# schema before it could follow its own instructions. Core tools are never
+# deferred; these join that set.
+ALWAYS_VISIBLE_TOOLS = (
+    "message_principal",
+    "get_recent_messages",
+    "get_thread",
+    "reply_in_thread",
+    "post_message",
+    "react",
+    "mark_read",
+    "list_channels",
+)
+
+
+def _keep_visible(names: set[str]) -> int:
+    """Exempt ``names`` from tool-search deferral. Returns how many were added."""
+    try:
+        import toolsets  # noqa: PLC0415
+
+        core = toolsets._HERMES_CORE_TOOLS
+    except Exception:
+        logger.info("filament-fcm: no core tool list to pin visible tools onto")
+        return 0
+    added = 0
+    for name in sorted(names):
+        if name not in core:
+            core.append(name)
+            added += 1
+    logger.info(
+        "filament-fcm: %d tools kept visible to the model (never deferred)", added
+    )
+    return added
 
 
 def _tool_inventory(

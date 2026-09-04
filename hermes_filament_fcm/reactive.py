@@ -1488,6 +1488,11 @@ FEATURE_COMPACT_TIMELINE = "compact_timeline"
 # the reply lands is decoupled from which session the turn joins.
 FEATURE_SHARED_CHANNEL_SESSIONS = "shared_channel_sessions"
 
+# Flags that are on unless the principal turns them off. Compact rendering
+# changes no behavior, only how much of the context window a history read
+# costs, so it is the one default-on flag.
+DEFAULT_ON_FEATURES = frozenset({FEATURE_COMPACT_TIMELINE})
+
 # Human-facing descriptions for the flags the code actually checks. Keep in
 # sync with the checks; surfaced by get_features and the set_feature tool so the
 # principal (and the agent mapping their request) knows what can be toggled.
@@ -1511,8 +1516,8 @@ KNOWN_FEATURES: dict[str, str] = {
         "provenance-labeled line per message instead of pretty-printed "
         "JSON, cutting the per-fetch context cost roughly tenfold. Content "
         "is never dropped — body, sender, time, event id, media and "
-        "reactions all survive; only envelope metadata goes. Off by "
-        "default; when off, results render as JSON exactly as before."
+        "reactions all survive; only envelope metadata goes. On by "
+        "default; when off, results render as JSON."
     ),
     FEATURE_SHARED_CHANNEL_SESSIONS: (
         "One conversation memory per shared channel, shared by every "
@@ -1566,9 +1571,9 @@ class FeatureFlagStore:
         return {}
 
     def is_enabled(self, name: str) -> bool:
-        """True only if the flag is present AND truthy. Absent/unknown → False
-        (fail-dark)."""
-        return bool(self.read().get(name, False))
+        """The flag's stored value, or its default when absent: False
+        (fail-dark) for every flag but those in ``DEFAULT_ON_FEATURES``."""
+        return bool(self.read().get(name, name in DEFAULT_ON_FEATURES))
 
     def write(self, flags: dict) -> None:
         """Replace the whole flag file (same serialization ``set`` uses)."""
