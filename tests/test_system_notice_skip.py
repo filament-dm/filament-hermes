@@ -140,6 +140,10 @@ def _make_adapter():
     a._user_id = _AGENT
     a._cc_room_id = None
     a._wake_policy = _AlwaysWakePolicy()
+    a._feature_flags = types.SimpleNamespace(is_enabled=lambda name: False)
+    a._seen_history = types.SimpleNamespace(
+        get=lambda key: None, record=lambda *a, **k: None
+    )
     a._engaged_threads = _NoEngagedThreads()
     a._sender_is_agent_cache = {}
     a._filament_api = None

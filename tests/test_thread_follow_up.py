@@ -151,6 +151,8 @@ def _make_adapter(tmp: Path, thread: dict | None):
     a._user_id = _AGENT
     a._cc_room_id = None
     a._wake_policy = reactive.WakePolicyStore(tmp / "wake.json")
+    a._feature_flags = reactive.FeatureFlagStore(tmp / "flags.json")
+    a._seen_history = reactive.SeenHistoryStore(tmp / "seen.json")
     a._engaged_threads = reactive.EngagedThreadStore(tmp / "threads.json")
     a._sender_is_agent_cache = {}
     a._filament_api = _FakeFilamentAPI(thread) if thread is not None else None
@@ -180,6 +182,7 @@ def _push(
     thread_id: str | None = _ROOT,
     is_mention: bool = False,
     event_id: str = "$follow_up",
+    sender_is_agent: bool | None = None,
 ):
     return fcm_client.PushMessage(
         event_id=event_id,
@@ -195,6 +198,7 @@ def _push(
         is_everyone_mention=False,
         raw={},
         has_content=True,
+        sender_is_agent=sender_is_agent,
     )
 
 
@@ -297,3 +301,199 @@ def test_muted_mention_does_not_record_engagement():
         _run(a, _push(_HUMAN, thread_id=None, is_mention=True, event_id=_ROOT))
         assert woke == []
         assert not a._engaged_threads.is_engaged("!shared", _ROOT)
+
+
+class _CapturingEvent:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def test_wake_puts_the_tool_map_on_the_event():
+    """The gateway reads the ephemeral prompt off the MessageEvent. Setting it
+    on the source (as the adapter once did) reaches nothing."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, _ = _make_adapter(tmp, None)
+        a._wake = adapter.FCMFilamentAdapter._wake.__get__(a)
+        a._instructions_store = reactive.InstructionsStore(tmp / "instructions.md")
+        a._server_guide_ready = False
+        a._owner_id = "@owner:example.org"
+        a._feature_flags = reactive.FeatureFlagStore(tmp / "flags.json")
+        a._capability_store = reactive.CapabilityPolicyStore(tmp / "caps.json")
+        a._channel_instructions = reactive.ChannelInstructionsStore(tmp / "ci.json")
+        a._shared_sessions_effective = lambda: False
+        a._cursor_channel_for_turn = lambda channel, thread_id: None
+        a._apply_session_keying = lambda: None
+        a.build_source = types.SimpleNamespace
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        a.handle_message = _capture
+        original_event = adapter.MessageEvent
+        adapter.MessageEvent = _CapturingEvent
+        try:
+            asyncio.run(
+                a._wake(
+                    channel="!shared",
+                    channel_name="general",
+                    sender=_HUMAN,
+                    sender_name="Someone",
+                    trigger="message",
+                    data="hello",
+                    target_event_id="$e",
+                    thread_id="$e",
+                    raw={},
+                    breadcrumb=None,
+                )
+            )
+        finally:
+            adapter.MessageEvent = original_event
+        assert len(captured) == 1
+        event = captured[0]
+        assert event.channel_prompt == adapter.framing.TOOL_MAP_PROMPT
+        assert event.channel_context is None
+        assert "[WAKE-UP SIGNAL]" in event.text
+
+
+def test_push_flag_classifies_the_sender_without_a_fetch():
+    """A server that says sender_is_agent spares the get_thread round trip;
+    the answer is cached like a fetched one."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, woke = _make_adapter(tmp, thread=None)
+        a._engaged_threads.record("!shared", _ROOT)
+        _run(a, _push(_HUMAN, sender_is_agent=False))
+        assert len(woke) == 1
+        assert a._sender_is_agent_cache[_HUMAN] is False
+        a2, woke2 = _make_adapter(tmp, thread=None)
+        a2._engaged_threads.record("!shared", _ROOT)
+        _run(a2, _push("@bot:example.org", sender_is_agent=True))
+        assert woke2 == []
+
+
+class _HistoryAPI:
+    """get_recent_messages returns a fixed channel window; get_thread a thread."""
+
+    def __init__(self, window, thread=None):
+        self.window = window
+        self.thread = thread
+        self.calls = []
+
+    async def call_tool(self, name, args):
+        self.calls.append((name, args))
+        return {
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps({"messages": self.window})}
+                ]
+            }
+        }
+
+    async def get_thread(self, message_id):
+        self.calls.append(("get_thread", {"message_id": message_id}))
+        return {
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(self.thread or {})}]
+            }
+        }
+
+    @staticmethod
+    def parse_tool_result(result):
+        return json.loads(result["result"]["content"][0]["text"])
+
+
+def _msg(event_id, body, sender=_HUMAN, ts=1):
+    return {"event_id": event_id, "sender": sender, "body": body, "timestamp": ts}
+
+
+def test_first_wake_inlines_the_unseen_channel_history_and_marks_it_seen():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, woke = _make_adapter(tmp, thread=None)
+        a._filament_api = _HistoryAPI(
+            [
+                _msg("$1", "earlier one", ts=1),
+                _msg("$2", "earlier two", ts=2),
+                _msg("$m1", "hi agent", ts=3),
+            ]
+        )
+        _run(a, _push(_HUMAN, thread_id=None, is_mention=True, event_id="$m1"))
+        assert woke[-1]["breadcrumb"] is None
+        assert (
+            "earlier one" in woke[-1]["history"]
+            and "earlier two" in woke[-1]["history"]
+        )
+        # The trigger itself is in the envelope already, not the history.
+        assert "hi agent" not in woke[-1]["history"]
+        key = reactive.history_key("!shared", "$m1", _HUMAN, False)
+        assert a._seen_history.get(key) == "$m1"
+
+
+def test_second_wake_in_the_same_conversation_inlines_only_what_is_new():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, woke = _make_adapter(tmp, thread=None)
+        root = _msg("$root", "hi agent", ts=1)
+        a._filament_api = _HistoryAPI(
+            [], thread={"root": root, "replies": [_msg("$r1", "first reply", ts=2)]}
+        )
+        _run(a, _push(_HUMAN, thread_id="$root", is_mention=True, event_id="$r1"))
+        # First wake in the thread: the root is new to this conversation.
+        assert "hi agent" in woke[-1]["history"]
+        a._filament_api = _HistoryAPI(
+            [],
+            thread={
+                "root": root,
+                "replies": [
+                    _msg("$r1", "first reply", ts=2),
+                    _msg("$r2", "second reply", ts=3),
+                    _msg("$r3", "third reply", ts=4),
+                ],
+            },
+        )
+        _run(a, _push(_HUMAN, thread_id="$root", is_mention=True, event_id="$r3"))
+        # Second wake: only what landed after the last mark, minus the trigger.
+        assert "second reply" in woke[-1]["history"]
+        assert "hi agent" not in woke[-1]["history"]
+        assert "first reply" not in woke[-1]["history"]
+        assert "third reply" not in woke[-1]["history"]
+
+
+def test_a_wake_with_nothing_new_carries_no_history_and_no_cue():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, woke = _make_adapter(tmp, thread=None)
+        a._filament_api = _HistoryAPI([_msg("$1", "only the trigger", ts=1)])
+        _run(a, _push(_HUMAN, thread_id=None, is_mention=True, event_id="$1"))
+        assert woke[-1]["history"] is None
+        assert woke[-1]["breadcrumb"] is None
+
+
+def test_per_sender_conversations_keep_separate_marks():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, woke = _make_adapter(tmp, thread=None)
+        a._wake_policy.set_reply_style("!shared", "channel") if hasattr(
+            a._wake_policy, "set_reply_style"
+        ) else None
+        a._filament_api = _HistoryAPI(
+            [_msg("$1", "earlier", ts=1), _msg("$m1", "hi", ts=2)]
+        )
+        _run(a, _push(_HUMAN, thread_id=None, is_mention=True, event_id="$m1"))
+        a._filament_api = _HistoryAPI(
+            [
+                _msg("$1", "earlier", ts=1),
+                _msg("$m1", "hi", ts=2),
+                _msg("$m2", "hello", sender="@other:example.org", ts=3),
+            ]
+        )
+        _run(
+            a,
+            _push(
+                "@other:example.org", thread_id=None, is_mention=True, event_id="$m2"
+            ),
+        )
+        # A different sender is a different conversation: it sees the whole window.
+        assert "earlier" in woke[-1]["history"]

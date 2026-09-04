@@ -67,11 +67,13 @@ from .reactive import (
     EngagedThreadStore,
     FeatureFlagStore,
     InstructionsStore,
+    SeenHistoryStore,
     WakePolicyStore,
     capability_hint,
     context_breadcrumb,
     conversation_key,
     guidance_block,
+    history_key,
     is_agent_mention,
     is_system_sender,
     keying_and_reply,
@@ -137,6 +139,10 @@ _NOT_FINALIZED_CODE = -32002
 # linear (2s, 4s) to stay well inside a connect attempt.
 _VOUCH_ACCEPT_ATTEMPTS = 3
 _VOUCH_ACCEPT_BACKOFF_S = 2.0
+
+
+# "Not passed": lets _wake tell an absent breadcrumb from one read as None.
+_UNSET: object = object()
 
 
 def _is_not_finalized(result: dict | None) -> bool:
@@ -253,6 +259,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Per-channel guidance, read fresh per wake like the stores above but
         # written only by the server-config sync (no backchannel set_* tool).
         self._channel_instructions = ChannelInstructionsStore()
+        # Per conversation, the newest message the model has been shown, so a
+        # wake inlines only the history that is new to its session.
+        self._seen_history = SeenHistoryStore()
         # Per-(channel, sender) tool-capability policy for data-plane turns.
         # Read fresh per wake so a backchannel set_capabilities takes effect on
         # the next event, exactly like the wake policy and standing instructions.
@@ -480,6 +489,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         attachment note.
         """
         note = None
+        if msg.has_media is False:
+            # The server said there is no attachment: nothing to fetch.
+            return None if msg.has_content else framing.NON_TEXT_NOTICE
         try:
             with bound_context(call_origin="media_lookup"):
                 result = await self._filament_api.get_thread(msg.event_id)
@@ -740,11 +752,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 message_id=trigger_id,
             )
             policy, policy_set_keys = self._wake_policy.read_with_provenance()
-            with contextlib.suppress(AttributeError):
-                source.channel_prompt = (
-                    f"{framing.TOOL_MAP_PROMPT}\n\n"
-                    + framing.wake_policy_prompt(policy, policy_set_keys)
-                )
+            channel_prompt = (
+                f"{framing.TOOL_MAP_PROMPT}\n\n"
+                + framing.wake_policy_prompt(policy, policy_set_keys)
+            )
             event = MessageEvent(
                 text=(
                     "[system: You just connected and posted a canned hello in "
@@ -761,6 +772,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 source=source,
                 message_id=trigger_id,
                 raw_message=None,
+                channel_prompt=channel_prompt,
             )
             with bound_context(
                 installation_id=self._installation_id,
@@ -1998,13 +2010,6 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if mentioned or thread_follow_up:
             self._engaged_threads.record(msg.room_id, msg.thread_id or msg.event_id)
 
-        # The push never includes attachments (ENG-603): describe any media on
-        # the event so the agent knows it exists. Only for admitted wakes, so
-        # skipped messages don't cost an API call.
-        data = framing.append_note(
-            self._strip_mention(msg.body or ""), await self._media_note(msg)
-        )
-
         # Where the reply lands is a per-channel wake-policy choice. Default
         # ("thread") threads off the triggering message: a top-level message
         # roots a new thread (thread_id = event_id). A channel configured
@@ -2019,6 +2024,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             self._wake_policy.reply_style(msg.room_id),
             self._shared_sessions_effective(),
         )
+        # Two independent reads for one admitted wake, in one round trip: the
+        # attachment note (the push never includes attachments, ENG-603) and
+        # the channel-history cue. Only for admitted wakes, so skipped
+        # messages don't cost an API call.
+        key = history_key(
+            msg.room_id, keying_thread, msg.sender, self._shared_sessions_effective()
+        )
+        media_note, (history, cue, newest) = await asyncio.gather(
+            self._media_note(msg),
+            self._history_for_wake(msg.room_id, msg.event_id, msg.thread_id, key),
+        )
+        data = framing.append_note(self._strip_mention(msg.body or ""), media_note)
         await self._wake(
             channel=msg.room_id,
             channel_name=msg.room_name,
@@ -2033,7 +2050,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=keying_thread,
             reply_anchor=reply_anchor,
             raw=msg.raw,
+            breadcrumb=cue,
+            history=history,
         )
+        # Dispatched: whatever the window held is now in front of this
+        # conversation, shown or skipped as the agent's own.
+        if newest:
+            self._seen_history.record(key, newest[0], newest[1])
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     @staticmethod
@@ -2159,6 +2182,83 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         return crumb
 
+    async def _history_for_wake(
+        self,
+        channel: str,
+        trigger_event_id: str,
+        thread_id: "str | None",
+        key: str,
+    ) -> "tuple[str | None, str | None, tuple[str, int | None] | None]":
+        """The history this wake's conversation has not been shown yet.
+
+        A wake inside a thread reads the thread (root and replies); a
+        top-level wake reads the channel's recent messages. Everything up to
+        the conversation's seen mark, the agent's own posts and the trigger
+        itself are left out, and what remains is rendered compactly for the
+        event-data block. Returns ``(history, count_cue, newest)``: the cue
+        stands in when rendering fails, ``newest`` is what to mark seen once
+        the turn is dispatched. Best-effort: any failure returns three Nones
+        and the turn proceeds without history.
+        """
+        if not self._filament_api:
+            return None, None, None
+        try:
+            if thread_id:
+                parsed = FilamentAPI.parse_tool_result(
+                    await self._filament_api.get_thread(thread_id)
+                )
+                root = parsed.get("root") if isinstance(parsed, dict) else None
+                replies = parsed.get("replies") if isinstance(parsed, dict) else None
+                messages = ([root] if isinstance(root, dict) else []) + [
+                    r for r in (replies or []) if isinstance(r, dict)
+                ]
+            else:
+                parsed = FilamentAPI.parse_tool_result(
+                    await self._filament_api.call_tool(
+                        "get_recent_messages",
+                        {"channel": channel, "limit": BREADCRUMB_LIMIT},
+                    )
+                )
+                messages = (
+                    parsed.get("messages", []) if isinstance(parsed, dict) else []
+                )
+                messages = [m for m in messages if isinstance(m, dict)]
+        except Exception:  # enrichment only, never fatal to a turn
+            logger.warning(
+                "filament-fcm: history read failed for %s", channel, exc_info=True
+            )
+            return None, None, None
+        seen = self._seen_history.get(key)
+        unseen, _ = unseen_messages(
+            messages, trigger_event_id=trigger_event_id, last_seen_event_id=seen
+        )
+        newest = timeline.newest_message({"messages": messages})
+        if not unseen:
+            logger.info(
+                "filament-fcm: history for %s: %d read, nothing new", key, len(messages)
+            )
+            return None, None, newest
+        try:
+            rendered = timeline.render_recent_messages(
+                {"messages": unseen}, channel=channel
+            )
+        except Exception:
+            # Renderer surprise: the counted cue still carries the signal.
+            return (
+                None,
+                context_breadcrumb(
+                    messages, trigger_event_id=trigger_event_id, last_seen_event_id=seen
+                ),
+                newest,
+            )
+        logger.info(
+            "filament-fcm: history for %s: %d unseen of %d read, inlined",
+            key,
+            len(unseen),
+            len(messages),
+        )
+        return rendered, None, newest
+
     async def _sender_is_agent(self, msg: PushMessage) -> bool | None:
         """Whether the message's sender is an agent (bot) — the storm-guard
         input for engaged-thread wakes (ENG-724).
@@ -2173,6 +2273,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
         if msg.sender in self._sender_is_agent_cache:
             return self._sender_is_agent_cache[msg.sender]
+        if msg.sender_is_agent is not None:
+            # The push already says; the same server-computed fact get_thread
+            # would return, without the round trip.
+            self._sender_is_agent_cache[msg.sender] = msg.sender_is_agent
+            return msg.sender_is_agent
         if not self._filament_api or not msg.thread_id:
             return None
         try:
@@ -2266,12 +2371,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         if gateway_command:
             body = slash_body
+            breadcrumb = None
         else:
             body = self._strip_mention(msg.body) if msg.body else msg.body
-            # The push never includes attachments (ENG-603): describe any media
-            # on the event so the agent knows it exists (an uncaptioned image
-            # would otherwise arrive as an empty message).
-            body = framing.append_note(body, await self._media_note(msg))
+            # Two independent reads in one round trip: the attachment note
+            # (the push never includes attachments, ENG-603, so an uncaptioned
+            # image would otherwise arrive as an empty message) and the
+            # backchannel context this session may not have seen (below).
+            media_note, breadcrumb = await asyncio.gather(
+                self._media_note(msg),
+                self._context_breadcrumb(msg.room_id, msg.event_id, inline=True),
+            )
+            body = framing.append_note(body, media_note)
             # Name the speaker in the turn's framing (see framing.control_body:
             # the principal is recognized by server-attributed id, never by
             # display name).
@@ -2301,28 +2412,22 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # policy consumer, so questions about wake behavior are answered from
         # the values in force this turn — control plane only: on a data turn
         # it would hand the trigger configuration to every participant.
-        # suppress: test doubles build plain dict sources.
+        channel_prompt = None
         if not gateway_command:
             policy, policy_set_keys = self._wake_policy.read_with_provenance()
-            with contextlib.suppress(AttributeError):
-                source.channel_prompt = (
-                    f"{framing.TOOL_MAP_PROMPT}\n\n"
-                    + framing.command_map_prompt(
-                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
-                    )
-                    + "\n\n"
-                    + framing.wake_policy_prompt(policy, policy_set_keys)
+            channel_prompt = (
+                f"{framing.TOOL_MAP_PROMPT}\n\n"
+                + framing.command_map_prompt(
+                    self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
                 )
+                + "\n\n"
+                + framing.wake_policy_prompt(policy, policy_set_keys)
+            )
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel
-        # timeline may hold context this session never saw. Flag the count so
-        # the agent reads it instead of answering "I don't see that" from an
-        # empty memory. The framework prepends channel_context to the body.
-        breadcrumb = (
-            None
-            if gateway_command
-            else await self._context_breadcrumb(msg.room_id, msg.event_id, inline=True)
-        )
+        # timeline may hold context this session never saw. The breadcrumb
+        # read above carries it; the framework prepends channel_context to
+        # the body.
         event = MessageEvent(
             text=body,
             message_type=MessageType.TEXT,
@@ -2330,6 +2435,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             message_id=msg.event_id,
             raw_message=msg.raw,
             channel_context=breadcrumb,
+            channel_prompt=channel_prompt,
         )
         logger.info(
             "Dispatching control message from %s (event=%s, room=%s)",
@@ -2686,6 +2792,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         raw: dict | None,
         reply_anchor: str | None = None,
         wake_event_id: str | None = None,
+        breadcrumb: str | object | None = _UNSET,
+        history: str | None = None,
     ) -> None:
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + any per-channel guidance + the event data,
@@ -2718,6 +2826,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             data_block = framing.reaction_data_block(trigger, target_event_id)
         else:
             data_block = data  # the event content — DATA the instructions act on
+        # Inlined history is untrusted like the event itself: it goes below
+        # the event content, inside the same block.
+        data_block = framing.with_history(data_block, history)
         # Resolve this turn's capability grant once: it both frames the agent
         # (the hint below, so it doesn't attempt disabled tools) and hard-gates
         # tool calls (the turn context's capabilities, pinned just before
@@ -2764,22 +2875,25 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             message_id=message_id,
         )
         # Same ephemeral tool map as the control path — the discovery-round
-        # tax is per session, and shared channels start sessions too.
-        with contextlib.suppress(AttributeError):
-            source.channel_prompt = framing.TOOL_MAP_PROMPT
+        # tax is per session, and shared channels start sessions too. It
+        # rides on the event: that is the field the gateway reads.
         # Reinforce the envelope's get_recent_messages hint with a concrete
         # count of channel history this reactive turn can't see — the counted
         # cue is what reliably drives the fetch (the static hint alone doesn't).
-        breadcrumb = await self._context_breadcrumb(
-            channel, target_event_id, thread_id=thread_id
-        )
+        # A caller that already read the cue alongside its other reads hands
+        # it in; the reaction path still reads it here.
+        if breadcrumb is _UNSET:
+            breadcrumb = await self._context_breadcrumb(
+                channel, target_event_id, thread_id=thread_id
+            )
         event = MessageEvent(
             text=envelope,
             message_type=MessageType.TEXT,
             source=source,
             message_id=message_id,
             raw_message=raw,
-            channel_context=breadcrumb,
+            channel_context=breadcrumb if isinstance(breadcrumb, str) else None,
+            channel_prompt=framing.TOOL_MAP_PROMPT,
         )
         logger.info(
             "filament-fcm: WAKE → reactive turn: trigger=%s channel=%s sender=%s "
@@ -2834,6 +2948,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             turn_context.data_turn(
                 capabilities=allowed,
                 cursor_channel=self._cursor_channel_for_turn(channel, thread_id),
+                history_key=history_key(
+                    channel, thread_id, sender, self._shared_sessions_effective()
+                ),
                 reply_anchor=(channel, reply_anchor)
                 if reply_anchor and reply_anchor != thread_id
                 else None,
@@ -2884,6 +3001,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     prompt_event_id=target,
                 ),
             )
+        # Not awaited: the reaction is a courtesy marker, and the model turn
+        # should not wait a round trip on it. Already on the gateway loop, so
+        # a task, not the cross-thread bridge.
+        task = asyncio.get_running_loop().create_task(
+            self._add_processing_reaction(target)
+        )
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+    async def _add_processing_reaction(self, target: str) -> None:
+        if not self._filament_api:
+            return
         try:
             with bound_context(call_origin="processing_reaction"):
                 await self._filament_api.react(message_id=target, key="👀")

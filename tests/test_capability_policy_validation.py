@@ -165,3 +165,30 @@ def test_unknown_plain_grant_still_rejected():
     assert err is not None and "no_such" in err
     err = plugin._capability_policy_error({"bundles": {"b": ["@no_such"]}})
     assert err is not None and "no_such" in err
+
+
+def test_keep_visible_pins_only_registered_named_tools():
+    # tool_search never defers a core tool; the instruction-named Filament
+    # tools join that list, once, and nothing unregistered does.
+    fake = types.ModuleType("toolsets")
+    fake._HERMES_CORE_TOOLS = ["terminal"]
+    sys.modules["toolsets"] = fake
+    try:
+        added = plugin._keep_visible(
+            {"message_principal", "get_thread"} & set(plugin.ALWAYS_VISIBLE_TOOLS)
+        )
+        assert added == 2
+        assert fake._HERMES_CORE_TOOLS == [
+            "terminal",
+            "get_thread",
+            "message_principal",
+        ]
+        assert plugin._keep_visible({"message_principal"}) == 0
+        assert fake._HERMES_CORE_TOOLS.count("message_principal") == 1
+    finally:
+        del sys.modules["toolsets"]
+
+
+def test_keep_visible_without_a_core_list_is_a_no_op():
+    sys.modules.pop("toolsets", None)
+    assert plugin._keep_visible({"message_principal"}) == 0

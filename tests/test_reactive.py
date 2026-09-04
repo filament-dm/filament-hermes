@@ -783,6 +783,21 @@ def test_feature_flag_default_off_and_toggle():
         assert store.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
 
 
+def test_compact_timeline_is_on_unless_turned_off():
+    # The one default-on flag: it changes only how much context a history read
+    # costs, never what the agent does.
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.FeatureFlagStore(Path(d) / "feature_flags.json")
+        assert reactive.FEATURE_COMPACT_TIMELINE in reactive.DEFAULT_ON_FEATURES
+        assert store.is_enabled(reactive.FEATURE_COMPACT_TIMELINE) is True
+        store.set(reactive.FEATURE_COMPACT_TIMELINE, False)
+        assert store.is_enabled(reactive.FEATURE_COMPACT_TIMELINE) is False
+        store.set(reactive.FEATURE_COMPACT_TIMELINE, True)
+        assert store.is_enabled(reactive.FEATURE_COMPACT_TIMELINE) is True
+        # Every other flag still ships dark.
+        assert store.is_enabled(reactive.FEATURE_ADVANCED_TOOL_CONTROLS) is False
+
+
 def test_feature_flag_set_preserves_other_flags():
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "feature_flags.json"
@@ -1334,8 +1349,10 @@ def test_read_effective_carries_a_pointer_not_the_guide():
         assert effective.index(reactive.SERVER_GUIDE_POINTER) < effective.index(
             "dad joke"
         )
-        # The pointer is small: the guide it points at is ~1.3KB.
-        assert len(reactive.SERVER_GUIDE_POINTER) < 250
+        # The pointer is small next to the ~3KB guide it points at, even
+        # carrying the four link forms inline.
+        assert len(reactive.SERVER_GUIDE_POINTER) < 400
+        assert "member:@" in reactive.SERVER_GUIDE_POINTER
         # No pointer (pre-skill, or an older server) leaves framing unchanged.
         assert store.read_effective() == f"{reactive.CORE_RULES}\n\n{store.read()}"
 
@@ -1379,3 +1396,24 @@ def test_empty_guide_removes_a_stale_skill():
 def test_empty_guide_is_a_no_op_when_no_skill_exists():
     with tempfile.TemporaryDirectory() as d:
         assert reactive.write_server_guide_skill("", hermes_home=Path(d)) is False
+
+
+def test_seen_history_keys_follow_the_session_rule():
+    assert reactive.history_key("!c", "$t", "@a:x", False) == "thread:$t"
+    assert reactive.history_key("!c", None, "@a:x", True) == "channel:!c"
+    assert reactive.history_key("!c", None, "@a:x", False) == "channel:!c|@a:x"
+
+
+def test_seen_history_marks_expire_with_the_session():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.SeenHistoryStore(Path(d) / "seen.json")
+        store.record("thread:$t", "$5", ts=5, now=1000.0)
+        assert store.get("thread:$t", now=1000.0 + 60) == "$5"
+        assert (
+            store.get("thread:$t", now=1000.0 + reactive.SEEN_HISTORY_TTL_SECONDS + 1)
+            is None
+        )
+        # A provably older overlapping read never rewinds the mark.
+        store.record("thread:$t", "$3", ts=3, now=2000.0)
+        assert store.get("thread:$t", now=2000.0) == "$5"
+        assert store.get("other") is None

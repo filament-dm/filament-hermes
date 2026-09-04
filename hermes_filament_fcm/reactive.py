@@ -443,6 +443,81 @@ class ChannelCursorStore:
         _atomic_write_text(self._path, json.dumps(cursors, indent=2))
 
 
+# How long a conversation's "already shown" mark is trusted. Hermes resets an
+# idle gateway session after a day by default, and a mark older than that may
+# describe a conversation the model no longer holds.
+SEEN_HISTORY_TTL_SECONDS = 24 * 3600
+
+
+def history_key(
+    channel: str, thread_id: "str | None", sender: str, shared_sessions: bool
+) -> str:
+    """The conversation a data turn joins, as the seen-history store keys it.
+
+    Mirrors the gateway's session key: a thread is one conversation whoever
+    speaks in it; a channel's top level is one conversation per channel under
+    shared sessions and one per (channel, sender) otherwise. Two wakes with
+    the same key land in the same model context, so what one of them showed
+    the other need not repeat.
+    """
+    kind, scope = conversation_key(channel, thread_id)
+    if kind == "thread":
+        return f"thread:{scope}"
+    return f"channel:{channel}" if shared_sessions else f"channel:{channel}|{sender}"
+
+
+class SeenHistoryStore(ChannelCursorStore):
+    """Per conversation, the newest message whose text the model has been
+    shown: inlined by a wake, fetched by the model itself, or the wake's own
+    triggering message. The next wake in that conversation inlines only what
+    came after it.
+
+    Same file shape and staleness rule as ``ChannelCursorStore``, keyed by
+    ``history_key`` and stamped with the wall-clock time of the record so a
+    mark older than ``SEEN_HISTORY_TTL_SECONDS`` reads as absent: a session
+    Hermes has since reset holds none of what the mark says it saw, and
+    showing that history again is the cheaper mistake.
+    """
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(path) if path else _default_dir() / "seen_history.json"
+
+    def get(self, key: str, now: "float | None" = None) -> str | None:
+        value = self.read().get(str(key))
+        if not isinstance(value, dict):
+            return None
+        at = value.get("at")
+        if isinstance(at, (int, float)):
+            age = (now if now is not None else time.time()) - at
+            if age > SEEN_HISTORY_TTL_SECONDS:
+                return None
+        event_id, _ = self._entry_parts(value)
+        return event_id
+
+    def record(
+        self,
+        key: str,
+        event_id: str,
+        ts: "int | None" = None,
+        now: "float | None" = None,
+    ) -> None:
+        if not key or not event_id:
+            return
+        marks = self.read()
+        _, stored_ts = self._entry_parts(marks.get(str(key)))
+        if stored_ts is not None and ts is not None and ts < stored_ts:
+            return
+        marks.pop(str(key), None)
+        marks[str(key)] = {
+            "event_id": str(event_id),
+            "ts": ts,
+            "at": now if now is not None else time.time(),
+        }
+        while len(marks) > self._MAX_CHANNELS:
+            marks.pop(next(iter(marks)))
+        _atomic_write_text(self._path, json.dumps(marks, indent=2))
+
+
 def is_system_sender(sender: str | None, self_user_id: str | None) -> bool:
     """True if ``sender`` is the local Filament system account
     (``@filament_god:<our-homeserver>``).
@@ -597,10 +672,14 @@ SERVER_GUIDE_SKILL = "filament-links"
 # One line in the envelope; the body lives in the skill. Phrased so the model
 # reaches for the skill at the moment it would otherwise invent a format or
 # ask its principal for a raw id.
+# The four link forms are inlined so a turn that only needs one of them does
+# not spend a tool round reading the skill; the skill keeps the full guide.
 SERVER_GUIDE_POINTER = (
-    "[WRITING LINKS] To @-mention a member or link a channel, group or "
-    f"message, read the `{SERVER_GUIDE_SKILL}` skill for the exact syntax. "
-    "Never put a raw room or user id in a message people read."
+    "[WRITING LINKS] Never put a raw room or user id in a message people read. "
+    "Member (an @-mention): [Name](member:@user:server). "
+    "Channel: [name](channel:!room:server). Group: [name](group:!space:server). "
+    "Message: [words](message:$event_id). "
+    f"The `{SERVER_GUIDE_SKILL}` skill has the full guide if you need more."
 )
 
 
@@ -1488,6 +1567,11 @@ FEATURE_COMPACT_TIMELINE = "compact_timeline"
 # the reply lands is decoupled from which session the turn joins.
 FEATURE_SHARED_CHANNEL_SESSIONS = "shared_channel_sessions"
 
+# Flags that are on unless the principal turns them off. Compact rendering
+# changes no behavior, only how much of the context window a history read
+# costs, so it is the one default-on flag.
+DEFAULT_ON_FEATURES = frozenset({FEATURE_COMPACT_TIMELINE})
+
 # Human-facing descriptions for the flags the code actually checks. Keep in
 # sync with the checks; surfaced by get_features and the set_feature tool so the
 # principal (and the agent mapping their request) knows what can be toggled.
@@ -1511,8 +1595,8 @@ KNOWN_FEATURES: dict[str, str] = {
         "provenance-labeled line per message instead of pretty-printed "
         "JSON, cutting the per-fetch context cost roughly tenfold. Content "
         "is never dropped — body, sender, time, event id, media and "
-        "reactions all survive; only envelope metadata goes. Off by "
-        "default; when off, results render as JSON exactly as before."
+        "reactions all survive; only envelope metadata goes. On by "
+        "default; when off, results render as JSON."
     ),
     FEATURE_SHARED_CHANNEL_SESSIONS: (
         "One conversation memory per shared channel, shared by every "
@@ -1566,9 +1650,9 @@ class FeatureFlagStore:
         return {}
 
     def is_enabled(self, name: str) -> bool:
-        """True only if the flag is present AND truthy. Absent/unknown → False
-        (fail-dark)."""
-        return bool(self.read().get(name, False))
+        """The flag's stored value, or its default when absent: False
+        (fail-dark) for every flag but those in ``DEFAULT_ON_FEATURES``."""
+        return bool(self.read().get(name, name in DEFAULT_ON_FEATURES))
 
     def write(self, flags: dict) -> None:
         """Replace the whole flag file (same serialization ``set`` uses)."""

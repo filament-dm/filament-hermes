@@ -84,12 +84,15 @@ class TurnContext:
             None to record none.
         reply_anchor: The (room_id, event_id) pair an unaddressed reply threads
             under, or None to post at the top level.
+        history_key: The conversation (see reactive.history_key) whose
+            seen-history mark this turn's own history reads advance, or None.
     """
 
     zone: Zone = Zone.DATA
     capabilities: frozenset[str] | None = None
     cursor_channel: str | None = None
     reply_anchor: tuple[str, str] | None = None
+    history_key: str | None = None
 
     def with_capabilities(self, capabilities: frozenset[str] | None) -> TurnContext:
         """Returns a copy carrying a different tool grant.
@@ -124,6 +127,7 @@ def data_turn(
     capabilities: frozenset[str] | None,
     cursor_channel: str | None,
     reply_anchor: tuple[str, str] | None,
+    history_key: str | None,
 ) -> TurnContext:
     """Builds a data-plane turn's context.
 
@@ -138,6 +142,8 @@ def data_turn(
             None to record none.
         reply_anchor: The (room_id, event_id) pair to thread a reply under, or
             None to post at the top level.
+        history_key: The conversation whose seen-history mark a history read
+            in this turn may advance, or None to advance none.
 
     Returns:
         A TurnContext in Zone.DATA.
@@ -147,6 +153,7 @@ def data_turn(
         capabilities=capabilities,
         cursor_channel=cursor_channel,
         reply_anchor=reply_anchor,
+        history_key=history_key,
     )
 
 

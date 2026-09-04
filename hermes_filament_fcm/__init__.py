@@ -125,11 +125,47 @@ BLOCKED_TOOLS: dict[str, str] = {
 }
 
 
+def _mark_history_seen(
+    seen_store: "reactive_mod.SeenHistoryStore", tool_name: str, args: dict, parsed: Any
+) -> None:
+    """A history read the model made itself counts as shown, for the
+    conversation the turn belongs to and only when the read is that
+    conversation's own (this channel's top level, or this thread)."""
+    key = turn_context.current().history_key
+    if not key or not isinstance(parsed, dict):
+        return
+    try:
+        if tool_name == "get_recent_messages":
+            channel = str(args.get("channel") or "")
+            if not channel or not key.startswith(f"channel:{channel}"):
+                return
+            if not timeline.cursor_advance_is_sound(
+                args, channel, payload=parsed, min_window=reactive_mod.BREADCRUMB_LIMIT
+            ):
+                return
+            newest = timeline.newest_message(parsed)
+        else:
+            thread = str(args.get("message_id") or args.get("thread_id") or "")
+            if not thread or key != f"thread:{thread}":
+                return
+            root = parsed.get("root")
+            replies = parsed.get("replies")
+            messages = ([root] if isinstance(root, dict) else []) + [
+                r for r in (replies or []) if isinstance(r, dict)
+            ]
+            newest = timeline.newest_message({"messages": messages})
+        if newest:
+            seen_store.record(key, newest[0], newest[1])
+    except Exception:
+        logger.warning("filament-fcm: seen-history update failed", exc_info=True)
+
+
 def _make_tool_handler(
     tool_name: str,
     api: FilamentAPI,
     cursor_store: "reactive_mod.ChannelCursorStore | None" = None,
     feature_flags: "reactive_mod.FeatureFlagStore | None" = None,
+    seen_store: "reactive_mod.SeenHistoryStore | None" = None,
 ):
     """Create an async handler that proxies a tool call through the
     given ``FilamentAPI`` instance.
@@ -195,6 +231,11 @@ def _make_tool_handler(
                         "filament-fcm: read-cursor update failed",
                         exc_info=True,
                     )
+            if seen_store is not None and tool_name in (
+                "get_recent_messages",
+                "get_thread",
+            ):
+                _mark_history_seen(seen_store, tool_name, args or {}, parsed)
             if tool_name in timeline.RENDERABLE_TOOLS:
                 # Flag read gated on renderability: the file read costs
                 # nothing on the many tools that can never render compactly.
@@ -445,6 +486,7 @@ def register(ctx: Any) -> None:
     # files, not the objects.
     cursor_store = reactive_mod.ChannelCursorStore()
     handler_flags = FeatureFlagStore()
+    seen_store = reactive_mod.SeenHistoryStore()
     registered = 0
     skipped = 0
     for tool in all_tools:
@@ -468,6 +510,7 @@ def register(ctx: Any) -> None:
                 api,
                 cursor_store=cursor_store,
                 feature_flags=handler_flags,
+                seen_store=seen_store,
             ),
             is_async=True,
             description=tool.get("description", ""),
@@ -480,6 +523,7 @@ def register(ctx: Any) -> None:
         registered,
         skipped,
     )
+    _keep_visible({t.get("name", "") for t in all_tools} & set(ALWAYS_VISIBLE_TOOLS))
 
     # Media bytes never flow through MCP tools/call (results are JSON) — they
     # come from the /mcp/agents/media side-channel. Register a local
@@ -499,6 +543,43 @@ def register(ctx: Any) -> None:
     _register_reactive_tools(ctx, server_sync, tool_descriptions)
     _register_capability_gate(ctx)
     register_cli(ctx)
+
+
+# The Filament tools the standing instructions and the tool map name. Hermes'
+# tool search defers every plugin tool behind tool_search/tool_describe, so a
+# reactive turn spent two model rounds rediscovering message_principal's
+# schema before it could follow its own instructions. Core tools are never
+# deferred; these join that set.
+ALWAYS_VISIBLE_TOOLS = (
+    "message_principal",
+    "get_recent_messages",
+    "get_thread",
+    "reply_in_thread",
+    "post_message",
+    "react",
+    "mark_read",
+    "list_channels",
+)
+
+
+def _keep_visible(names: set[str]) -> int:
+    """Exempt ``names`` from tool-search deferral. Returns how many were added."""
+    try:
+        import toolsets  # noqa: PLC0415
+
+        core = toolsets._HERMES_CORE_TOOLS
+    except Exception:
+        logger.info("filament-fcm: no core tool list to pin visible tools onto")
+        return 0
+    added = 0
+    for name in sorted(names):
+        if name not in core:
+            core.append(name)
+            added += 1
+    logger.info(
+        "filament-fcm: %d tools kept visible to the model (never deferred)", added
+    )
+    return added
 
 
 def _tool_inventory(
