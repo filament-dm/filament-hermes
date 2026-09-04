@@ -297,3 +297,57 @@ def test_muted_mention_does_not_record_engagement():
         _run(a, _push(_HUMAN, thread_id=None, is_mention=True, event_id=_ROOT))
         assert woke == []
         assert not a._engaged_threads.is_engaged("!shared", _ROOT)
+
+
+class _CapturingEvent:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def test_wake_puts_the_tool_map_on_the_event():
+    """The gateway reads the ephemeral prompt off the MessageEvent. Setting it
+    on the source (as the adapter once did) reaches nothing."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, _ = _make_adapter(tmp, None)
+        a._wake = adapter.FCMFilamentAdapter._wake.__get__(a)
+        a._instructions_store = reactive.InstructionsStore(tmp / "instructions.md")
+        a._server_guide_ready = False
+        a._owner_id = "@owner:example.org"
+        a._feature_flags = reactive.FeatureFlagStore(tmp / "flags.json")
+        a._capability_store = reactive.CapabilityPolicyStore(tmp / "caps.json")
+        a._channel_instructions = reactive.ChannelInstructionsStore(tmp / "ci.json")
+        a._shared_sessions_effective = lambda: False
+        a._cursor_channel_for_turn = lambda channel, thread_id: None
+        a._apply_session_keying = lambda: None
+        a.build_source = types.SimpleNamespace
+        captured = []
+
+        async def _capture(event):
+            captured.append(event)
+
+        a.handle_message = _capture
+        original_event = adapter.MessageEvent
+        adapter.MessageEvent = _CapturingEvent
+        try:
+            asyncio.run(
+                a._wake(
+                    channel="!shared",
+                    channel_name="general",
+                    sender=_HUMAN,
+                    sender_name="Someone",
+                    trigger="message",
+                    data="hello",
+                    target_event_id="$e",
+                    thread_id="$e",
+                    raw={},
+                    breadcrumb=None,
+                )
+            )
+        finally:
+            adapter.MessageEvent = original_event
+        assert len(captured) == 1
+        event = captured[0]
+        assert event.channel_prompt == adapter.framing.TOOL_MAP_PROMPT
+        assert event.channel_context is None
+        assert "[WAKE-UP SIGNAL]" in event.text

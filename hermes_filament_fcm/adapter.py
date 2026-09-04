@@ -744,11 +744,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 message_id=trigger_id,
             )
             policy, policy_set_keys = self._wake_policy.read_with_provenance()
-            with contextlib.suppress(AttributeError):
-                source.channel_prompt = (
-                    f"{framing.TOOL_MAP_PROMPT}\n\n"
-                    + framing.wake_policy_prompt(policy, policy_set_keys)
-                )
+            channel_prompt = (
+                f"{framing.TOOL_MAP_PROMPT}\n\n"
+                + framing.wake_policy_prompt(policy, policy_set_keys)
+            )
             event = MessageEvent(
                 text=(
                     "[system: You just connected and posted a canned hello in "
@@ -765,6 +764,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 source=source,
                 message_id=trigger_id,
                 raw_message=None,
+                channel_prompt=channel_prompt,
             )
             with bound_context(
                 installation_id=self._installation_id,
@@ -2316,18 +2316,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # policy consumer, so questions about wake behavior are answered from
         # the values in force this turn — control plane only: on a data turn
         # it would hand the trigger configuration to every participant.
-        # suppress: test doubles build plain dict sources.
+        channel_prompt = None
         if not gateway_command:
             policy, policy_set_keys = self._wake_policy.read_with_provenance()
-            with contextlib.suppress(AttributeError):
-                source.channel_prompt = (
-                    f"{framing.TOOL_MAP_PROMPT}\n\n"
-                    + framing.command_map_prompt(
-                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
-                    )
-                    + "\n\n"
-                    + framing.wake_policy_prompt(policy, policy_set_keys)
+            channel_prompt = (
+                f"{framing.TOOL_MAP_PROMPT}\n\n"
+                + framing.command_map_prompt(
+                    self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
                 )
+                + "\n\n"
+                + framing.wake_policy_prompt(policy, policy_set_keys)
+            )
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel
         # timeline may hold context this session never saw. The breadcrumb
@@ -2340,6 +2339,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             message_id=msg.event_id,
             raw_message=msg.raw,
             channel_context=breadcrumb,
+            channel_prompt=channel_prompt,
         )
         logger.info(
             "Dispatching control message from %s (event=%s, room=%s)",
@@ -2775,9 +2775,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             message_id=message_id,
         )
         # Same ephemeral tool map as the control path — the discovery-round
-        # tax is per session, and shared channels start sessions too.
-        with contextlib.suppress(AttributeError):
-            source.channel_prompt = framing.TOOL_MAP_PROMPT
+        # tax is per session, and shared channels start sessions too. It
+        # rides on the event: that is the field the gateway reads.
         # Reinforce the envelope's get_recent_messages hint with a concrete
         # count of channel history this reactive turn can't see — the counted
         # cue is what reliably drives the fetch (the static hint alone doesn't).
@@ -2794,6 +2793,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             message_id=message_id,
             raw_message=raw,
             channel_context=breadcrumb if isinstance(breadcrumb, str) else None,
+            channel_prompt=framing.TOOL_MAP_PROMPT,
         )
         logger.info(
             "filament-fcm: WAKE → reactive turn: trigger=%s channel=%s sender=%s "
