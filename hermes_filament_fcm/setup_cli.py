@@ -22,6 +22,7 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
 import yaml
 from hermes_cli.setup import (
     get_env_value,
@@ -35,6 +36,7 @@ from hermes_cli.setup import (
     save_env_value,
 )
 
+from ._version import version_headers
 from .filament_api import FilamentAPI
 
 # The Firebase project the gateway registers with. It must be the same project
@@ -203,8 +205,10 @@ def _enable_plugin() -> None:
 
 # JSON-RPC codes from the agents MCP. -32002: token valid but the account
 # doesn't exist yet ("reserved" — the principal hasn't finished the connect
-# flow). Anything else (e.g. -32001) means the token isn't usable.
+# flow). -32001: auth required — the token itself is bad and retrying won't
+# help. Everything else is transient.
 _RESERVED_CODE = -32002
+_AUTH_REQUIRED_CODE = -32001
 
 # How long to keep trying an endpoint that never answers before giving up.
 # Generous, because a laptop waking from sleep or a VPN reconnecting can take
@@ -230,9 +234,6 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     instead — a bad URL never resolves itself. Any reply resets that budget. An
     endpoint that answers but errs is retried forever; only -32001 aborts.
     """
-    # Only this specific error code means the token itself is bad and
-    # retrying won't help. Everything else is transient or reserved.
-    _AUTH_REQUIRED_CODE = -32001
 
     async def _poll() -> tuple[bool, str | None]:
         api = FilamentAPI(url, token)
@@ -331,6 +332,121 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
         return False, None
 
 
+# RFC 8693 token exchange, with the connect token itself as the subject —
+# the server consumes it and returns a fresh bearer (ENG-893).
+_TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
+_ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
+
+
+def _pasted_token_if_alive(token: str, url: str) -> str | None:
+    """After an ambiguous exchange outcome: keep the paste only if it works.
+
+    The exchange consumes its subject token before replying, so a lost reply
+    leaves two possibilities: the request never made it (paste still valid) or
+    it did (paste dead, and the replacement died with the reply). Ask the
+    server which one happened rather than guessing — persisting a dead
+    credential would strand the gateway with silent 401s after restart.
+
+    Returns the pasted token when the server still accepts it, ``None`` when
+    it is consumed or the probe itself failed (nothing trustworthy to save).
+    """
+    try:
+        resp = httpx.post(
+            url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "get_self", "arguments": {}},
+            },
+            headers={"Authorization": f"Bearer {token}", **version_headers()},
+            timeout=15.0,
+        )
+        # Our server 401s a dead token, but JSON-RPC-over-HTTP servers also
+        # signal auth failures as -32001 inside a 200 envelope — honor both
+        # before trusting a credential enough to persist it.
+        try:
+            error = resp.json().get("error")
+        except Exception:
+            error = None
+        auth_rejected = (
+            isinstance(error, dict) and error.get("code") == _AUTH_REQUIRED_CODE
+        )
+        alive = resp.status_code != 401 and not auth_rejected
+    except Exception:
+        alive = False
+    if alive:
+        print_info("Keeping the pasted token (the exchange didn't go through).")
+        return token
+    print_warning(
+        "The token exchange reply was lost after the server retired the "
+        "pasted token, so neither credential is usable. Reconnect in the "
+        "Filament app to get a fresh token, then re-run setup."
+    )
+    return None
+
+
+def _exchange_connect_token(token: str, url: str) -> str | None:
+    """Swap the pasted connect token for a fresh bearer; return what to persist.
+
+    The connect token rode the copy-pasted one-liner, so it lives in shell
+    history and the process environment of everything the installer ran. The
+    server's token-exchange grant consumes it (single-use) and returns a
+    replacement that never appears on a command line or in shell history —
+    that replacement is what we save. Call this only after the token validated
+    (the agent is finalized): the server refuses to consume a reservation.
+
+    Best-effort against old servers: a definitive refusal keeps the original
+    token, so setup still completes against a server that predates the
+    exchange (its token endpoint rejects an fmcp_ subject as an invalid
+    Matrix token; nothing is consumed). But when the outcome is ambiguous —
+    the request may have reached the server and consumed the paste without a
+    reply landing — the paste is probed first, and ``None`` is returned when
+    nothing usable remains; the caller must then abort without persisting.
+    """
+    try:
+        resp = httpx.post(
+            f"{url}/oauth/token",
+            data={
+                "grant_type": _TOKEN_EXCHANGE_GRANT,
+                "subject_token": token,
+                "subject_token_type": _ACCESS_TOKEN_TYPE,
+            },
+            headers=version_headers(),
+            timeout=30.0,
+        )
+    except httpx.ConnectError:
+        # Never reached a server, so nothing was consumed.
+        print_info("Keeping the pasted token (the exchange didn't go through).")
+        return token
+    except Exception:
+        # Sent, but the reply was lost (timeout, dropped connection, ...).
+        return _pasted_token_if_alive(token, url)
+
+    if resp.status_code == 200:
+        try:
+            fresh = resp.json().get("access_token")
+        except Exception:
+            fresh = None
+        if isinstance(fresh, str) and fresh.startswith("fmcp_"):
+            print_info(
+                "Exchanged the connect token for a fresh credential "
+                "(the pasted one no longer works)."
+            )
+            return fresh
+        # A 200 means the subject was consumed, but the replacement in the
+        # body is unusable — same ambiguity as a lost reply.
+        return _pasted_token_if_alive(token, url)
+
+    # A definitive refusal consumes nothing (pre-exchange servers 401 the
+    # fmcp_ subject as an invalid Matrix token).
+    print_info(
+        "Keeping the pasted token (this server doesn't rotate connect "
+        "tokens, or the exchange didn't go through)."
+    )
+    return token
+
+
 def _run_interactive_setup() -> bool | None:
     """Run the interactive setup prompts.
 
@@ -390,7 +506,13 @@ def _run_interactive_setup() -> bool | None:
     if not ready:
         return False
 
-    # Token validated — persist all configuration.
+    # Retire the pasted (shell-history-exposed) token for a fresh one, then
+    # persist all configuration. None means neither token survived the
+    # exchange — abort before touching the saved config.
+    exchanged = _exchange_connect_token(token, url)
+    if exchanged is None:
+        return False
+    token = exchanged
     save_env_value("FILAMENT_MCP_TOKEN", token)
     save_env_value("FILAMENT_MCP_URL", url)
     # A token names an identity; a FILAMENT_HOME_ROOM carried over from a
@@ -564,7 +686,14 @@ def connect(
         return 1
 
     migrate_legacy_install()
-    _persist(token, resolved, principal_id)
+    # Retire the pasted (shell-history-exposed) token for a fresh one, as
+    # late as possible so a failure above never strands an unsaved credential.
+    # None means neither token survived the exchange — leave the existing
+    # configuration untouched.
+    exchanged = _exchange_connect_token(token, resolved)
+    if exchanged is None:
+        return 1
+    _persist(exchanged, resolved, principal_id)
     print_success("Connected. Configuration saved.")
 
     if restart:
