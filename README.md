@@ -23,7 +23,10 @@ The pasted token is an onboarding credential: once it validates, connect
 exchanges it for a fresh one and saves that instead, and the exchange consumes
 the pasted token — so the copy in your shell history (or anyone who saw the
 one-liner) stops working the moment the agent connects. Against a server that
-doesn't support the exchange yet, the pasted token is kept as-is.
+doesn't support the exchange yet, the pasted token is kept as-is. (The
+replacement is only as private as the connection it rode in on: production is
+HTTPS, but a custom `--url` pointing at a plain-`http://` dev cluster sends
+every credential in the clear, this one included.)
 
 ### On a shared machine, use `-p`
 
