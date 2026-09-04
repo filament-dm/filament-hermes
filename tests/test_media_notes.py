@@ -233,7 +233,7 @@ def _make_adapter(api):
     return a
 
 
-def _push_msg(body="", has_content=True, event_id="$evt"):
+def _push_msg(body="", has_content=True, event_id="$evt", has_media=None):
     return fcm_client.PushMessage(
         event_id=event_id,
         room_id="!room",
@@ -248,6 +248,7 @@ def _push_msg(body="", has_content=True, event_id="$evt"):
         is_everyone_mention=False,
         raw={},
         has_content=has_content,
+        has_media=has_media,
     )
 
 
@@ -463,3 +464,45 @@ def test_api_download_media_raises_on_error_and_leaves_no_file(tmp_path):
         raise AssertionError("expected RuntimeError")
     assert not dest.exists()
     assert not dest.with_name("out.bin.part").exists()
+
+
+def test_server_says_no_media_skips_the_fetch():
+    """A push flagged has_media=False needs no get_thread."""
+    api = _FakeAPI(thread={"root": {"event_id": "$evt", "media": _MEDIA}})
+    note = asyncio.run(
+        _make_adapter(api)._media_note(_push_msg(body="hi", has_media=False))
+    )
+    assert note is None
+    assert api.calls == []
+
+
+def test_server_says_no_media_but_no_content_still_notes_something_arrived():
+    api = _FakeAPI(thread={"root": {"event_id": "$evt", "media": []}})
+    note = asyncio.run(
+        _make_adapter(api)._media_note(_push_msg(has_content=False, has_media=False))
+    )
+    assert note == framing.NON_TEXT_NOTICE
+    assert api.calls == []
+
+
+def test_server_says_media_still_fetches_the_details():
+    api = _FakeAPI(thread={"root": {"event_id": "$evt", "media": _MEDIA}})
+    note = asyncio.run(
+        _make_adapter(api)._media_note(_push_msg(body="look", has_media=True))
+    )
+    assert "photo.png" in note
+    assert api.calls == ["$evt"]
+
+
+def test_an_older_server_without_the_flag_fetches_as_before():
+    api = _FakeAPI(thread={"root": {"event_id": "$evt", "media": _MEDIA}})
+    note = asyncio.run(_make_adapter(api)._media_note(_push_msg(body="look")))
+    assert "photo.png" in note
+    assert api.calls == ["$evt"]
+
+
+def test_push_flags_parse_as_optional_booleans():
+    assert fcm_client._optional_flag(True) is True
+    assert fcm_client._optional_flag(False) is False
+    assert fcm_client._optional_flag(None) is None
+    assert fcm_client._optional_flag("true") is None

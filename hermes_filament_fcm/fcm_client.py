@@ -175,6 +175,11 @@ class PushMessage:
     is_reply_to_me: bool = False
     # The group (loop) the channel belongs to, when the server knows it.
     loop_name: str | None = None
+    # Server hints that spare a fetch. None when the server predates them.
+    # has_media: the event carries an attachment. sender_is_agent: the
+    # sender is a bot user.
+    has_media: bool | None = None
+    sender_is_agent: bool | None = None
 
 
 @dataclass
@@ -297,6 +302,11 @@ def parse_envelope(data_message: dict[str, str]) -> Envelope | None:
 # dataclass, or None if the payload is malformed.
 
 
+def _optional_flag(value: object) -> bool | None:
+    """A server flag that may be absent: bools pass, anything else is unknown."""
+    return value if isinstance(value, bool) else None
+
+
 def _build_push_message(env: Envelope) -> PushMessage | None:
     """Build a ``PushMessage`` from a ``direct_message`` or
     ``channel_message`` envelope."""
@@ -333,6 +343,8 @@ def _build_push_message(env: Envelope) -> PushMessage | None:
         is_everyone_mention=bool(branch.get("is_everyone_mention", False)),
         is_reply_to_me=bool(branch.get("is_reply_to_recipient", False)),
         loop_name=branch.get("loop_name"),
+        has_media=_optional_flag(branch.get("has_media")),
+        sender_is_agent=_optional_flag(branch.get("sender_is_agent")),
         raw=env.payload,
         has_content=has_content,
     )

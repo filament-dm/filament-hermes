@@ -484,6 +484,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         attachment note.
         """
         note = None
+        if msg.has_media is False:
+            # The server said there is no attachment: nothing to fetch.
+            return None if msg.has_content else framing.NON_TEXT_NOTICE
         try:
             with bound_context(call_origin="media_lookup"):
                 result = await self._filament_api.get_thread(msg.event_id)
@@ -2182,6 +2185,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """
         if msg.sender in self._sender_is_agent_cache:
             return self._sender_is_agent_cache[msg.sender]
+        if msg.sender_is_agent is not None:
+            # The push already says; the same server-computed fact get_thread
+            # would return, without the round trip.
+            self._sender_is_agent_cache[msg.sender] = msg.sender_is_agent
+            return msg.sender_is_agent
         if not self._filament_api or not msg.thread_id:
             return None
         try:

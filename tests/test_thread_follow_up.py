@@ -180,6 +180,7 @@ def _push(
     thread_id: str | None = _ROOT,
     is_mention: bool = False,
     event_id: str = "$follow_up",
+    sender_is_agent: bool | None = None,
 ):
     return fcm_client.PushMessage(
         event_id=event_id,
@@ -195,6 +196,7 @@ def _push(
         is_everyone_mention=False,
         raw={},
         has_content=True,
+        sender_is_agent=sender_is_agent,
     )
 
 
@@ -351,3 +353,19 @@ def test_wake_puts_the_tool_map_on_the_event():
         assert event.channel_prompt == adapter.framing.TOOL_MAP_PROMPT
         assert event.channel_context is None
         assert "[WAKE-UP SIGNAL]" in event.text
+
+
+def test_push_flag_classifies_the_sender_without_a_fetch():
+    """A server that says sender_is_agent spares the get_thread round trip;
+    the answer is cached like a fetched one."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        a, woke = _make_adapter(tmp, thread=None)
+        a._engaged_threads.record("!shared", _ROOT)
+        _run(a, _push(_HUMAN, sender_is_agent=False))
+        assert len(woke) == 1
+        assert a._sender_is_agent_cache[_HUMAN] is False
+        a2, woke2 = _make_adapter(tmp, thread=None)
+        a2._engaged_threads.record("!shared", _ROOT)
+        _run(a2, _push("@bot:example.org", sender_is_agent=True))
+        assert woke2 == []
