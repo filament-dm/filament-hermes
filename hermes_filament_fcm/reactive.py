@@ -597,10 +597,14 @@ SERVER_GUIDE_SKILL = "filament-links"
 # One line in the envelope; the body lives in the skill. Phrased so the model
 # reaches for the skill at the moment it would otherwise invent a format or
 # ask its principal for a raw id.
+# The four link forms are inlined so a turn that only needs one of them does
+# not spend a tool round reading the skill; the skill keeps the full guide.
 SERVER_GUIDE_POINTER = (
-    "[WRITING LINKS] To @-mention a member or link a channel, group or "
-    f"message, read the `{SERVER_GUIDE_SKILL}` skill for the exact syntax. "
-    "Never put a raw room or user id in a message people read."
+    "[WRITING LINKS] Never put a raw room or user id in a message people read. "
+    "Member (an @-mention): [Name](member:@user:server). "
+    "Channel: [name](channel:!room:server). Group: [name](group:!space:server). "
+    "Message: [words](message:$event_id). "
+    f"The `{SERVER_GUIDE_SKILL}` skill has the full guide if you need more."
 )
 
 

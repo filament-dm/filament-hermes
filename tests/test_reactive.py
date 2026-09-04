@@ -1349,8 +1349,10 @@ def test_read_effective_carries_a_pointer_not_the_guide():
         assert effective.index(reactive.SERVER_GUIDE_POINTER) < effective.index(
             "dad joke"
         )
-        # The pointer is small: the guide it points at is ~1.3KB.
-        assert len(reactive.SERVER_GUIDE_POINTER) < 250
+        # The pointer is small next to the ~3KB guide it points at, even
+        # carrying the four link forms inline.
+        assert len(reactive.SERVER_GUIDE_POINTER) < 400
+        assert "member:@" in reactive.SERVER_GUIDE_POINTER
         # No pointer (pre-skill, or an older server) leaves framing unchanged.
         assert store.read_effective() == f"{reactive.CORE_RULES}\n\n{store.read()}"
 
