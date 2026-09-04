@@ -16,4 +16,5 @@ def test_message_tools_advertise_block_kit_without_html() -> None:
     for name in ("post_message", "reply_in_thread", "message_principal"):
         properties = by_name[name]["inputSchema"]["properties"]
         assert "block-kit" in properties["markdown_body"]["description"]
+        assert "whole markdown body" in properties["markdown_body"]["description"]
         assert "html_body" not in properties

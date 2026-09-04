@@ -178,7 +178,7 @@
         },
         "markdown_body": {
           "type": "string",
-          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting. To send a Block Kit layout, put a JSON object with a blocks array in a fenced block labeled block-kit."
+          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting. To send a Block Kit layout, make the whole markdown body a fenced block labeled block-kit containing a JSON object with a blocks array."
         }
       },
       "required": [
@@ -200,7 +200,7 @@
       "properties": {
         "markdown_body": {
           "type": "string",
-          "description": "Message body (markdown). To send a Block Kit layout, put a JSON object with a blocks array in a fenced block labeled block-kit."
+          "description": "Message body (markdown). To send a Block Kit layout, make the whole markdown body a fenced block labeled block-kit containing a JSON object with a blocks array."
         }
       },
       "required": [
@@ -224,7 +224,7 @@
         },
         "markdown_body": {
           "type": "string",
-          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting. To send a Block Kit layout, put a JSON object with a blocks array in a fenced block labeled block-kit."
+          "description": "Message body (markdown). Rendered to HTML by the server for rich formatting. To send a Block Kit layout, make the whole markdown body a fenced block labeled block-kit containing a JSON object with a blocks array."
         }
       },
       "required": [
