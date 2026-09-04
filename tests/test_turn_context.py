@@ -89,13 +89,14 @@ def test_activating_control_permits_policy_edits():
 # ── data_turn requires every decision to be explicit ─────────────────
 
 
-def test_data_turn_requires_all_three_decisions():
+def test_data_turn_requires_every_decision():
     """Every field must be passed explicitly, so omitting one raises."""
-    for missing in ("capabilities", "cursor_channel", "reply_anchor"):
+    for missing in ("capabilities", "cursor_channel", "reply_anchor", "history_key"):
         kwargs = {
             "capabilities": frozenset({"post"}),
             "cursor_channel": "!room:s",
             "reply_anchor": ("!room:s", "$e"),
+            "history_key": "channel:!room:s",
         }
         del kwargs[missing]
         try:
@@ -107,7 +108,7 @@ def test_data_turn_requires_all_three_decisions():
 
 def test_data_turn_never_yields_the_control_zone():
     ctx = turn_context.data_turn(
-        capabilities=None, cursor_channel=None, reply_anchor=None
+        capabilities=None, cursor_channel=None, reply_anchor=None, history_key=None
     )
     assert ctx.zone is Zone.DATA
 
@@ -127,6 +128,7 @@ def test_a_turn_cannot_be_partly_configured():
                 capabilities=frozenset({"post"}),
                 cursor_channel="!a:s",
                 reply_anchor=("!a:s", "$1"),
+                history_key=None,
             )
         )
         turn_context.activate(turn_context.CONTROL)
@@ -144,7 +146,10 @@ def test_a_turn_cannot_be_partly_configured():
 
 def test_context_is_frozen_so_downstream_cannot_widen_authority():
     ctx = turn_context.data_turn(
-        capabilities=frozenset({"post"}), cursor_channel=None, reply_anchor=None
+        capabilities=frozenset({"post"}),
+        cursor_channel=None,
+        reply_anchor=None,
+        history_key=None,
     )
     for field, value in (
         ("zone", Zone.CONTROL),
@@ -160,7 +165,10 @@ def test_context_is_frozen_so_downstream_cannot_widen_authority():
 
 def test_with_capabilities_copies_rather_than_mutating():
     ctx = turn_context.data_turn(
-        capabilities=frozenset({"post"}), cursor_channel="!a:s", reply_anchor=None
+        capabilities=frozenset({"post"}),
+        cursor_channel="!a:s",
+        reply_anchor=None,
+        history_key=None,
     )
     narrowed = ctx.with_capabilities(frozenset())
     assert ctx.capabilities == frozenset({"post"})  # original untouched
@@ -177,7 +185,10 @@ def test_concurrent_turns_do_not_race():
     async def turn(name, caps, out):
         turn_context.activate(
             turn_context.data_turn(
-                capabilities=frozenset(caps), cursor_channel=name, reply_anchor=None
+                capabilities=frozenset(caps),
+                cursor_channel=name,
+                reply_anchor=None,
+                history_key=None,
             )
         )
         await asyncio.sleep(0)  # yield: the other turn activates here

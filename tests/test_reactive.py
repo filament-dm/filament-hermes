@@ -1396,3 +1396,24 @@ def test_empty_guide_removes_a_stale_skill():
 def test_empty_guide_is_a_no_op_when_no_skill_exists():
     with tempfile.TemporaryDirectory() as d:
         assert reactive.write_server_guide_skill("", hermes_home=Path(d)) is False
+
+
+def test_seen_history_keys_follow_the_session_rule():
+    assert reactive.history_key("!c", "$t", "@a:x", False) == "thread:$t"
+    assert reactive.history_key("!c", None, "@a:x", True) == "channel:!c"
+    assert reactive.history_key("!c", None, "@a:x", False) == "channel:!c|@a:x"
+
+
+def test_seen_history_marks_expire_with_the_session():
+    with tempfile.TemporaryDirectory() as d:
+        store = reactive.SeenHistoryStore(Path(d) / "seen.json")
+        store.record("thread:$t", "$5", ts=5, now=1000.0)
+        assert store.get("thread:$t", now=1000.0 + 60) == "$5"
+        assert (
+            store.get("thread:$t", now=1000.0 + reactive.SEEN_HISTORY_TTL_SECONDS + 1)
+            is None
+        )
+        # A provably older overlapping read never rewinds the mark.
+        store.record("thread:$t", "$3", ts=3, now=2000.0)
+        assert store.get("thread:$t", now=2000.0) == "$5"
+        assert store.get("other") is None

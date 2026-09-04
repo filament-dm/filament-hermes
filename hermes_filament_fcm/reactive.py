@@ -443,6 +443,81 @@ class ChannelCursorStore:
         _atomic_write_text(self._path, json.dumps(cursors, indent=2))
 
 
+# How long a conversation's "already shown" mark is trusted. Hermes resets an
+# idle gateway session after a day by default, and a mark older than that may
+# describe a conversation the model no longer holds.
+SEEN_HISTORY_TTL_SECONDS = 24 * 3600
+
+
+def history_key(
+    channel: str, thread_id: "str | None", sender: str, shared_sessions: bool
+) -> str:
+    """The conversation a data turn joins, as the seen-history store keys it.
+
+    Mirrors the gateway's session key: a thread is one conversation whoever
+    speaks in it; a channel's top level is one conversation per channel under
+    shared sessions and one per (channel, sender) otherwise. Two wakes with
+    the same key land in the same model context, so what one of them showed
+    the other need not repeat.
+    """
+    kind, scope = conversation_key(channel, thread_id)
+    if kind == "thread":
+        return f"thread:{scope}"
+    return f"channel:{channel}" if shared_sessions else f"channel:{channel}|{sender}"
+
+
+class SeenHistoryStore(ChannelCursorStore):
+    """Per conversation, the newest message whose text the model has been
+    shown: inlined by a wake, fetched by the model itself, or the wake's own
+    triggering message. The next wake in that conversation inlines only what
+    came after it.
+
+    Same file shape and staleness rule as ``ChannelCursorStore``, keyed by
+    ``history_key`` and stamped with the wall-clock time of the record so a
+    mark older than ``SEEN_HISTORY_TTL_SECONDS`` reads as absent: a session
+    Hermes has since reset holds none of what the mark says it saw, and
+    showing that history again is the cheaper mistake.
+    """
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._path = Path(path) if path else _default_dir() / "seen_history.json"
+
+    def get(self, key: str, now: "float | None" = None) -> str | None:
+        value = self.read().get(str(key))
+        if not isinstance(value, dict):
+            return None
+        at = value.get("at")
+        if isinstance(at, (int, float)):
+            age = (now if now is not None else time.time()) - at
+            if age > SEEN_HISTORY_TTL_SECONDS:
+                return None
+        event_id, _ = self._entry_parts(value)
+        return event_id
+
+    def record(
+        self,
+        key: str,
+        event_id: str,
+        ts: "int | None" = None,
+        now: "float | None" = None,
+    ) -> None:
+        if not key or not event_id:
+            return
+        marks = self.read()
+        _, stored_ts = self._entry_parts(marks.get(str(key)))
+        if stored_ts is not None and ts is not None and ts < stored_ts:
+            return
+        marks.pop(str(key), None)
+        marks[str(key)] = {
+            "event_id": str(event_id),
+            "ts": ts,
+            "at": now if now is not None else time.time(),
+        }
+        while len(marks) > self._MAX_CHANNELS:
+            marks.pop(next(iter(marks)))
+        _atomic_write_text(self._path, json.dumps(marks, indent=2))
+
+
 def is_system_sender(sender: str | None, self_user_id: str | None) -> bool:
     """True if ``sender`` is the local Filament system account
     (``@filament_god:<our-homeserver>``).

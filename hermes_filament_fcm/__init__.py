@@ -120,11 +120,47 @@ BLOCKED_TOOLS: dict[str, str] = {
 }
 
 
+def _mark_history_seen(
+    seen_store: "reactive_mod.SeenHistoryStore", tool_name: str, args: dict, parsed: Any
+) -> None:
+    """A history read the model made itself counts as shown, for the
+    conversation the turn belongs to and only when the read is that
+    conversation's own (this channel's top level, or this thread)."""
+    key = turn_context.current().history_key
+    if not key or not isinstance(parsed, dict):
+        return
+    try:
+        if tool_name == "get_recent_messages":
+            channel = str(args.get("channel") or "")
+            if not channel or not key.startswith(f"channel:{channel}"):
+                return
+            if not timeline.cursor_advance_is_sound(
+                args, channel, payload=parsed, min_window=reactive_mod.BREADCRUMB_LIMIT
+            ):
+                return
+            newest = timeline.newest_message(parsed)
+        else:
+            thread = str(args.get("message_id") or args.get("thread_id") or "")
+            if not thread or key != f"thread:{thread}":
+                return
+            root = parsed.get("root")
+            replies = parsed.get("replies")
+            messages = ([root] if isinstance(root, dict) else []) + [
+                r for r in (replies or []) if isinstance(r, dict)
+            ]
+            newest = timeline.newest_message({"messages": messages})
+        if newest:
+            seen_store.record(key, newest[0], newest[1])
+    except Exception:
+        logger.warning("filament-fcm: seen-history update failed", exc_info=True)
+
+
 def _make_tool_handler(
     tool_name: str,
     api: FilamentAPI,
     cursor_store: "reactive_mod.ChannelCursorStore | None" = None,
     feature_flags: "reactive_mod.FeatureFlagStore | None" = None,
+    seen_store: "reactive_mod.SeenHistoryStore | None" = None,
 ):
     """Create an async handler that proxies a tool call through the
     given ``FilamentAPI`` instance.
@@ -190,6 +226,11 @@ def _make_tool_handler(
                         "filament-fcm: read-cursor update failed",
                         exc_info=True,
                     )
+            if seen_store is not None and tool_name in (
+                "get_recent_messages",
+                "get_thread",
+            ):
+                _mark_history_seen(seen_store, tool_name, args or {}, parsed)
             if tool_name in timeline.RENDERABLE_TOOLS:
                 # Flag read gated on renderability: the file read costs
                 # nothing on the many tools that can never render compactly.
@@ -439,6 +480,7 @@ def register(ctx: Any) -> None:
     # files, not the objects.
     cursor_store = reactive_mod.ChannelCursorStore()
     handler_flags = FeatureFlagStore()
+    seen_store = reactive_mod.SeenHistoryStore()
     registered = 0
     skipped = 0
     for tool in all_tools:
@@ -462,6 +504,7 @@ def register(ctx: Any) -> None:
                 api,
                 cursor_store=cursor_store,
                 feature_flags=handler_flags,
+                seen_store=seen_store,
             ),
             is_async=True,
             description=tool.get("description", ""),
