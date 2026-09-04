@@ -43,6 +43,7 @@ def _main_with(ready, monkeypatch):
         "print_header": _noop,
         "print_info": _noop,
         "migrate_legacy_install": _noop,
+        "seed_display_defaults": _noop,
         "_run_interactive_setup": lambda: ready,
         "_restart_gateway": lambda: restarts.append(True),
     }
