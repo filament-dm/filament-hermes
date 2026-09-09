@@ -390,7 +390,53 @@ if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
     "structlog>=25.5.0,<26"
   )
 fi
-"$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}"
+# On a sealed venv the lazy dir is PREPENDED to sys.path (the .pth above /
+# the image's HERMES_LAZY_INSTALL_TARGET activation), so anything installed
+# there shadows the venv's copy for the whole gateway — not just this plugin.
+# `--target` resolves against an empty environment, so without guidance uv
+# picks the newest version of every transitive dep: seen in the field as
+# protobuf 7.x landing in the lazy dir on a venv whose own packages
+# (googleapis-common-protos, opentelemetry-proto) pin protobuf<7, and a
+# cryptography a patch ahead of hermes-agent's == pin. Filament works, the
+# rest of Hermes silently runs on versions its own constraints forbid.
+#
+# Constrain the resolution to the venv's existing pins: every distribution the
+# venv already has stays at the venv's version (so the lazy copy, if one is
+# needed at all, is identical and shadowing is harmless), and only what the
+# venv lacks is added. The plugin's own direct deps are exempt so a pyproject
+# bump can still raise them. Only plain `name==ver` lines are kept — the
+# freeze's URL/editable entries can't go in a constraints file.
+CONSTRAINT_ARGS=()
+CONSTRAINTS=""
+if [ "$SEALED" = 1 ]; then
+  CONSTRAINTS="$(mktemp)"
+  _direct_names="$(printf '%s\n' "${FCM_DEPS[@]}" \
+    | sed -E 's/^[[:space:]]*([A-Za-z0-9_.-]+).*/\1/' | tr 'A-Z_.' 'a-z--')"
+  "$UV" pip freeze --python "$PY" 2>/dev/null \
+    | grep -E '^[A-Za-z0-9_.-]+==' \
+    | while IFS= read -r _line; do
+        _name="$(printf '%s' "${_line%%==*}" | tr 'A-Z_.' 'a-z--')"
+        printf '%s\n' "$_direct_names" | grep -qx -- "$_name" || printf '%s\n' "$_line"
+      done > "$CONSTRAINTS" || true
+  if [ -s "$CONSTRAINTS" ]; then
+    CONSTRAINT_ARGS=(--constraint "$CONSTRAINTS")
+  else
+    warn "could not read the venv's installed versions; dependencies in $LAZY_TARGET \
+may shadow the venv with versions Hermes did not pin."
+  fi
+fi
+if ! "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
+    ${CONSTRAINT_ARGS[@]+"${CONSTRAINT_ARGS[@]}"} "${FCM_DEPS[@]}"; then
+  # The venv's pins and the plugin's requirements can't both hold — a
+  # genuine conflict. A broken Filament is worse than a shadowed venv
+  # package, so install unconstrained and say what happened.
+  [ "${#CONSTRAINT_ARGS[@]}" -gt 0 ] || err "dependency install failed."
+  warn "the plugin's dependencies conflict with versions already in $VENV; \
+installing unconstrained into $LAZY_TARGET (these copies shadow the venv's)."
+  "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}" \
+    || err "dependency install failed."
+fi
+[ -z "$CONSTRAINTS" ] || rm -f "$CONSTRAINTS"
 
 # The directory-plugin entry point ($PLUGIN_DIR/__init__.py, which Hermes loads
 # to call register()) is committed to the repo, so the clone already has it —
@@ -434,13 +480,33 @@ info "Connecting to Filament ..."
 # dep target) on PYTHONPATH, so `hermes_filament_fcm` imports from the clone.
 # The package is not pip-installed, so there is no console script to run.
 run_setup() {
-  # In the profile (hosted) flow this script owns the gateway restart — an
-  # s6 bounce or the direct spawn below — so the wizard's own restart would
-  # only spend two extra CLI startups getting replaced moments later.
+  # When this script owns the gateway restart — an s6 bounce (any supervised
+  # slot is live, detected below before the wizard runs) or the profile
+  # flow's direct spawn — the wizard's own `hermes gateway restart` is worse
+  # than redundant: under s6 it runs inside the gateway's process tree, can't
+  # reach the supervisor, and just costs two CLI startups before the real
+  # bounce moments later.
   PYTHONPATH="$PLUGIN_DIR${PYPATH_PREFIX:+:$PYPATH_PREFIX}${PYTHONPATH:+:$PYTHONPATH}" \
-    FILAMENT_SETUP_SKIP_RESTART="${FILAMENT_PROFILE:+1}" \
-    "$PY" -m hermes_filament_fcm.setup_cli "$@"
+    FILAMENT_SETUP_SKIP_RESTART="${SCRIPT_OWNS_RESTART:-}" \
+    "$PY" -c 'from hermes_filament_fcm.setup_cli import main; main()' "$@"
+  # Not `-m hermes_filament_fcm.setup_cli`: the package __init__ imports
+  # setup_cli, so runpy then finds it already in sys.modules and prints a
+  # RuntimeWarning at the top of the wizard.
 }
+
+# Decide up front whether this script will restart the gateway itself, so the
+# wizard can be told to skip its own attempt. The s6 probe is cheap and is
+# what the restart section below keys off anyway.
+S6_SVC="$(command -v s6-svc 2>/dev/null || true)"
+if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
+  S6_SVC=/command/s6-svc
+fi
+SCRIPT_OWNS_RESTART="${FILAMENT_PROFILE:+1}"
+if [ -z "$SCRIPT_OWNS_RESTART" ] && [ -n "$S6_SVC" ]; then
+  for _svcdir in /run/service/gateway-* /run/service/hermes-gateway-*; do
+    if [ -p "$_svcdir/supervise/control" ]; then SCRIPT_OWNS_RESTART=1; break; fi
+  done
+fi
 
 # Re-attach the terminal so the setup wizard's prompts work even when this
 # script is piped from curl straight into bash, where stdin is the download
@@ -512,10 +578,7 @@ fi
 # s6-overlay keeps its binaries in /command, which is rarely on PATH.
 # -t sends SIGTERM and the supervisor respawns the service — the same
 # action as upstream's S6ServiceManager.restart. No-op outside s6 images.
-S6_SVC="$(command -v s6-svc 2>/dev/null || true)"
-if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
-  S6_SVC=/command/s6-svc
-fi
+# ($S6_SVC was resolved above, before the wizard ran.)
 
 # Restart a live service slot. Returns false only when no live slot exists
 # (a control FIFO is absent) — that's what gates the caller's naming-mismatch
@@ -604,3 +667,15 @@ done
 HOOKEOF
   info "Installed post-restart hook: profile gateways revive on container restarts."
 fi
+
+# --- Where to look next -------------------------------------------------------
+# The wizard says "hermes gateway status"; when `hermes` wasn't on the caller's
+# PATH (Docker/cloud shells often lack the shim dir) that command fails in the
+# very terminal they're about to type it in. Name the launcher we resolved and
+# the real log path — under s6 the supervised gateway's log is the one that
+# shows the plugin loading.
+if [ -n "${HERMES_PATH_PREFIX:-}" ]; then
+  HERMES_BIN="$(command -v hermes 2>/dev/null || true)"
+  [ -z "$HERMES_BIN" ] || info "Check status with: $HERMES_BIN gateway status  (hermes was not on your PATH)"
+fi
+info "Gateway log: $HERMES_HOME/logs/gateway.log"

@@ -46,6 +46,7 @@ def _main_with(ready, monkeypatch):
         "seed_display_defaults": _noop,
         "_run_interactive_setup": lambda: ready,
         "_restart_gateway": lambda: restarts.append(True),
+        "_find_hermes_home": lambda: Path("/tmp/hermes-home"),
     }
     return _extract("main", ns), restarts
 
