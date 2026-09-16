@@ -30,3 +30,30 @@ jobs:
 
       - name: Run pre-commit checks
         run: uv run --group dev prek run --all-files
+
+  install-sh-bash32:
+    name: install.sh under bash 3.2
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Confirm /bin/bash is still 3.2
+        # The whole point of this job. If Apple ever ships a newer /bin/bash,
+        # this stops covering bash 3.2 and should be retargeted (e.g. at a
+        # 3.2 built from source) rather than quietly passing.
+        run: |
+          /bin/bash --version
+          case "$(/bin/bash -c 'echo $BASH_VERSION')" in
+            3.2*) ;;
+            *) echo "::error::/bin/bash is no longer 3.2; retarget this job" ; exit 1 ;;
+          esac
+
+      - name: Parse install.sh
+        # Necessary but not sufficient: -n parses without expanding, so it
+        # passes even on the here-doc-in-a-substitution bug this job exists for.
+        run: /bin/bash -n install.sh
+
+      - name: Run install.sh's dependency-read block
+        run: /bin/bash tests/install-dep-read.sh
