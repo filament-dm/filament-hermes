@@ -13,7 +13,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +21,18 @@ DEP_READ_SH = ROOT / "tests" / "install-dep-read.sh"
 
 _HEREDOC_OPEN = re.compile(r"<<-?\s*[\"']?[A-Za-z_][A-Za-z0-9_]*")
 _SUBST_OPEN = re.compile(r"[$<>]\(")
+
+
+def _declared_dependencies() -> list[str]:
+    """``[project].dependencies`` from pyproject.toml, in declaration order.
+
+    Regex rather than tomllib, matching ``test_directory_plugin.py`` — tomllib
+    is 3.11+ and the project declares ``requires-python = ">=3.9"``.
+    """
+    text = (ROOT / "pyproject.toml").read_text()
+    block = re.search(r"^dependencies\s*=\s*\[(.*?)^\]", text, re.M | re.S)
+    assert block, "no [project].dependencies in pyproject.toml"
+    return re.findall(r"[\"\']([^\"\']+)[\"\']", block.group(1))
 
 
 def _substitution_depth(prefix: str, depth: int) -> int:
@@ -100,6 +111,4 @@ def test_dep_read_block_yields_every_declared_dependency():
         text=True,
         env={"PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin"},
     )
-    with open(ROOT / "pyproject.toml", "rb") as f:
-        declared = tomllib.load(f)["project"]["dependencies"]
-    assert out.stdout.splitlines() == declared
+    assert out.stdout.splitlines() == _declared_dependencies()
