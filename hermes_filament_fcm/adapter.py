@@ -68,6 +68,7 @@ from .reactive import (
     FeatureFlagStore,
     InstructionsStore,
     SeenHistoryStore,
+    SettingsStore,
     WakePolicyStore,
     capability_hint,
     context_breadcrumb,
@@ -80,6 +81,7 @@ from .reactive import (
     principal_note,
     reply_thread_for_send,
     sender_is_agent_in_thread,
+    settings_block,
     unseen_messages,
     write_server_guide_skill,
 )
@@ -256,6 +258,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # backchannel with the set_instructions / set_wake_policy tools, no restart.
         self._instructions_store = InstructionsStore()
         self._wake_policy = WakePolicyStore()
+        # The agent's declared settings, synced down from the server document
+        # and read fresh per turn so an edit in the app lands on the next one.
+        self._settings_store = SettingsStore()
         # Per-channel guidance, read fresh per wake like the stores above but
         # written only by the server-config sync (no backchannel set_* tool).
         self._channel_instructions = ChannelInstructionsStore()
@@ -2423,6 +2428,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 + "\n\n"
                 + framing.wake_policy_prompt(policy, policy_set_keys)
             )
+            # The principal edits settings in the app and then talks here;
+            # the values in force this turn belong in front of the model.
+            settings = settings_block(self._settings_store.read())
+            if settings:
+                channel_prompt += f"\n\n{settings}"
         # A control turn is often dispatched into a fresh session (cold start,
         # or a turn escalated here from a different session): the backchannel
         # timeline may hold context this session never saw. The breadcrumb
@@ -2802,6 +2812,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         instructions = self._instructions_store.read_effective(
             SERVER_GUIDE_POINTER if self._server_guide_ready else ""
         )
+        # Settings are trusted config like the instructions, so they ride in
+        # the same block, never in the data zone.
+        settings = settings_block(self._settings_store.read())
+        if settings:
+            instructions = f"{instructions}\n\n{settings}" if instructions else settings
         # Trusted framing line, present only when the waking sender IS the
         # principal. Both ids are server-attributed (sender from the push
         # payload, owner from get_self at connect) — never message content or

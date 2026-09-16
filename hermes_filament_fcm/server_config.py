@@ -53,6 +53,7 @@ from .reactive import (
     ChannelInstructionsStore,
     FeatureFlagStore,
     InstructionsStore,
+    SettingsStore,
     WakePolicyStore,
 )
 
@@ -63,6 +64,10 @@ SECTION_WAKE_POLICY = "wake_policy"
 SECTION_INSTRUCTIONS = "instructions"
 SECTION_FEATURE_FLAGS = "feature_flags"
 SECTION_CHANNEL_INSTRUCTIONS = "channel_instructions"
+# Declared by the agent through the server's own tools; synced down for the
+# turn framing and carried back up verbatim so a whole-document write-back
+# never drops it.
+SECTION_SETTINGS = "settings"
 
 # Per-wake syncs are TTL-cached: a burst of events costs at most one HTTP
 # round-trip per window, and the window is short enough that a backchannel
@@ -230,6 +235,7 @@ class ServerConfigSync:
         instructions_store: InstructionsStore | None = None,
         feature_store: FeatureFlagStore | None = None,
         channel_instructions_store: ChannelInstructionsStore | None = None,
+        settings_store: SettingsStore | None = None,
         inventory_provider: Callable[[], list[dict]] | None = None,
         ttl_seconds: float = SYNC_TTL_SECONDS,
         tools_interval_seconds: float = TOOLS_REPORT_INTERVAL_SECONDS,
@@ -242,6 +248,7 @@ class ServerConfigSync:
         self._channel_instructions_store = (
             channel_instructions_store or ChannelInstructionsStore()
         )
+        self._settings_store = settings_store or SettingsStore()
         self._inventory_provider = inventory_provider
         self._ttl = float(ttl_seconds)
         self._tools_interval = float(tools_interval_seconds)
@@ -308,6 +315,7 @@ class ServerConfigSync:
             (SECTION_WAKE_POLICY, self._wake_store.path),
             (SECTION_FEATURE_FLAGS, self._feature_store.path),
             (SECTION_CHANNEL_INSTRUCTIONS, self._channel_instructions_store.path),
+            (SECTION_SETTINGS, self._settings_store.path),
         ):
             value = _read_json_file(path)
             if isinstance(value, dict):
@@ -356,6 +364,7 @@ class ServerConfigSync:
                 dict,
                 self._channel_instructions_store.write,
             ),
+            (SECTION_SETTINGS, dict, self._settings_store.write),
         )
         for section, typ, write in writers:
             if section in exclude:

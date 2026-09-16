@@ -90,6 +90,7 @@ def _make_sync(tmp_path, api, **kwargs):
         "channel_instructions_store": reactive.ChannelInstructionsStore(
             tmp_path / "channel_instructions.json"
         ),
+        "settings_store": reactive.SettingsStore(tmp_path / "settings.json"),
     }
     kwargs.setdefault("ttl_seconds", 0.0)
     return server_config.ServerConfigSync(api, **stores, **kwargs), stores
@@ -210,6 +211,37 @@ def test_apply_writes_channel_instructions_file(tmp_path):
     )
     assert stores["channel_instructions_store"].get("!room:x") == "Answer in French."
     assert stores["channel_instructions_store"].get("!other:x") == ""
+
+
+def test_settings_sync_down_and_ride_the_write_back(tmp_path):
+    settings = {
+        "fields": [
+            {
+                "key": "tone",
+                "label": "Tone",
+                "schema": {"type": "string"},
+                "value": "terse",
+            }
+        ]
+    }
+    api = FakeAPI(
+        get_results=[
+            (
+                200,
+                {"config": {"settings": settings, "instructions": "x"}, "revision": 2},
+            )
+        ],
+        put_results=[(200, {"agent_user_id": "@a:x", "revision": 3})],
+    )
+    sync, stores = _make_sync(tmp_path, api)
+    asyncio.run(sync.sync())
+    assert stores["settings_store"].read() == settings
+    # A write-back of another section carries settings up unchanged, so the
+    # whole-document PUT cannot erase what the agent declared.
+    stores["instructions_store"].write("be brief")
+    asyncio.run(sync.write_back("instructions"))
+    assert api.put_bodies[-1]["config"]["settings"] == settings
+    assert api.put_bodies[-1]["config"]["instructions"] == "be brief"
 
 
 # ── Seed: create the server document from the local files ────────────

@@ -820,6 +820,65 @@ class ChannelInstructionsStore:
         )
 
 
+class SettingsStore:
+    """The agent's declared settings, as the server holds them.
+
+    The ``settings`` section of the server config document: fields the agent
+    declared with declare_settings, with values the principal may have edited
+    in the app. Written only by the server-config sync and read fresh on every
+    turn, so an edit in the app reaches the next turn without a restart. A
+    missing or malformed file reads as no settings.
+    """
+
+    def __init__(self, path: str | os.PathLike | None = None) -> None:
+        self._explicit_path = _explicit_path(path, "FILAMENT_SETTINGS_FILE")
+
+    @property
+    def path(self) -> Path:
+        return self._explicit_path or _default_dir() / "settings.json"
+
+    def read(self) -> dict:
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.debug("filament-fcm: failed to read settings", exc_info=True)
+        return {}
+
+    def write(self, section: dict) -> None:
+        _atomic_write_text(self.path, json.dumps(section, indent=2))
+        fields = section.get("fields")
+        logger.info(
+            "filament-fcm: settings updated (%d field(s))",
+            len(fields) if isinstance(fields, list) else 0,
+        )
+
+
+def settings_block(section: dict) -> str:
+    """Framing block carrying the agent's current settings, or "" when none
+    are declared. Values are the agent's own declarations as edited by the
+    principal in the app: trusted config, the same class as the standing
+    instructions. Pure and stdlib-only."""
+    fields = section.get("fields") if isinstance(section, dict) else None
+    if not isinstance(fields, list) or not fields:
+        return ""
+    lines = [
+        "[YOUR SETTINGS]",
+        "Declared by you; your principal can edit them in Filament. "
+        "Follow the current values.",
+    ]
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        label = field.get("label") or field.get("key") or "?"
+        value = json.dumps(field.get("value"), ensure_ascii=False)
+        lines.append(f"- {label} ({field.get('key')}): {value}")
+    return "\n".join(lines)
+
+
 def guidance_block(text: str) -> str:
     """Framing block carrying the principal's guidance for the waking channel,
     or "" when there is none (no empty header in the envelope).

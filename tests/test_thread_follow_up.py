@@ -321,6 +321,7 @@ def test_wake_puts_the_tool_map_on_the_event():
         a._feature_flags = reactive.FeatureFlagStore(tmp / "flags.json")
         a._capability_store = reactive.CapabilityPolicyStore(tmp / "caps.json")
         a._channel_instructions = reactive.ChannelInstructionsStore(tmp / "ci.json")
+        a._settings_store = reactive.SettingsStore(tmp / "settings.json")
         a._shared_sessions_effective = lambda: False
         a._cursor_channel_for_turn = lambda channel, thread_id: None
         a._apply_session_keying = lambda: None
