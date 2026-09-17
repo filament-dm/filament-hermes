@@ -17,6 +17,8 @@ uv run --group dev ruff check .            # lint (config in pyproject.toml)
 
 There is no build step. End users never install this by hand — the Filament app hands them a one-liner that runs `install.sh` with a `CONNECT_TOKEN`, which pip-installs the package into the Hermes venv and runs the `filament-fcm-setup` wizard (`setup_cli.py`).
 
+`install.sh` has to run under **bash 3.2** — that is `/bin/bash` on macOS, so it is what the `curl | bash` one-liner executes there. Never open a here-doc inside a `$(...)` or `<(...)`: 3.2 rescans the substitution's raw text at expansion time and an apostrophe in a comment silently breaks the whole thing. `bash -n` does not catch it. `tests/test_install_sh.py` guards the shape statically and `tests/install-dep-read.sh` runs the dependency-read block for real (under `/bin/bash` in the macOS CI job).
+
 `hermes plugins install` and `hermes plugins update` security-scan the whole cloned tree, `tests/` and docs included, and refuse to install anything they rate `dangerous`. Every version of this plugin has to pass that scan — check it before merging.
 
 ## The Hermes dependency is implicit — and tests must not need it

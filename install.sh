@@ -347,10 +347,20 @@ ${PLUGIN_REF:-main}/install.sh | CONNECT_TOKEN=... bash"
 # constraint (a fresh install just installs; a re-run upgrades). `hermes plugins
 # update` only pulls code, so this installer is the dependency-refresh path.
 info "Installing/upgrading plugin dependencies ..."
+# BEGIN dep-read (extracted and run by tests/install-dep-read.sh)
+#
+# The here-doc writes to a temp file and the loop reads that back, rather
+# than the here-doc feeding a `<(...)` or `$(...)` directly. bash 3.2 —
+# still /bin/bash on macOS, and so what the documented `curl | bash`
+# one-liner runs there — rescans a substitution's raw text at expansion
+# time to find its closing paren, without skipping `#` comments. An
+# apostrophe in a Python comment below then reads as an opening quote and
+# the whole block dies with "bad substitution". `bash -n` cannot catch
+# that (it parses but never expands) and the failure is non-fatal, so it
+# used to drop every macOS install silently onto the fallback list below.
 FCM_DEPS=()
-while IFS= read -r _dep; do
-  [ -n "$_dep" ] && FCM_DEPS+=("$_dep")
-done < <("$PY" - "$CLONE_TMP/pyproject.toml" <<'PYEOF'
+_DEPS_OUT="$(mktemp)"
+"$PY" - "$CLONE_TMP/pyproject.toml" > "$_DEPS_OUT" <<'PYEOF' || true
 import sys
 
 # Parse pyproject.toml properly so requirement extras (e.g. "httpx[socks]") and
@@ -374,7 +384,12 @@ if tomllib is not None:
         deps = []
 print("\n".join(d for d in deps if isinstance(d, str)))
 PYEOF
-)
+while IFS= read -r _dep; do
+  [ -n "$_dep" ] || continue
+  FCM_DEPS+=("$_dep")
+done < "$_DEPS_OUT"
+rm -f "$_DEPS_OUT"
+# END dep-read
 if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
   # A pyproject parse hiccup must never leave the plugin without its hard
   # dependency — fall back to the essential set.
