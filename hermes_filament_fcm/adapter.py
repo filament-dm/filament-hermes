@@ -244,12 +244,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("filament-fcm"))
 
         # ── Control plane vs reactive plane ───────────────────────────────
-        # The principal's backchannel (cc_room_id, learned in Stage 1) is the
-        # CONTROL plane: messages there are commands. Every other channel is the
-        # REACTIVE plane: an inbound event is a wake-up signal, handled per the
-        # tunable wake policy + standing instructions — never as instructions to
-        # the agent (see _wake). Admission (who reaches the agent at all) is
-        # still the gateway's job (FILAMENT_CONTROL_USERS / FILAMENT_ALLOW_DATA_USERS).
+        # The principal (owner_id, learned in Stage 1) carries CONTROL authority
+        # wherever they speak. The principal's backchannel (cc_room_id, also
+        # learned in Stage 1) is CONTROL by location, preserving the authority
+        # of guests invited there. Every other sender/location pair is REACTIVE:
+        # an inbound event is a wake-up signal, handled per the tunable wake
+        # policy + standing instructions — never as instructions to the agent
+        # (see _wake). Admission (who reaches the agent at all) is still the
+        # gateway's job (FILAMENT_CONTROL_USERS / FILAMENT_ALLOW_DATA_USERS).
+        # Extra FILAMENT_CONTROL_USERS remain room-scoped here: only owner_id
+        # receives sender-following authority outside the backchannel.
         #
         # Both the standing instructions and the wake policy are read fresh from
         # disk on every event, so the principal can retune them from the
@@ -525,12 +529,23 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     # ── Control vs reactive plane ────────────────────────────────────
 
     def _is_control_channel(self, room_id: str) -> bool:
-        """True if *room_id* is the principal's backchannel (the control plane).
+        """True if *room_id* is the principal's backchannel.
 
-        Everything else is the reactive plane. The backchannel is learned from
-        get_self (cc_room_id) in Stage 1; until then nothing is control.
+        The backchannel is control by location. The principal is also control
+        by sender outside it, decided separately after any shared-channel wake
+        gate. The room id is learned from get_self (cc_room_id) in Stage 1;
+        until then no room receives location-based authority.
         """
         return bool(self._cc_room_id) and room_id == self._cc_room_id
+
+    def _is_principal(self, sender: str) -> bool:
+        """Whether *sender* is the owner learned from get_self.
+
+        Before Stage 1 supplies owner_id, fail closed: no sender outside the
+        backchannel is promoted to control.
+        """
+        owner_id = getattr(self, "_owner_id", None)
+        return owner_id is not None and sender == owner_id
 
     def _mentions_me(self, body: str) -> bool:
         """True if *body* addresses the agent (by full id or localpart)."""
@@ -1835,7 +1850,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         produce — already means shared and is never touched. The flag is
         read fresh per event so a backchannel toggle takes effect on the
         next wake, no restart. DM (backchannel) and thread keying are
-        untouched either way.
+        untouched either way. This knob changes only sender grouping: the
+        event source's originating room/thread remains the session coordinate
+        for both reactive and sender-following control turns.
 
         The knob is written ONLY while the flag is on, always alongside the
         managed marker; turning the flag off removes both, restoring
@@ -1858,12 +1875,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             extra.pop(_SESSION_KEYING_MANAGED_KEY, None)
 
     async def _handle_push_message_turn(self, msg: PushMessage, turn_id: str) -> None:
-        """Route an incoming message: backchannel = control, else = reactive.
+        """Route one message by sender and location after admission policy.
 
-        Admission (who reaches the agent at all) is the gateway's job. Here we
-        only route: the principal's backchannel is imperative (commands); every
-        other channel is the reactive plane, where the wake policy decides
-        whether to spend a turn and the standing instructions decide what to do.
+        The backchannel is immediately control by room. A principal DM is
+        immediately control by sender. In shared channels the existing wake
+        policy still decides whether to spend a turn; once admitted, a
+        principal message is control and every other message is reactive data.
         """
         logger.info(
             "filament-fcm: message event=%s from %s (%s) in %s (room=%s, "
@@ -1919,19 +1936,32 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # costs at most one HTTP call; never raises.
         await self._server_config.sync()
 
-        if self._is_control_channel(msg.room_id):
+        is_backchannel = self._is_control_channel(msg.room_id)
+        is_principal = self._is_principal(msg.sender)
+        if is_backchannel:
             logger.info("filament-fcm: → CONTROL plane (backchannel %s)", msg.room_id)
             slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
             await self._handle_control_message(msg)
             slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="control")
             return
 
+        # DMs have no shared audience whose wake policy needs to be respected.
+        # The owner carries authority into any DM, including one other than the
+        # designated backchannel. Non-owner DMs keep the existing reactive path.
+        if is_principal and msg.is_direct:
+            logger.info(
+                "filament-fcm: → CONTROL plane (principal DM in %s)", msg.room_id
+            )
+            slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
+            await self._handle_control_message(msg)
+            slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="control")
+            return
+
         logger.info(
-            "filament-fcm: → REACTIVE plane (room %s is not the backchannel %s)",
+            "filament-fcm: applying shared-channel wake gate in %s (backchannel=%s)",
             msg.room_id,
             self._cc_room_id,
         )
-        slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="reactive")
 
         # Never reply to a Filament system notice. filament_god authors exactly
         # one kind of timeline message today — the "X vouched for Y to join
@@ -1959,8 +1989,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             return
 
-        # Reactive plane: wake only if the policy admits this message. A mention
-        # is the server's flag (is_mention_of_recipient) first, with a body
+        # Outside the backchannel, wake only if the policy admits this message.
+        # This gate remains in front of principal promotion for shared channels:
+        # authority follows the sender, but an unmentioned principal message
+        # must not spend a turn merely because of that authority. A mention is
+        # the server's flag (is_mention_of_recipient) first, with a body
         # text-match as a fallback. @everyone/@here is NOT a mention (see
         # is_agent_mention): one broadcast must not wake every agent at once.
         mentioned = is_agent_mention(
@@ -2009,6 +2042,22 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # re-records to refresh the thread's eviction slot.
         if mentioned or thread_follow_up:
             self._engaged_threads.record(msg.room_id, msg.thread_id or msg.event_id)
+
+        # The shared-channel gate has admitted this turn. Principal authority
+        # now follows the sender: dispatch the raw command with control framing,
+        # never through the data-plane envelope below.
+        if is_principal:
+            logger.info(
+                "filament-fcm: → CONTROL plane (principal in shared room %s)",
+                msg.room_id,
+            )
+            slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
+            await self._handle_control_message(msg)
+            slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="control")
+            return
+
+        logger.info("filament-fcm: → REACTIVE plane (non-principal sender)")
+        slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="reactive")
 
         # Where the reply lands is a per-channel wake-policy choice. Default
         # ("thread") threads off the triggering message: a top-level message
@@ -2303,9 +2352,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         return verdict
 
     async def _handle_control_message(self, msg: PushMessage) -> None:
-        """Backchannel (control plane): the principal commands the agent
-        directly — no wake policy, no standing-instructions framing, full
-        command authority."""
+        """Dispatch a control turn from its originating room.
+
+        The backchannel is control by location, including for guests. Outside
+        it, only the principal reaches this path, after the shared-channel wake
+        gate when applicable. All control turns use imperative framing and full
+        capability; only the backchannel may intercept plugin or gateway slash
+        commands.
+        """
+        is_backchannel = self._is_control_channel(msg.room_id)
+        is_shared = not is_backchannel and not msg.is_direct
         # The slash check runs on the lead-stripped body: only a *leading*
         # mention is addressing; an MXID inside command arguments is data
         # the deterministic parser must see untouched.
@@ -2316,9 +2372,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # ONLY the /fil- namespace is ours (case-insensitive prefix): any
         # other leading-/ message belongs to some other software's slash
         # namespace and falls through to the normal LLM control path below —
-        # we must not swallow it. Control-plane only by construction (this
-        # method is only reached for the backchannel), which is what makes
-        # the writes below legitimate.
+        # we must not swallow it. This interception is backchannel-only, which
+        # is what makes the writes below legitimate. Sender-following control
+        # turns outside the backchannel deliberately skip it and reach the LLM.
         #
         # The whole surface is gated behind the slash_commands feature flag
         # (default OFF, read fresh per event like the capability gate): while
@@ -2339,7 +2395,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # that can decline.
         is_owner = self._owner_id is not None and msg.sender == self._owner_id
         if (
-            slash_body
+            is_backchannel
+            and slash_body
             and slash.is_fil_command(slash_body)
             and (
                 self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
@@ -2365,7 +2422,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # platform it serves. So the hand-over asks who is speaking, and a
         # sender we cannot identify as the owner takes the ordinary path.
         gateway_command = (
-            slash_body.startswith("/")
+            is_backchannel
+            and slash_body.startswith("/")
             and not slash.is_fil_command(slash_body)
             and is_owner
         )
@@ -2377,10 +2435,23 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # Two independent reads in one round trip: the attachment note
             # (the push never includes attachments, ENG-603, so an uncaptioned
             # image would otherwise arrive as an empty message) and the
-            # backchannel context this session may not have seen (below).
+            # conversation context this session may not have seen (below).
+            if not is_backchannel:
+                context_read = self._context_breadcrumb(
+                    msg.room_id,
+                    msg.event_id,
+                    thread_id=msg.thread_id,
+                    inline=False,
+                )
+            else:
+                # Keep the legacy backchannel inline context. Other originating
+                # rooms stay behind a counted cue; only the principal message
+                # itself is promoted by sender authority.
+                context_read = self._context_breadcrumb(
+                    msg.room_id, msg.event_id, inline=True
+                )
             media_note, breadcrumb = await asyncio.gather(
-                self._media_note(msg),
-                self._context_breadcrumb(msg.room_id, msg.event_id, inline=True),
+                self._media_note(msg), context_read
             )
             body = framing.append_note(body, media_note)
             # Name the speaker in the turn's framing (see framing.control_body:
@@ -2392,15 +2463,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 sender_display_name=msg.sender_display_name,
                 owner_id=self._owner_id,
             )
-        # In the backchannel we default to replying on the main timeline: a
-        # top-level message (msg.thread_id is None) gets a normal channel reply,
-        # while a message the principal posted *inside* a thread keeps the reply
-        # in that thread. (Elsewhere/reactive turns still thread off the message.)
+        # A backchannel or DM top-level message gets a top-level reply. In a
+        # shared channel, a top-level principal command roots a reply thread,
+        # matching the reactive default; an existing thread keeps its root.
+        # Keep the actual incoming thread as the session key and carry a
+        # separate reply anchor for the top-level shared case.
         thread_id = msg.thread_id
+        reply_anchor = (
+            (msg.room_id, msg.thread_id or msg.event_id) if is_shared else None
+        )
         source = self.build_source(
             chat_id=msg.room_id,
             chat_name=msg.room_name,
-            chat_type="dm",
+            chat_type="group" if is_shared else "dm",
             user_id=msg.sender,
             user_name=msg.sender_display_name or msg.sender,
             thread_id=thread_id,
@@ -2415,19 +2490,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         channel_prompt = None
         if not gateway_command:
             policy, policy_set_keys = self._wake_policy.read_with_provenance()
-            channel_prompt = (
-                f"{framing.TOOL_MAP_PROMPT}\n\n"
-                + framing.command_map_prompt(
-                    self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+            prompt_parts = [framing.TOOL_MAP_PROMPT]
+            if is_backchannel:
+                prompt_parts.append(
+                    framing.command_map_prompt(
+                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+                    )
                 )
-                + "\n\n"
-                + framing.wake_policy_prompt(policy, policy_set_keys)
-            )
+            prompt_parts.append(framing.wake_policy_prompt(policy, policy_set_keys))
+            channel_prompt = "\n\n".join(prompt_parts)
         # A control turn is often dispatched into a fresh session (cold start,
-        # or a turn escalated here from a different session): the backchannel
-        # timeline may hold context this session never saw. The breadcrumb
-        # read above carries it; the framework prepends channel_context to
-        # the body.
+        # or a turn escalated here from a different session). The breadcrumb
+        # read above carries safe context for that originating conversation;
+        # the framework prepends channel_context to the body.
         event = MessageEvent(
             text=body,
             message_type=MessageType.TEXT,
@@ -2450,9 +2525,24 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             thread_id=thread_id,
         )
         # The control zone is what permits set_instructions and
-        # set_wake_policy, which refuse from a data turn. CONTROL carries the
-        # rest of a control turn's authority as one value; see turn_context.
-        turn_context.activate(turn_context.CONTROL)
+        # set_wake_policy, which refuse from a data turn. Keep the legacy
+        # backchannel constant unchanged; principal turns elsewhere carry the
+        # originating room's cursor/history identity and reply anchor in an
+        # explicit control context.
+        if is_backchannel:
+            context = turn_context.CONTROL
+        else:
+            context = turn_context.control_turn(
+                cursor_channel=msg.room_id,
+                reply_anchor=reply_anchor,
+                history_key=history_key(
+                    msg.room_id,
+                    msg.thread_id,
+                    msg.sender,
+                    self._shared_sessions_effective(),
+                ),
+            )
+        turn_context.activate(context)
         # Applied synchronously right before dispatch: the base adapter
         # derives the session key at handle_message entry, so no await can
         # interleave a flag toggle between decision and use — and the

@@ -182,11 +182,14 @@ def _make_adapter(tmp_path, monkeypatch, slash_enabled=True):
     a._cc_room_id = _CC_ROOM
     a._owner_id = "@irena:fil"
     dispatched = []
+    dispatched_contexts = []
 
     async def _record(event):
         dispatched.append(event)
+        dispatched_contexts.append(adapter.turn_context.current())
 
     a.handle_message = _record
+    a.dispatched_contexts = dispatched_contexts
     return a, api, sync, dispatched
 
 
@@ -205,6 +208,32 @@ def _control_msg(body, sender="@irena:fil"):
         is_everyone_mention=False,
         raw={},
     )
+
+
+def _shared_control_msg(body, *, thread_id=None):
+    return fcm_client.PushMessage(
+        event_id="$shared-event",
+        room_id=_WELCOME,
+        room_name="welcome",
+        sender="@irena:fil",
+        sender_display_name="Irena",
+        body=body,
+        is_direct=False,
+        branch_type="channel_message",
+        thread_id=thread_id,
+        is_mention=True,
+        is_everyone_mention=False,
+        raw={},
+    )
+
+
+def _direct_control_msg(body):
+    msg = _shared_control_msg(body)
+    msg.room_id = "!other-dm:fil"
+    msg.room_name = "Irena"
+    msg.is_direct = True
+    msg.branch_type = "direct_message"
+    return msg
 
 
 def test_slash_message_never_reaches_the_llm(tmp_path, monkeypatch):
@@ -465,6 +494,86 @@ def test_ordinary_control_message_is_still_framed(tmp_path, monkeypatch):
     text = dispatched[0].text
     assert text != "restart the gateway"
     assert text.endswith("restart the gateway")
+
+
+def test_shared_principal_control_uses_origin_and_threaded_reply(tmp_path, monkeypatch):
+    a, api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+
+    async def _reply_from_turn(event):
+        dispatched.append(event)
+        a.dispatched_contexts.append(adapter.turn_context.current())
+        await a.send(event.source["chat_id"], "from the control turn")
+
+    a.handle_message = _reply_from_turn
+    asyncio.run(a._handle_control_message(_shared_control_msg("ship it")))
+
+    event = dispatched[0]
+    ctx = a.dispatched_contexts[0]
+    assert event.source["chat_id"] == _WELCOME
+    assert event.source["thread_id"] is None
+    assert event.source["chat_type"] == "group"
+    assert event.text.startswith("[Message from your principal")
+    assert "[EVENT DATA" not in event.text
+    assert ctx.zone is adapter.turn_context.Zone.CONTROL
+    assert ctx.cursor_channel == _WELCOME
+    assert ctx.reply_anchor == (_WELCOME, "$shared-event")
+    assert ctx.history_key.startswith(f"channel:{_WELCOME}")
+    assert api.posted[-1] == ("$shared-event", "from the control turn")
+
+
+def test_shared_principal_control_keeps_originating_thread_session(
+    tmp_path, monkeypatch
+):
+    a, _api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    asyncio.run(
+        a._handle_control_message(
+            _shared_control_msg("continue", thread_id="$origin-thread")
+        )
+    )
+    event = dispatched[0]
+    ctx = a.dispatched_contexts[0]
+    assert event.source["chat_id"] == _WELCOME
+    assert event.source["thread_id"] == "$origin-thread"
+    assert ctx.reply_anchor == (_WELCOME, "$origin-thread")
+    assert ctx.history_key == "thread:$origin-thread"
+
+
+def test_principal_dm_replies_top_level_in_its_origin(tmp_path, monkeypatch):
+    a, api, _sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+
+    async def _reply_from_turn(event):
+        dispatched.append(event)
+        a.dispatched_contexts.append(adapter.turn_context.current())
+        await a.send(event.source["chat_id"], "dm reply")
+
+    a.handle_message = _reply_from_turn
+    asyncio.run(a._handle_control_message(_direct_control_msg("hello")))
+
+    event = dispatched[0]
+    ctx = a.dispatched_contexts[0]
+    assert event.source["chat_id"] == "!other-dm:fil"
+    assert event.source["thread_id"] is None
+    assert event.source["chat_type"] == "dm"
+    assert ctx.cursor_channel == "!other-dm:fil"
+    assert ctx.reply_anchor is None
+    assert api.posted[-1] == ("!other-dm:fil", "dm reply")
+
+
+def test_shared_principal_slashes_stay_on_the_llm_path(tmp_path, monkeypatch):
+    a, api, sync, dispatched = _make_adapter(tmp_path, monkeypatch)
+    for body in ("/fil-config #welcome post off", "/restart", "/status"):
+        asyncio.run(a._handle_control_message(_shared_control_msg(body)))
+    assert len(dispatched) == 3
+    assert all(
+        event.text.startswith("[Message from your principal") for event in dispatched
+    )
+    assert [event.text.splitlines()[-1] for event in dispatched] == [
+        "/fil-config #welcome post off",
+        "/restart",
+        "/status",
+    ]
+    assert sync.written_back == []
+    assert api.posted == []
 
 
 if __name__ == "__main__":
