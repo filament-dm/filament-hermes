@@ -86,6 +86,35 @@ def test_activating_control_permits_policy_edits():
     asyncio.run(main())
 
 
+def test_control_turn_requires_originating_conversation_fields():
+    """Principal control outside the backchannel states every location field."""
+    for missing in ("cursor_channel", "reply_anchor", "history_key"):
+        kwargs = {
+            "cursor_channel": "!shared:s",
+            "reply_anchor": ("!shared:s", "$event"),
+            "history_key": "channel:!shared:s|@owner:s",
+        }
+        del kwargs[missing]
+        try:
+            turn_context.control_turn(**kwargs)
+        except TypeError:
+            continue
+        raise AssertionError(f"control_turn accepted a missing {missing}")
+
+
+def test_control_turn_carries_full_authority_at_its_origin():
+    ctx = turn_context.control_turn(
+        cursor_channel="!shared:s",
+        reply_anchor=("!shared:s", "$event"),
+        history_key="channel:!shared:s|@owner:s",
+    )
+    assert ctx.zone is Zone.CONTROL
+    assert ctx.capabilities is None
+    assert ctx.cursor_channel == "!shared:s"
+    assert ctx.reply_anchor == ("!shared:s", "$event")
+    assert ctx.history_key == "channel:!shared:s|@owner:s"
+
+
 # ── data_turn requires every decision to be explicit ─────────────────
 
 
