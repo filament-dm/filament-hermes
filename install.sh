@@ -115,10 +115,56 @@ if [ -z "$VENV" ]; then
   fi
 fi
 
+# Newer Hermes (the "pm" layout) has no venv at a fixed path, so everything
+# above misses it. Its launcher runs a Hermes-managed Python directly, and the
+# dependencies live in a content-addressed environment *generation*
+# ($HERMES_HOME/installs/<id>/environments/<hash>/venv) that Hermes replaces
+# whenever its dependency graph changes (hermes update, extras, plugin enables).
+#
+# Only reached when no venv-layout install was found, so every host the checks
+# above already serve behaves exactly as before.
+#
+# Ask the launcher which generation it runs: `--run-module` runs a module inside
+# the Hermes runtime after the selected generation is activated, and the stdlib
+# `site` module prints the resulting sys.path, one quoted entry per line. That
+# venv's Python can run the setup wizard, but nothing is installed into it —
+# anything pip-installed there vanishes with the next generation. Nothing has to
+# be: vendor/ carries the plugin's own dependencies, Hermes core has the rest,
+# and plugin.yaml's `python_runtime: external` keeps Hermes from folding this
+# plugin into its dependency union.
+#
+# Output goes through temp files rather than a $(...) or <(...) — the dep-read
+# block below says why substitutions stay simple here (bash 3.2). stdin is
+# /dev/null: under `curl | bash` it is the rest of this script.
+# BEGIN pm-detect (extracted and run by tests/test_install_sh_pm_layout.py)
+PM_LAYOUT=0
+PM_LAUNCHER=""
+if [ -z "$VENV" ]; then
+  _SITE_OUT="$(mktemp)"
+  for _launcher in "$(command -v hermes 2>/dev/null || true)" \
+      "${HERMES_INSTALL_DIR:+$HERMES_INSTALL_DIR/.hermes/bin/hermes}" \
+      "$HERMES_HOME/hermes-agent/.hermes/bin/hermes"; do
+    [ -n "$_launcher" ] && [ -x "$_launcher" ] || continue
+    HERMES_HOME="$HERMES_HOME" "$_launcher" --run-module site \
+      < /dev/null > "$_SITE_OUT" 2>/dev/null || true
+    sed -n "s|^[[:space:]]*'\(/.*/site-packages\)',\{0,1\}\$|\1|p" "$_SITE_OUT" > "$_SITE_OUT.paths"
+    while IFS= read -r _path; do
+      CANDIDATE="${_path%/lib/python*/site-packages}"
+      if [ "$CANDIDATE" != "$_path" ] && [ -f "$CANDIDATE/pyvenv.cfg" ] && is_venv "$CANDIDATE"; then
+        VENV="$CANDIDATE"; break
+      fi
+    done < "$_SITE_OUT.paths"
+    if [ -n "$VENV" ]; then PM_LAYOUT=1; PM_LAUNCHER="$_launcher"; break; fi
+  done
+  rm -f "$_SITE_OUT" "$_SITE_OUT.paths"
+fi
+# END pm-detect
+
 [ -n "$VENV" ] || err "Hermes venv not found — install/start Hermes Agent first. \
 Checked \$VIRTUAL_ENV, $HERMES_HOME/hermes-agent/venv, /usr/local/lib/hermes-agent/venv, \
-/opt/hermes/.venv, and the 'hermes' command on PATH. If your venv lives elsewhere, \
-re-run with VIRTUAL_ENV=/path/to/venv."
+/opt/hermes/.venv, the 'hermes' command on PATH, and the environment a pm-managed \
+Hermes launcher reports. If your venv lives elsewhere, re-run with VIRTUAL_ENV=/path/to/venv."
+[ "$PM_LAYOUT" = 0 ] || info "Hermes manages its own environment (pm layout); using $VENV."
 
 # Docker/cloud images keep the data tree at /opt/data (the image sets
 # HERMES_HOME=/opt/data itself, so this only matters under a stripped
@@ -133,11 +179,15 @@ export HERMES_HOME="$HERMES_HOME"
 PY="$VENV/bin/python"
 
 # uv ships with Hermes: $HERMES_HOME/bin/uv on user installs, /usr/local/bin/uv
-# on Docker/cloud images. Fall back to one on PATH.
-UV="$HERMES_HOME/bin/uv"
-[ -x "$UV" ] || UV=/usr/local/bin/uv
-[ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
-[ -n "$UV" ] || err "uv not found — install Hermes Agent first (expected $HERMES_HOME/bin/uv)."
+# on Docker/cloud images. Fall back to one on PATH. A pm-layout install needs
+# none: nothing is pip-installed there (see above).
+UV=""
+if [ "$PM_LAYOUT" = 0 ]; then
+  UV="$HERMES_HOME/bin/uv"
+  [ -x "$UV" ] || UV=/usr/local/bin/uv
+  [ -x "$UV" ] || UV="$(command -v uv 2>/dev/null || true)"
+  [ -n "$UV" ] || err "uv not found — install Hermes Agent first (expected $HERMES_HOME/bin/uv)."
+fi
 
 # Make `hermes` resolvable for everything below (profile creation, the wizard's
 # gateway-restart step), without shadowing an existing launcher (the Docker
@@ -149,6 +199,11 @@ if ! command -v hermes >/dev/null 2>&1; then
   HERMES_PATH_PREFIX="$HERMES_HOME/bin:$VENV/bin"
   if [ "$VENV" = /opt/hermes/.venv ] && [ -x /opt/hermes/bin/hermes ]; then
     HERMES_PATH_PREFIX="/opt/hermes/bin:$HERMES_PATH_PREFIX"
+  fi
+  # A pm generation's venv has no hermes entry point; the launcher found above
+  # is the one to run.
+  if [ -n "$PM_LAUNCHER" ]; then
+    HERMES_PATH_PREFIX="$(dirname "$PM_LAUNCHER")"
   fi
   export PATH="$HERMES_PATH_PREFIX:$PATH"
 fi
@@ -167,7 +222,9 @@ fi
 # too, for hand-built variants at other paths.
 SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
 SEALED=0
-if [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = "1" ] || [ "$VENV" = /opt/hermes/.venv ] \
+if [ "$PM_LAYOUT" = 1 ]; then
+  : # Nothing is installed into a pm generation, sealed or not (see above).
+elif [ "${HERMES_DISABLE_LAZY_INSTALLS:-}" = "1" ] || [ "$VENV" = /opt/hermes/.venv ] \
     || { [ -n "$SITE" ] && [ ! -w "$SITE" ]; }; then
   SEALED=1
 fi
@@ -180,7 +237,7 @@ fi
 # which fails EACCES and takes the whole install down. Probe one glob level
 # for a __pycache__ we can't write, and treat that venv as sealed too.
 # POSIX-only ([ -w ] rather than find -writable) so this holds on macOS.
-if [ "$SEALED" = 0 ] && [ -n "$SITE" ]; then
+if [ "$SEALED" = 0 ] && [ "$PM_LAYOUT" = 0 ] && [ -n "$SITE" ]; then
   for _pycache in "$SITE"/*/__pycache__; do
     [ -d "$_pycache" ] || continue
     if [ ! -w "$_pycache" ]; then
@@ -232,6 +289,8 @@ gateway may not see the dependencies; set HERMES_LAZY_INSTALL_TARGET to a dir \
 it already activates."
     fi
   fi
+elif [ "$PM_LAYOUT" = 1 ]; then
+  info "Nothing to install into Hermes's environment — the plugin's dependencies ship in its vendor/ tree."
 elif [ "$SEALED" = 1 ]; then
   err "Hermes venv at $VENV is sealed (read-only or lazy installs disabled) and HERMES_LAZY_INSTALL_TARGET is not set — nowhere to install."
 else
@@ -346,7 +405,7 @@ ${PLUGIN_REF:-main}/install.sh | CONNECT_TOKEN=... bash"
 # updates: each dep is brought to the newest version satisfying its pyproject
 # constraint (a fresh install just installs; a re-run upgrades). `hermes plugins
 # update` only pulls code, so this installer is the dependency-refresh path.
-info "Installing/upgrading plugin dependencies ..."
+[ "$PM_LAYOUT" = 1 ] || info "Installing/upgrading plugin dependencies ..."
 # BEGIN dep-read (extracted and run by tests/install-dep-read.sh)
 #
 # The here-doc writes to a temp file and the loop reads that back, rather
@@ -390,68 +449,72 @@ while IFS= read -r _dep; do
 done < "$_DEPS_OUT"
 rm -f "$_DEPS_OUT"
 # END dep-read
-if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
-  # A pyproject parse hiccup must never leave the plugin without its hard
-  # dependency — fall back to the essential set.
-  #
-  # firebase-messaging must stay the fork here too. Installing the stock package
-  # would put it ahead of the vendored fork on sys.path, and the agent would
-  # connect, look healthy and never receive a push. Keep the ref in step with
-  # pyproject.toml and scripts/vendor-deps.sh.
-  warn "could not read dependencies from pyproject.toml; using built-in defaults."
-  FCM_DEPS=(
-    "firebase-messaging @ git+https://github.com/filament-dm/firebase-messaging.git@filament/integration"
-    "httpx>=0.24"
-    "structlog>=25.5.0,<26"
-  )
-fi
-# On a sealed venv the lazy dir is PREPENDED to sys.path (the .pth above /
-# the image's HERMES_LAZY_INSTALL_TARGET activation), so anything installed
-# there shadows the venv's copy for the whole gateway — not just this plugin.
-# `--target` resolves against an empty environment, so without guidance uv
-# picks the newest version of every transitive dep: seen in the field as
-# protobuf 7.x landing in the lazy dir on a venv whose own packages
-# (googleapis-common-protos, opentelemetry-proto) pin protobuf<7, and a
-# cryptography a patch ahead of hermes-agent's == pin. Filament works, the
-# rest of Hermes silently runs on versions its own constraints forbid.
-#
-# Constrain the resolution to the venv's existing pins: every distribution the
-# venv already has stays at the venv's version (so the lazy copy, if one is
-# needed at all, is identical and shadowing is harmless), and only what the
-# venv lacks is added. The plugin's own direct deps are exempt so a pyproject
-# bump can still raise them. Only plain `name==ver` lines are kept — the
-# freeze's URL/editable entries can't go in a constraints file.
-CONSTRAINT_ARGS=()
-CONSTRAINTS=""
-if [ "$SEALED" = 1 ]; then
-  CONSTRAINTS="$(mktemp)"
-  _direct_names="$(printf '%s\n' "${FCM_DEPS[@]}" \
-    | sed -E 's/^[[:space:]]*([A-Za-z0-9_.-]+).*/\1/' | tr 'A-Z_.' 'a-z--')"
-  "$UV" pip freeze --python "$PY" 2>/dev/null \
-    | grep -E '^[A-Za-z0-9_.-]+==' \
-    | while IFS= read -r _line; do
-        _name="$(printf '%s' "${_line%%==*}" | tr 'A-Z_.' 'a-z--')"
-        printf '%s\n' "$_direct_names" | grep -qx -- "$_name" || printf '%s\n' "$_line"
-      done > "$CONSTRAINTS" || true
-  if [ -s "$CONSTRAINTS" ]; then
-    CONSTRAINT_ARGS=(--constraint "$CONSTRAINTS")
-  else
-    warn "could not read the venv's installed versions; dependencies in $LAZY_TARGET \
-may shadow the venv with versions Hermes did not pin."
+# A pm-layout Hermes gets nothing installed (see where it is detected above).
+# The dep-read still runs for it; it only reads pyproject.toml.
+if [ "$PM_LAYOUT" = 0 ]; then
+  if [ "${#FCM_DEPS[@]}" -eq 0 ]; then
+    # A pyproject parse hiccup must never leave the plugin without its hard
+    # dependency — fall back to the essential set.
+    #
+    # firebase-messaging must stay the fork here too. Installing the stock package
+    # would put it ahead of the vendored fork on sys.path, and the agent would
+    # connect, look healthy and never receive a push. Keep the ref in step with
+    # pyproject.toml and scripts/vendor-deps.sh.
+    warn "could not read dependencies from pyproject.toml; using built-in defaults."
+    FCM_DEPS=(
+      "firebase-messaging @ git+https://github.com/filament-dm/firebase-messaging.git@filament/integration"
+      "httpx>=0.24"
+      "structlog>=25.5.0,<26"
+    )
   fi
+  # On a sealed venv the lazy dir is PREPENDED to sys.path (the .pth above /
+  # the image's HERMES_LAZY_INSTALL_TARGET activation), so anything installed
+  # there shadows the venv's copy for the whole gateway — not just this plugin.
+  # `--target` resolves against an empty environment, so without guidance uv
+  # picks the newest version of every transitive dep: seen in the field as
+  # protobuf 7.x landing in the lazy dir on a venv whose own packages
+  # (googleapis-common-protos, opentelemetry-proto) pin protobuf<7, and a
+  # cryptography a patch ahead of hermes-agent's == pin. Filament works, the
+  # rest of Hermes silently runs on versions its own constraints forbid.
+  #
+  # Constrain the resolution to the venv's existing pins: every distribution the
+  # venv already has stays at the venv's version (so the lazy copy, if one is
+  # needed at all, is identical and shadowing is harmless), and only what the
+  # venv lacks is added. The plugin's own direct deps are exempt so a pyproject
+  # bump can still raise them. Only plain `name==ver` lines are kept — the
+  # freeze's URL/editable entries can't go in a constraints file.
+  CONSTRAINT_ARGS=()
+  CONSTRAINTS=""
+  if [ "$SEALED" = 1 ]; then
+    CONSTRAINTS="$(mktemp)"
+    _direct_names="$(printf '%s\n' "${FCM_DEPS[@]}" \
+      | sed -E 's/^[[:space:]]*([A-Za-z0-9_.-]+).*/\1/' | tr 'A-Z_.' 'a-z--')"
+    "$UV" pip freeze --python "$PY" 2>/dev/null \
+      | grep -E '^[A-Za-z0-9_.-]+==' \
+      | while IFS= read -r _line; do
+          _name="$(printf '%s' "${_line%%==*}" | tr 'A-Z_.' 'a-z--')"
+          printf '%s\n' "$_direct_names" | grep -qx -- "$_name" || printf '%s\n' "$_line"
+        done > "$CONSTRAINTS" || true
+    if [ -s "$CONSTRAINTS" ]; then
+      CONSTRAINT_ARGS=(--constraint "$CONSTRAINTS")
+    else
+      warn "could not read the venv's installed versions; dependencies in $LAZY_TARGET \
+  may shadow the venv with versions Hermes did not pin."
+    fi
+  fi
+  if ! "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
+      ${CONSTRAINT_ARGS[@]+"${CONSTRAINT_ARGS[@]}"} "${FCM_DEPS[@]}"; then
+    # The venv's pins and the plugin's requirements can't both hold — a
+    # genuine conflict. A broken Filament is worse than a shadowed venv
+    # package, so install unconstrained and say what happened.
+    [ "${#CONSTRAINT_ARGS[@]}" -gt 0 ] || err "dependency install failed."
+    warn "the plugin's dependencies conflict with versions already in $VENV; \
+  installing unconstrained into $LAZY_TARGET (these copies shadow the venv's)."
+    "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}" \
+      || err "dependency install failed."
+  fi
+  [ -z "$CONSTRAINTS" ] || rm -f "$CONSTRAINTS"
 fi
-if ! "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
-    ${CONSTRAINT_ARGS[@]+"${CONSTRAINT_ARGS[@]}"} "${FCM_DEPS[@]}"; then
-  # The venv's pins and the plugin's requirements can't both hold — a
-  # genuine conflict. A broken Filament is worse than a shadowed venv
-  # package, so install unconstrained and say what happened.
-  [ "${#CONSTRAINT_ARGS[@]}" -gt 0 ] || err "dependency install failed."
-  warn "the plugin's dependencies conflict with versions already in $VENV; \
-installing unconstrained into $LAZY_TARGET (these copies shadow the venv's)."
-  "$UV" pip install --upgrade ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} "${FCM_DEPS[@]}" \
-    || err "dependency install failed."
-fi
-[ -z "$CONSTRAINTS" ] || rm -f "$CONSTRAINTS"
 
 # The directory-plugin entry point ($PLUGIN_DIR/__init__.py, which Hermes loads
 # to call register()) is committed to the repo, so the clone already has it —
@@ -472,6 +535,16 @@ fi
 mv "$CLONE_TMP" "$PLUGIN_DIR" || err "could not move the plugin into $PLUGIN_DIR."
 trap - EXIT
 
+# pm-layout Hermes keeps a provenance record per plugin, which is what
+# `hermes plugins check-updates` reads; a directory cloned by hand (as above) has
+# none until it is adopted. Best-effort and quiet: a re-run finds the record
+# already there (adopt then exits non-zero), `hermes plugins update` pulls from
+# the clone's git remote either way, and the plugin's own update check keeps
+# reminding the principal. Venv-layout Hermes has no records and no `adopt`.
+if [ "$PM_LAYOUT" = 1 ]; then
+  hermes plugins adopt "$PLUGIN_ID" < /dev/null > /dev/null 2>&1 || true
+fi
+
 # An install made under the old plugin id is retired by the setup step below,
 # not here. It rewrites plugins.enabled onto the new id and then removes the old
 # directory, in that order — so if setup never gets that far, config still names
@@ -485,7 +558,7 @@ trap - EXIT
 # overwrite an untracked file now that the file is committed. Nobody has to delete
 # it by hand.
 
-"$UV" pip uninstall hermes-filament-fcm >/dev/null 2>&1 || true
+[ -z "$UV" ] || "$UV" pip uninstall hermes-filament-fcm >/dev/null 2>&1 || true
 if [ -n "$LAZY_TARGET" ] && [ -d "$LAZY_TARGET" ]; then
   rm -rf "$LAZY_TARGET"/hermes_filament_fcm "$LAZY_TARGET"/hermes_filament_fcm-*.dist-info 2>/dev/null || true
 fi
@@ -544,7 +617,11 @@ if [ -n "${FILAMENT_PROFILE:-}" ] && [ -n "${ROOT_HERMES_HOME:-}" ]; then
 its managed integrations may be missing; compare config.yaml against the root profile's."
 import sys
 
-import yaml
+# pm-layout Hermes ships ruamel behind hermes_yaml instead of PyYAML.
+try:
+    import yaml
+except ImportError:
+    import hermes_yaml as yaml
 
 root, prof = sys.argv[1], sys.argv[2]
 try:
