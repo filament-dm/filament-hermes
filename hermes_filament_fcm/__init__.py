@@ -687,9 +687,16 @@ def _mcp_server_statuses() -> dict[str, Any]:
     ``get_mcp_status`` is Hermes-core banner plumbing — treat it as optional.
     A Hermes without it (or with no MCP servers configured) just produces
     health-less entries for foreign toolsets.
+
+    Imported from ``tools.mcp_tool_discovery``, its home since Hermes
+    v2026.9.7. Never from its old module (``mcp_tool``, no ``_discovery``):
+    releases from v2026.9.14 until the compat layer's removal *disable any
+    plugin* that imports an old path (``hermes plugins compat``), and current
+    Hermes no longer has it there at all. Hermes older than v2026.9.7 lands
+    in the except below.
     """
     try:
-        from tools.mcp_tool import get_mcp_status  # noqa: PLC0415
+        from tools.mcp_tool_discovery import get_mcp_status  # noqa: PLC0415
 
         return {
             str(row.get("name")): row
