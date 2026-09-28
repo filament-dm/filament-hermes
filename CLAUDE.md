@@ -13,13 +13,14 @@ uv run --group dev pytest tests/ -q        # run tests
 uv run --group dev pytest tests/test_reactive.py -q                    # one file
 uv run --group dev pytest tests/test_reactive.py::test_name -q         # one test
 uv run --group dev ruff check .            # lint (config in pyproject.toml)
+python3 scripts/plugin-scan.py              # Hermes plugin security scan — must say SAFE (CI runs it)
 ```
 
 There is no build step. End users never install this by hand — the Filament app hands them a one-liner that runs `install.sh` with a `CONNECT_TOKEN`, which pip-installs the package into the Hermes venv and runs the `filament-fcm-setup` wizard (`setup_cli.py`).
 
-`install.sh` has to run under **bash 3.2** — that is `/bin/bash` on macOS, so it is what the `curl | bash` one-liner executes there. Never open a here-doc inside a `$(...)` or `<(...)`: 3.2 rescans the substitution's raw text at expansion time and an apostrophe in a comment silently breaks the whole thing. `bash -n` does not catch it. `tests/test_install_sh.py` guards the shape statically and `tests/install-dep-read.sh` runs the dependency-read block for real (under `/bin/bash` in the macOS CI job).
+`install.sh` has to run under **bash 3.2** — that is `/bin/bash` on macOS, so it is what the Filament app's one-liner (curl piped into bash) executes there. Never open a here-doc inside a `$(...)` or `<(...)`: 3.2 rescans the substitution's raw text at expansion time and an apostrophe in a comment silently breaks the whole thing. `bash -n` does not catch it. `tests/test_install_sh.py` guards the shape statically and `tests/install-dep-read.sh` runs the dependency-read block for real (under `/bin/bash` in the macOS CI job).
 
-`hermes plugins install` and `hermes plugins update` security-scan the whole cloned tree, `tests/` and docs included, and refuse to install anything they rate `dangerous`. Every version of this plugin has to pass that scan — check it before merging.
+`hermes plugins install` and `hermes plugins update` security-scan the whole cloned tree, `tests/` and docs included. The verdict must be `safe`: a `caution` verdict (any HIGH finding) from a community source such as this repo needs interactive confirmation, so the Hermes portal's install-from-GitHub flow blocks it outright, and `dangerous` (any CRITICAL) cannot be forced at all. MEDIUM and LOW findings are informational and don't affect the verdict. Docs are judged more harshly than code comments: the same download-and-run wording that is MEDIUM in a `.sh` comment is HIGH in a `.md` file, so never write a literal pipe from a downloader into a shell in prose — say "curl piped into bash". `scripts/plugin-scan.py` runs upstream Hermes's own scanner on the tree (the `plugin-scan` CI job does too) — it must say SAFE before merging.
 
 ## The Hermes dependency is implicit — and tests must not need it
 

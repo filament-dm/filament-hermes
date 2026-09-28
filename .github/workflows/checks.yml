@@ -57,3 +57,23 @@ jobs:
 
       - name: Run install.sh's dependency-read block
         run: /bin/bash tests/install-dep-read.sh
+
+  plugin-scan:
+    name: Hermes plugin security scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Scan with upstream Hermes's scanner
+        # Only a `safe` verdict installs unattended: one HIGH finding (a
+        # `caution` verdict) blocks the Hermes portal's install-from-GitHub
+        # flow. Scans against hermes-agent main, so a scanner change upstream
+        # shows up here before it reaches users.
+        run: python3 scripts/plugin-scan.py
