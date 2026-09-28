@@ -86,9 +86,10 @@ def test_explicit_filament_reasoning_choice_survives(config_path):
         f"display:\n  platforms:\n    {PLATFORM_NAME}:\n      show_reasoning: true\n"
     )
     seed_display_defaults()
-    assert _read(config_path)["display"]["platforms"][PLATFORM_NAME][
-        "show_reasoning"
-    ] is True
+    assert (
+        _read(config_path)["display"]["platforms"][PLATFORM_NAME]["show_reasoning"]
+        is True
+    )
 
 
 def test_returns_the_keys_it_wrote(config_path):
