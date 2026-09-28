@@ -22,7 +22,6 @@ import sys
 import time
 from pathlib import Path
 
-import yaml
 from hermes_cli.setup import (
     get_env_value,
     print_header,
@@ -36,6 +35,16 @@ from hermes_cli.setup import (
 )
 
 from .filament_api import FilamentAPI
+
+# PyYAML on the venv-layout Hermes every existing host runs. Hermes on its newer
+# pm-managed layout no longer ships PyYAML and routes all YAML through its own
+# ruamel-backed hermes_yaml, which offers the same safe_load/safe_dump. Without
+# this fallback the plugin can't even load there: the package __init__ imports
+# this module.
+try:
+    import yaml
+except ImportError:
+    import hermes_yaml as yaml
 
 # The Firebase project the gateway registers with. It must be the same project
 # the homeserver pushes from, or FCM rejects every token as cross-project and
@@ -193,7 +202,7 @@ def _enable_plugin() -> None:
 
     plugins["enabled"] = migrated
     with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
+        yaml.safe_dump(config, f, default_flow_style=False)
 
     if LEGACY_PLUGIN_ID in enabled:
         print_info(f"Renamed {LEGACY_PLUGIN_ID} to {PLUGIN_ID} in {config_path}")
@@ -241,7 +250,7 @@ def seed_display_defaults() -> None:
     ours.update(missing_ours)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
+        yaml.safe_dump(config, f, default_flow_style=False)
     print_info(f"Set chat display defaults in {config_path}")
 
 

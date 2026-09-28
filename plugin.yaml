@@ -17,6 +17,17 @@ description: >
   agents API. Its Python dependencies ship in the plugin's own vendor/ tree, so
   `hermes plugins install` is the whole installation.
 
+# Keep Hermes's package manager (pm-layout Hermes) out of our dependencies. It
+# otherwise treats a directory plugin's pyproject.toml as a workspace member of
+# Hermes's own environment: it prompts for consent, drops the firebase-messaging
+# fork (it manages no direct-URL requirements), and hatchling-builds this package
+# into every environment generation — and if that build ever fails, it evicts
+# the plugin. We need none of it: vendor/ carries what Hermes core lacks, and the
+# rest (httpx, aiohttp, cryptography, protobuf) is core. Hermes versions without
+# the package manager don't know the key and ignore it (at worst logging an
+# unknown-field warning); it never affects loading.
+python_runtime: external
+
 # Prompted for by `hermes plugins install` and saved to ~/.hermes/.env, which is
 # what lets the install command connect the agent on its own. The plugin's
 # platform stays down until the token is set (check_requirements), so a skipped
