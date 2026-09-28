@@ -278,8 +278,10 @@ def control_body(
 ) -> str:
     """Names the speaker in a control-plane turn's framing.
 
-    Any backchannel sender other than the principal is named by sanitized
-    display name rather than by a bare id.
+    Any control-plane sender other than the principal (currently a guest in
+    the backchannel) is named by sanitized display name rather than by a bare
+    id. The principal is recognized by server-attributed id wherever their
+    message lands.
 
     There is deliberately no data-versus-instruction split here. In the control
     plane the message is the command.

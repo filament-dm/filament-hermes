@@ -8,8 +8,8 @@ Each field has one reader elsewhere in the plugin:
 zone
     The control-plane tools (set_instructions, set_wake_policy,
     set_capabilities, set_feature, set_agent_config, and their getters) refuse
-    unless it is Zone.CONTROL, so a shared-channel participant can never
-    reconfigure the agent.
+    unless it is Zone.CONTROL, so a non-principal shared-channel participant
+    can never reconfigure the agent.
 capabilities
     The pre_tool_call capability gate denies any tool outside the set. This is
     the hard half of the trust boundary that the envelope framing states
@@ -50,10 +50,12 @@ class Zone(str, Enum):
     guards fail closed.
 
     Attributes:
-        CONTROL: The principal's private backchannel, where a message is a
-            command. Required by the control-plane set_* tools.
-        DATA: A shared channel, where an event is a wake-up signal and its
-            content is data rather than instructions.
+        CONTROL: A command from the principal wherever it lands, or any message
+            in the principal's backchannel. Required by the control-plane
+            set_* tools.
+        DATA: An admitted non-principal message outside the backchannel, where
+            the event is a wake-up signal and its content is data rather than
+            instructions.
     """
 
     CONTROL = "control"
@@ -111,10 +113,16 @@ class TurnContext:
 # same Hermes process.
 UNCLAIMED: Final = TurnContext()
 
-# Every control turn uses this value: full capability, no read-cursor
-# authority, and no reply anchor.
+# The backchannel control turn uses this value: full capability, no
+# read-cursor authority, and no reply anchor. Principal control turns outside
+# the backchannel use control_turn() so their room and reply location remain
+# explicit without widening this constant.
 CONTROL: Final = TurnContext(
-    zone=Zone.CONTROL, capabilities=None, cursor_channel=None, reply_anchor=None
+    zone=Zone.CONTROL,
+    capabilities=None,
+    cursor_channel=None,
+    reply_anchor=None,
+    history_key=None,
 )
 
 _current: contextvars.ContextVar[TurnContext] = contextvars.ContextVar(
@@ -151,6 +159,39 @@ def data_turn(
     return TurnContext(
         zone=Zone.DATA,
         capabilities=capabilities,
+        cursor_channel=cursor_channel,
+        reply_anchor=reply_anchor,
+        history_key=history_key,
+    )
+
+
+def control_turn(
+    *,
+    cursor_channel: str | None,
+    reply_anchor: tuple[str, str] | None,
+    history_key: str | None,
+) -> TurnContext:
+    """Build a control-plane context tied to its originating conversation.
+
+    This is for principal messages outside the backchannel. The zone and full
+    capability are fixed here; callers must state the room whose reads may
+    advance, the location an unaddressed reply belongs under, and the
+    conversation whose fetched history was shown.
+
+    Args:
+        cursor_channel: The originating room id whose read cursor this turn may
+            record, or None to record none.
+        reply_anchor: The originating (room_id, event_id) pair to thread an
+            unaddressed reply under, or None to post at the top level.
+        history_key: The originating conversation whose seen-history mark a
+            history read in this turn may advance, or None to advance none.
+
+    Returns:
+        A full-capability TurnContext in Zone.CONTROL.
+    """
+    return TurnContext(
+        zone=Zone.CONTROL,
+        capabilities=None,
         cursor_channel=cursor_channel,
         reply_anchor=reply_anchor,
         history_key=history_key,

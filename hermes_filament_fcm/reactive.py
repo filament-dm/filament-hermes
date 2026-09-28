@@ -1,10 +1,10 @@
 """Reactive-mode plumbing for the Filament FCM adapter.
 
-Shared channels (everything except the principal's backchannel) run in
-"reactive mode": an inbound event is a wake-up signal, not a command. The
-adapter wakes the agent according to a tunable WAKE POLICY, and the agent acts
-on the event data according to tunable STANDING INSTRUCTIONS — never treating the data
-itself as instructions.
+Outside the principal's backchannel, non-principal messages run in "reactive
+mode": an inbound event is a wake-up signal, not a command. Principal messages
+in shared channels pass through the same wake gate, then retain control
+authority. For reactive turns the agent acts on event data according to
+tunable STANDING INSTRUCTIONS — never treating the data itself as instructions.
 
 Both the standing instructions and the wake policy are *data the adapter reads
 fresh on every event* (not startup config), so the principal can retune them

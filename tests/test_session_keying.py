@@ -11,6 +11,9 @@ label — with two invariants pinned here:
 - the flag is read fresh per turn (backchannel toggle → next wake, no
   restart), in both directions.
 
+Principal control turns outside the backchannel use the same originating
+room/thread inputs. Authority changes; conversation identity does not.
+
 Modules are loaded standalone with the gateway stubbed (same pattern as
 ``test_thread_follow_up``).
 """
@@ -366,3 +369,27 @@ def test_thread_turn_does_not_read_the_channel_cursor():
         # A thread turn has seen none of it: cue fires.
         crumb = asyncio.run(a._context_breadcrumb("!room:s", "$t", thread_id="$thread"))
         assert crumb is not None and "recent message(s)" in crumb
+
+
+def test_principal_control_session_scope_uses_originating_room_and_thread():
+    owner = "@owner:s"
+    origin = "!shared:s"
+    backchannel = "!backchannel:s"
+
+    channel_ctx = turn_context.control_turn(
+        cursor_channel=origin,
+        reply_anchor=(origin, "$event"),
+        history_key=reactive.history_key(origin, None, owner, True),
+    )
+    assert reactive.conversation_key(origin, None) == ("channel", origin)
+    assert channel_ctx.history_key == f"channel:{origin}"
+    assert backchannel not in channel_ctx.history_key
+
+    thread_ctx = turn_context.control_turn(
+        cursor_channel=origin,
+        reply_anchor=(origin, "$thread"),
+        history_key=reactive.history_key(origin, "$thread", owner, True),
+    )
+    assert reactive.conversation_key(origin, "$thread") == ("thread", "$thread")
+    assert thread_ctx.history_key == "thread:$thread"
+    assert thread_ctx.reply_anchor[0] == origin

@@ -149,6 +149,7 @@ def _make_adapter(tmp: Path, thread: dict | None):
     a = adapter.FCMFilamentAdapter.__new__(adapter.FCMFilamentAdapter)
     a._server_config = _NoopServerConfig()
     a._user_id = _AGENT
+    a._owner_id = None
     a._cc_room_id = None
     a._wake_policy = reactive.WakePolicyStore(tmp / "wake.json")
     a._feature_flags = reactive.FeatureFlagStore(tmp / "flags.json")
@@ -301,6 +302,99 @@ def test_muted_mention_does_not_record_engagement():
         _run(a, _push(_HUMAN, thread_id=None, is_mention=True, event_id=_ROOT))
         assert woke == []
         assert not a._engaged_threads.is_engaged("!shared", _ROOT)
+
+
+def test_admitted_principal_message_routes_to_control():
+    with tempfile.TemporaryDirectory() as d:
+        a, woke = _make_adapter(Path(d), thread=None)
+        a._owner_id = _HUMAN
+        controlled = []
+
+        async def _record_control(msg):
+            controlled.append(msg)
+
+        a._handle_control_message = _record_control
+        _run(a, _push(_HUMAN, is_mention=True))
+        assert [msg.sender for msg in controlled] == [_HUMAN]
+        assert woke == []
+
+
+def test_nonprincipal_shared_message_remains_reactive():
+    with tempfile.TemporaryDirectory() as d:
+        a, woke = _make_adapter(Path(d), thread=None)
+        a._owner_id = "@owner:filament.example"
+        controlled = []
+
+        async def _record_control(msg):
+            controlled.append(msg)
+
+        a._handle_control_message = _record_control
+        _run(a, _push(_HUMAN, is_mention=True))
+        assert controlled == []
+        assert len(woke) == 1
+
+
+def test_backchannel_guest_still_routes_to_control():
+    with tempfile.TemporaryDirectory() as d:
+        a, woke = _make_adapter(Path(d), thread=None)
+        a._owner_id = "@owner:filament.example"
+        a._is_control_channel = lambda room_id: room_id == "!shared"
+        controlled = []
+
+        async def _record_control(msg):
+            controlled.append(msg)
+
+        a._handle_control_message = _record_control
+        _run(a, _push(_HUMAN))
+        assert [msg.sender for msg in controlled] == [_HUMAN]
+        assert woke == []
+
+
+def test_unknown_owner_uses_room_rule_only():
+    with tempfile.TemporaryDirectory() as d:
+        a, woke = _make_adapter(Path(d), thread=None)
+        controlled = []
+
+        async def _record_control(msg):
+            controlled.append(msg)
+
+        a._handle_control_message = _record_control
+        _run(a, _push(_HUMAN, is_mention=True))
+        assert controlled == []
+        assert len(woke) == 1
+
+
+def test_unmentioned_principal_in_shared_channel_stays_asleep():
+    with tempfile.TemporaryDirectory() as d:
+        a, woke = _make_adapter(Path(d), thread=None)
+        a._owner_id = _HUMAN
+        controlled = []
+
+        async def _record_control(msg):
+            controlled.append(msg)
+
+        a._handle_control_message = _record_control
+        _run(a, _push(_HUMAN, is_mention=False))
+        assert controlled == []
+        assert woke == []
+
+
+def test_principal_dm_routes_to_control_without_shared_wake_gate():
+    with tempfile.TemporaryDirectory() as d:
+        a, woke = _make_adapter(Path(d), thread=None)
+        a._owner_id = _HUMAN
+        controlled = []
+
+        async def _record_control(msg):
+            controlled.append(msg)
+
+        a._handle_control_message = _record_control
+        msg = _push(_HUMAN, is_mention=False)
+        msg.is_direct = True
+        msg.branch_type = "direct_message"
+        _run(a, msg)
+        assert [item.sender for item in controlled] == [_HUMAN]
+        assert woke == []
 
 
 class _CapturingEvent:

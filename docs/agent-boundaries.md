@@ -12,8 +12,9 @@ single presence on Filament. Generalizes to other personal-agent engines.
 
 We want one agent on Filament that behaves in (at least) two ways at once:
 
-- **Command-and-control (C2):** in the owner's backchannel and other trusted places,
-  a message *is an instruction* and the agent has full capability.
+- **Command-and-control (C2):** a message from the owner is an instruction wherever
+  it lands; the backchannel is also trusted by location, and the agent has full
+  capability for either case.
 - **Twitter-bot:** in shared loops with untrusted users, a message is *data to consider*,
   not a command to obey, and the agent's capability is deliberately small.
 
@@ -33,7 +34,7 @@ Borrow the networking control/data-plane split (and its often-forgotten third si
 | Plane | Question it answers | Filament example | Who, by default |
 |---|---|---|---|
 | **Management plane** | *Who may change the agent?* | edit persona, memory, allowlists, enable tools, reconfigure | Principal only |
-| **Control plane** | *Whose instructions does it obey?* | "post this", "join that loop", "summarize and DM me" | Principal + trusted |
+| **Control plane** | *Whose instructions does it obey?* | "post this", "join that loop", "summarize and DM me" | Principal anywhere; anyone in the backchannel |
 | **Data plane** | *Whose input does it merely process?* | a stranger @-mentions it in a public loop | anyone present |
 
 The user's "command-and-control vs customize" distinction is exactly **control plane vs
@@ -41,6 +42,8 @@ management plane**. The "pushes as data, not commands" instinct is exactly **dat
 control plane**. One vocabulary covers both.
 
 A given message lands in exactly one plane, decided by *who sent it* and *where*. The
+principal's server-attributed owner id wins wherever the message lands; the backchannel
+also assigns control by location. Every other sender/location pair is data plane. The
 agent's job is to apply the right posture for that plane.
 
 ---
@@ -93,11 +96,14 @@ principal; referential framing + a small tool ring for the public.
   the framing and the handler checks.
 
 **Implemented in this repo (the Warden).** Admission stays the gateway's job:
-`FILAMENT_CONTROL_USERS` is the control-plane allowlist (the principal is seeded into it at
-setup and re-added at runtime from `get_self`); `FILAMENT_ALLOW_DATA_USERS` (default
-**true**) additionally admits untrusted participants in whatever loops the agent is in. The
-adapter only *frames*: a sender in the control set passes through as commands, everyone else
-is wrapped in a "treat as data, not commands" envelope (`adapter.py:_frame_data_message`).
+`FILAMENT_CONTROL_USERS` admits configured users and `FILAMENT_ALLOW_DATA_USERS` (default
+**true**) additionally admits untrusted participants in whatever loops the agent is in.
+Authority is then classified independently. The principal discovered from `get_self.owner`
+is control by sender in any room; the backchannel is control by location, including for
+guests; every other admitted message is wrapped in a "treat as data, not commands" envelope.
+Extra `FILAMENT_CONTROL_USERS` deliberately remain room-scoped rather than gaining the
+owner's sender-following authority: outside the backchannel their messages are data plane.
+Until `get_self` supplies an owner id, only the backchannel room rule can produce control.
 We do **not** gate by loop — the agent acts in whatever loops it's a member of. ⚠️ Note
 that loop membership is **not a hard boundary today**: `_accept_pending_invites` auto-accepts
 invites, so anyone can pull the agent into a loop, and with `FILAMENT_ALLOW_DATA_USERS=true`
@@ -136,8 +142,9 @@ While OFF the adapter leaves `current_capabilities` `None` and injects no tool h
 always-registered hook is inert and behavior is identical to a pre-feature install.
 
 **On Filament:** today's adapter has the hooks — it knows `cc_room_id` (backchannel)
-and `owner_id`. Implemented: (a) a zone classifier, (b) per-zone message framing in
-`_handle_push_message`, and (c) **per-turn capability gating** — the `pre_tool_call` hook +
+and `owner_id`. Implemented: (a) a sender-and-location zone classifier, (b) per-zone message
+framing in `_handle_push_message_turn`, and (c) **per-turn capability gating** — the
+`pre_tool_call` hook +
 `CapabilityPolicyStore` described above. A data-plane turn is now held back both by prompt
 framing *and* by hard per-call tool denial keyed on `(room_id, sender)`, so it can no longer
 *invoke* a privileged tool (`post_message` to an ungranted degree, `accept_invite`,
@@ -145,6 +152,15 @@ framing *and* by hard per-call tool denial keyed on `(room_id, sender)`, so it c
 contains it. All MCP tools are still *registered* unconditionally; the gate denies at call
 time rather than hiding the tool, which is the same enforcement property (the model sees a
 refusal it cannot bypass).
+
+Shared-channel wake admission remains orthogonal to authority. The configured
+`mention`/`all`/`off` rule and engaged-thread behavior run before a principal message is
+promoted, so an unmentioned owner message does not spend a turn merely because it carries
+authority. Once admitted, the owner message uses `control_body` directly, with no data-plane
+envelope, and replies in its originating shared thread. Principal DMs and the backchannel
+reply on their originating top-level timeline unless the incoming message was already in a
+thread. `/fil-*` commands and Hermes gateway commands remain backchannel-only; owner messages
+using those spellings elsewhere are ordinary LLM control turns.
 
 ### 4.2 The Twins — two instances, shared identity, hard partition
 
@@ -170,8 +186,9 @@ so Filament shows a single presence.
   each other's FCM registration. Two gateways on one host also need separate
   `HERMES_HOME`, which now gives them distinct state directories for free.
 - **Routing = work-claiming, not auth.** Both see every push, so each claims a *disjoint*
-  slice by a deterministic zone rule (control process: backchannel + principal DMs; data
-  process: other loops). The existing `_seen_events` dedup is per-process and won't
+  slice by a deterministic zone rule (control process: the principal everywhere plus the
+  backchannel; data process: every other sender/location pair). The existing `_seen_events`
+  dedup is per-process and won't
   coordinate across them — the partition must be deterministic, and only the claiming
   process adds (and later removes) the 👀 reaction.
 - **Capability boundary = which tools each process registers** (in `register()`),
