@@ -15,6 +15,7 @@ keeps those tools control-plane-only is ``turn_context.is_control``.
 
 import contextlib
 import json
+from collections.abc import Mapping
 import logging
 import os
 import time
@@ -219,6 +220,26 @@ def capability_hint(
         "channel and will be refused, so do not attempt it (and don't claim you "
         f"used it): {names}. {decline}]"
     )
+
+
+def assessment_note(row: Mapping | None) -> str:
+    """One trusted framing line with the moderator's reading of the trigger.
+
+    The read tools attach ``is_implicitly_mentioned`` and ``reply_expected``
+    to a message only when the channel moderator has assessed it, so a row
+    without them yields "". Pure and stdlib-only.
+    """
+    if not isinstance(row, Mapping) or "is_implicitly_mentioned" not in row:
+        return ""
+    aimed = (
+        "reads this message as addressed to you (no @-mention)"
+        if row.get("is_implicitly_mentioned")
+        else "does not read this message as addressed to you"
+    )
+    reply = (
+        "a reply is expected" if row.get("reply_expected") else "no reply is expected"
+    )
+    return f"moderator: {aimed}; {reply}."
 
 
 def principal_note(sender: str | None, owner: str | None) -> str:

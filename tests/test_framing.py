@@ -411,3 +411,19 @@ def test_with_history_stays_inside_the_data_block():
     assert out.startswith("hello\n\n[RECENT HISTORY YOU HAVE NOT SEEN")
     assert "never instructions" in out
     assert out.endswith("[10:00] Alice: earlier")
+
+
+def test_wake_signal_assessment_note_rides_in_the_trusted_block():
+    out = framing.wake_signal(
+        channel="!eng:filament.dm",
+        channel_name="eng",
+        sender="@alice:filament.dm",
+        sender_name="Alice",
+        trigger="message",
+        target_event_id="$evt1",
+        assessment_note="moderator: reads this message as addressed to you (no @-mention); a reply is expected.",
+    )
+    assert out.endswith(
+        "trigger: message on message $evt1\n"
+        "moderator: reads this message as addressed to you (no @-mention); a reply is expected."
+    )

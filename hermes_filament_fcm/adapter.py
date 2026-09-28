@@ -55,6 +55,7 @@ from .observability import (
     new_id,
 )
 from .reactive import (
+    assessment_note,
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
     FEATURE_SHARED_CHANNEL_SESSIONS,
@@ -230,6 +231,22 @@ def _metadata_value(metadata: Any, key: str) -> str | None:
         return None
     value = metadata.get(key)
     return value if isinstance(value, str) and value else None
+
+
+
+def _moderation_grace_seconds() -> float:
+    """Seconds to hold a reactive wake so a moderator's flag can land first.
+
+    Read from FILAMENT_MODERATION_GRACE_S; unset, empty or invalid means no
+    hold, which is the pre-moderation behaviour.
+    """
+    raw = os.getenv("FILAMENT_MODERATION_GRACE_S", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
 
 
 class FCMFilamentAdapter(BasePlatformAdapter):
@@ -1981,8 +1998,33 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             and self._wake_policy.thread_wake(msg.room_id) == "engaged"
             and await self._sender_is_agent(msg) is False
         )
+        # A moderator annotates a message after it lands (a flag that withholds
+        # it, or an assessment of who it addresses), so the push arrives
+        # before either. Holding for the grace period and reading the window
+        # once lets both inform this wake: a withheld trigger is dropped, and
+        # an implicit mention counts as a mention.
+        window: "list[dict] | None" = None
+        trigger_row: "dict | None" = None
+        grace = _moderation_grace_seconds()
+        if grace > 0:
+            await asyncio.sleep(grace)
+            window = await self._read_window(msg.room_id, msg.thread_id)
+            trigger_row = next(
+                (m for m in window or [] if m.get("event_id") == msg.event_id), None
+            )
+        if trigger_row is not None and trigger_row.get("withheld") is True:
+            slog.info(
+                "filament_fcm.turn.skipped",
+                turn_id=turn_id,
+                reason="withheld_by_moderator",
+                event_id=msg.event_id,
+            )
+            return
+        implicitly_mentioned = bool(
+            trigger_row is not None and trigger_row.get("is_implicitly_mentioned")
+        )
         if not self._wake_policy.should_wake_message(
-            msg.room_id, mentioned or thread_follow_up
+            msg.room_id, mentioned or thread_follow_up or implicitly_mentioned
         ):
             logger.info(
                 "filament-fcm: skipping message in %s (wake policy: not woken; "
@@ -2007,7 +2049,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # thread root, or — for a top-level mention — its event id, which IS
         # the thread root once replies thread off it. A follow-up wake
         # re-records to refresh the thread's eviction slot.
-        if mentioned or thread_follow_up:
+        if mentioned or thread_follow_up or implicitly_mentioned:
             self._engaged_threads.record(msg.room_id, msg.thread_id or msg.event_id)
 
         # Where the reply lands is a per-channel wake-policy choice. Default
@@ -2031,9 +2073,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         key = history_key(
             msg.room_id, keying_thread, msg.sender, self._shared_sessions_effective()
         )
-        media_note, (history, cue, newest) = await asyncio.gather(
+        media_note, (history, cue, newest, trigger_row) = await asyncio.gather(
             self._media_note(msg),
-            self._history_for_wake(msg.room_id, msg.event_id, msg.thread_id, key),
+            self._history_for_wake(
+                msg.room_id, msg.event_id, msg.thread_id, key, messages=window
+            ),
         )
         data = framing.append_note(self._strip_mention(msg.body or ""), media_note)
         await self._wake(
@@ -2052,6 +2096,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             raw=msg.raw,
             breadcrumb=cue,
             history=history,
+            assessment_note=assessment_note(trigger_row),
         )
         # Dispatched: whatever the window held is now in front of this
         # conversation, shown or skipped as the agent's own.
@@ -2182,26 +2227,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         return crumb
 
-    async def _history_for_wake(
-        self,
-        channel: str,
-        trigger_event_id: str,
-        thread_id: "str | None",
-        key: str,
-    ) -> "tuple[str | None, str | None, tuple[str, int | None] | None]":
-        """The history this wake's conversation has not been shown yet.
-
-        A wake inside a thread reads the thread (root and replies); a
-        top-level wake reads the channel's recent messages. Everything up to
-        the conversation's seen mark, the agent's own posts and the trigger
-        itself are left out, and what remains is rendered compactly for the
-        event-data block. Returns ``(history, count_cue, newest)``: the cue
-        stands in when rendering fails, ``newest`` is what to mark seen once
-        the turn is dispatched. Best-effort: any failure returns three Nones
-        and the turn proceeds without history.
-        """
+    async def _read_window(
+        self, channel: str, thread_id: "str | None"
+    ) -> "list[dict] | None":
+        """The recent-history window for a wake: the thread when there is one,
+        otherwise the channel's recent messages. None when the read fails."""
         if not self._filament_api:
-            return None, None, None
+            return None
         try:
             if thread_id:
                 parsed = FilamentAPI.parse_tool_result(
@@ -2209,25 +2241,52 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 )
                 root = parsed.get("root") if isinstance(parsed, dict) else None
                 replies = parsed.get("replies") if isinstance(parsed, dict) else None
-                messages = ([root] if isinstance(root, dict) else []) + [
+                return ([root] if isinstance(root, dict) else []) + [
                     r for r in (replies or []) if isinstance(r, dict)
                 ]
-            else:
-                parsed = FilamentAPI.parse_tool_result(
-                    await self._filament_api.call_tool(
-                        "get_recent_messages",
-                        {"channel": channel, "limit": BREADCRUMB_LIMIT},
-                    )
+            parsed = FilamentAPI.parse_tool_result(
+                await self._filament_api.call_tool(
+                    "get_recent_messages",
+                    {"channel": channel, "limit": BREADCRUMB_LIMIT},
                 )
-                messages = (
-                    parsed.get("messages", []) if isinstance(parsed, dict) else []
-                )
-                messages = [m for m in messages if isinstance(m, dict)]
+            )
+            messages = parsed.get("messages", []) if isinstance(parsed, dict) else []
+            return [m for m in messages if isinstance(m, dict)]
         except Exception:  # enrichment only, never fatal to a turn
             logger.warning(
                 "filament-fcm: history read failed for %s", channel, exc_info=True
             )
-            return None, None, None
+            return None
+
+    async def _history_for_wake(
+        self,
+        channel: str,
+        trigger_event_id: str,
+        thread_id: "str | None",
+        key: str,
+        messages: "list[dict] | None" = None,
+    ) -> "tuple[str | None, str | None, tuple[str, int | None] | None, dict | None]":
+        """The history this wake's conversation has not been shown yet.
+
+        A wake inside a thread reads the thread (root and replies); a
+        top-level wake reads the channel's recent messages. Everything up to
+        the conversation's seen mark, the agent's own posts and the trigger
+        itself are left out, and what remains is rendered compactly for the
+        event-data block. Returns ``(history, count_cue, newest, trigger_row)``:
+        the cue stands in when rendering fails, ``newest`` is what to mark
+        seen once the turn is dispatched, and ``trigger_row`` is the trigger's
+        own row as the read tools returned it (None when not in the window).
+        `messages` supplies an already-read window so the wake does not read
+        twice. Best-effort: any failure returns four Nones and the turn
+        proceeds without history.
+        """
+        if messages is None:
+            messages = await self._read_window(channel, thread_id)
+        if messages is None:
+            return None, None, None, None
+        trigger_row = next(
+            (m for m in messages if m.get("event_id") == trigger_event_id), None
+        )
         seen = self._seen_history.get(key)
         unseen, _ = unseen_messages(
             messages, trigger_event_id=trigger_event_id, last_seen_event_id=seen
@@ -2237,7 +2296,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             logger.info(
                 "filament-fcm: history for %s: %d read, nothing new", key, len(messages)
             )
-            return None, None, newest
+            return None, None, newest, trigger_row
         try:
             rendered = timeline.render_recent_messages(
                 {"messages": unseen}, channel=channel
@@ -2250,6 +2309,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     messages, trigger_event_id=trigger_event_id, last_seen_event_id=seen
                 ),
                 newest,
+                trigger_row,
             )
         logger.info(
             "filament-fcm: history for %s: %d unseen of %d read, inlined",
@@ -2257,7 +2317,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             len(unseen),
             len(messages),
         )
-        return rendered, None, newest
+        return rendered, None, newest, trigger_row
 
     async def _sender_is_agent(self, msg: PushMessage) -> bool | None:
         """Whether the message's sender is an agent (bot) — the storm-guard
@@ -2794,6 +2854,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         wake_event_id: str | None = None,
         breadcrumb: str | object | None = _UNSET,
         history: str | None = None,
+        assessment_note: str = "",
     ) -> None:
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + any per-channel guidance + the event data,
@@ -2818,6 +2879,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             trigger=trigger,
             target_event_id=target_event_id,
             sender_note=sender_note,
+            assessment_note=assessment_note,
         )
         # data is None for a reaction wake (no body); a message wake always
         # passes a string (possibly empty). Distinguish on None, not falsiness,

@@ -162,6 +162,7 @@ def wake_signal(
     trigger: str,
     target_event_id: str | None,
     sender_note: str = "",
+    assessment_note: str = "",
 ) -> str:
     """Builds the trusted header of a data-plane turn.
 
@@ -182,6 +183,10 @@ def wake_signal(
             or an empty string. It is decided from server-attributed ids, which
             is why it may ride in the trusted header rather than in the event
             data.
+        assessment_note: The channel moderator's reading of the message from
+            reactive.assessment_note, or an empty string. It comes from the
+            server's read tools, attributed to the moderator account, never
+            from the message itself.
 
     Returns:
         The header block, with no trailing newline.
@@ -194,6 +199,7 @@ def wake_signal(
         + f"trigger: {sanitize_meta(trigger)}"
         + (f" on message {target_event_id}" if target_event_id else "")
         + (f"\n{sender_note}" if sender_note else "")
+        + (f"\n{assessment_note}" if assessment_note else "")
     )
 
 
