@@ -71,9 +71,23 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check out upstream Hermes's scanner
+        # Through the authenticated checkout rather than the script's own
+        # download: raw.githubusercontent.com rate-limits (429) shared runners.
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+          path: .hermes-agent
+          sparse-checkout: |
+            tools/plugin_guard.py
+            tools/plugin_guard_context.py
+            tools/skills_guard.py
+          sparse-checkout-cone-mode: false
+
       - name: Scan with upstream Hermes's scanner
         # Only a `safe` verdict installs unattended: one HIGH finding (a
         # `caution` verdict) blocks the Hermes portal's install-from-GitHub
         # flow. Scans against hermes-agent main, so a scanner change upstream
         # shows up here before it reaches users.
-        run: python3 scripts/plugin-scan.py
+        run: python3 scripts/plugin-scan.py --hermes-dir .hermes-agent
