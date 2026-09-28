@@ -211,15 +211,22 @@ def _enable_plugin() -> None:
 
 
 # Hermes ships CLI-shaped display defaults: a message sent mid-run interrupts
-# the task and posts an "Interrupting current task" ack, and mid-turn assistant
-# text ("I'll check the recent messages first.") is relayed as messages. In a
-# chat room both read as noise, so an install gets quieter values. Only absent
-# keys are written, so an explicit choice survives re-running setup. The
-# interim gate is scoped to our platform; the busy knobs have no per-platform
-# form in Hermes, and the gateway reads them at start.
+# the task and posts an "Interrupting current task" ack, mid-turn assistant
+# text ("I'll check the recent messages first.") is relayed as messages, and
+# where display.show_reasoning is on (Hermes's CLI defaults it on, and some
+# hosted images, e.g. Nous cloud, set it globally) the model's reasoning is
+# prepended to every reply. In a chat room all of it reads as noise, so an
+# install gets quieter values. Only absent keys are written, so an explicit
+# choice survives (including one made with Hermes's /reasoning command, which
+# writes the same per-platform key). The interim and reasoning gates are scoped
+# to our platform, and a per-platform value beats the global one; the busy
+# knobs have no per-platform form in Hermes, and the gateway reads them at start.
 PLATFORM_NAME = "filament-fcm"
 _BUSY_DEFAULTS = {"busy_input_mode": "queue", "busy_ack_enabled": False}
-_PLATFORM_DISPLAY_DEFAULTS = {"interim_assistant_messages": False}
+_PLATFORM_DISPLAY_DEFAULTS = {
+    "interim_assistant_messages": False,
+    "show_reasoning": False,
+}
 
 
 def _subdict(parent: dict, key: str) -> dict:
@@ -229,8 +236,14 @@ def _subdict(parent: dict, key: str) -> dict:
     return child
 
 
-def seed_display_defaults() -> None:
-    """Fill in the chat-friendly display settings config.yaml doesn't set yet."""
+def seed_display_defaults(*, announce: bool = True) -> list[str]:
+    """Fill in the chat-friendly display settings config.yaml doesn't set yet.
+
+    Runs from setup and again when the gateway connects, so an agent installed
+    before a default was added picks it up without re-running setup. Returns the
+    dotted keys written (empty when nothing was missing); ``announce=False``
+    skips the setup-console line for callers that log instead.
+    """
     config_path = _find_hermes_home() / "config.yaml"
     config: dict = {}
     if config_path.exists():
@@ -244,14 +257,18 @@ def seed_display_defaults() -> None:
         k: v for k, v in _PLATFORM_DISPLAY_DEFAULTS.items() if k not in ours
     }
     if not missing and not missing_ours:
-        return
+        return []
 
     display.update(missing)
     ours.update(missing_ours)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w") as f:
         yaml.safe_dump(config, f, default_flow_style=False)
-    print_info(f"Set chat display defaults in {config_path}")
+    if announce:
+        print_info(f"Set chat display defaults in {config_path}")
+    return [f"display.{k}" for k in missing] + [
+        f"display.platforms.{PLATFORM_NAME}.{k}" for k in missing_ours
+    ]
 
 
 # JSON-RPC codes from the agents MCP. -32002: token valid but the account

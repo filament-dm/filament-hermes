@@ -66,6 +66,39 @@ def test_missing_config_is_created_with_all_defaults(config_path):
     assert display["busy_input_mode"] == "queue"
     assert display["busy_ack_enabled"] is False
     assert display["platforms"][PLATFORM_NAME]["interim_assistant_messages"] is False
+    assert display["platforms"][PLATFORM_NAME]["show_reasoning"] is False
+
+
+def test_global_show_reasoning_is_overridden_for_filament_only(config_path):
+    # Some hosted images (Nous cloud) turn reasoning on globally. The global
+    # value stays — other platforms keep it — and ours gets a per-platform off,
+    # which Hermes resolves ahead of the global one.
+    config_path.write_text("display:\n  show_reasoning: true\n")
+    seed_display_defaults()
+    display = _read(config_path)["display"]
+    assert display["show_reasoning"] is True
+    assert display["platforms"][PLATFORM_NAME]["show_reasoning"] is False
+
+
+def test_explicit_filament_reasoning_choice_survives(config_path):
+    # Hermes's /reasoning command writes exactly this key.
+    config_path.write_text(
+        f"display:\n  platforms:\n    {PLATFORM_NAME}:\n      show_reasoning: true\n"
+    )
+    seed_display_defaults()
+    assert _read(config_path)["display"]["platforms"][PLATFORM_NAME][
+        "show_reasoning"
+    ] is True
+
+
+def test_returns_the_keys_it_wrote(config_path):
+    ours = f"display.platforms.{PLATFORM_NAME}"
+    config_path.write_text(
+        "display:\n  busy_input_mode: interrupt\n  busy_ack_enabled: false\n"
+        f"  platforms:\n    {PLATFORM_NAME}:\n      interim_assistant_messages: false\n"
+    )
+    assert seed_display_defaults(announce=False) == [f"{ours}.show_reasoning"]
+    assert seed_display_defaults(announce=False) == []
 
 
 def test_other_sections_are_kept(config_path):
