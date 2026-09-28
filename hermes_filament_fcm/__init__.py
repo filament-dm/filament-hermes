@@ -69,6 +69,7 @@ from .setup_cli import (
 from .status import enabled as status_enabled
 from .status import pre_tool_call_hook as status_pre_tool_call
 from .turn_context import Zone
+from .upload_hint import rewrite_tool as _rewrite_upload_hint
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -479,7 +480,13 @@ def register(ctx: Any) -> None:
     # server when possible, with the static manifest as a fallback. Each
     # handler closes over ``api`` — the same instance the adapter will
     # use — so tool calls proxy through the live MCP session.
-    all_tools = _resolve_tools(mcp_url, mcp_token)
+    # The server's attachment hint tells the model to curl
+    # ``$MCP_BASE/mcp/agents/upload`` with ``Bearer $TOKEN`` — placeholders no
+    # Hermes host defines. Rewrite them to this deployment's upload URL and
+    # ``$FILAMENT_MCP_TOKEN`` before the model ever sees them (upload_hint.py).
+    all_tools = [
+        _rewrite_upload_hint(t, mcp_url) for t in _resolve_tools(mcp_url, mcp_token)
+    ]
     # Session-economy hooks for the message-read proxies: the read
     # cursor (always on) and the compact_timeline flag (read fresh per
     # call). Fresh store instances — like every store, state lives in the
