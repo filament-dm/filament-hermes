@@ -18,6 +18,7 @@ Startup is staged:
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import re
@@ -96,6 +97,7 @@ from .self_update import (
     working_tree_is_clean,
 )
 from .server_config import ServerConfigSync
+from .setup_cli import seed_display_defaults
 from .status import TurnScope, is_nonconversational_notice
 from .status import publisher as status_publisher
 from .update_check import UpdateChecker, build_reminder, update_check_disabled
@@ -108,6 +110,29 @@ _SESSION_KEYING_MANAGED_KEY = "_filament_fcm_managed_session_keying"
 
 
 logger = logging.getLogger("gateway.filament_fcm")
+
+
+@functools.cache  # once per gateway process, not per reconnect
+def _seed_display_defaults() -> None:
+    """Apply setup's chat display defaults to an install that predates one.
+
+    Setup seeds them, but `hermes plugins update` doesn't re-run setup, so an
+    agent installed before a default existed (show_reasoning, most recently)
+    would never get it. Absent keys only, so an explicit choice is never
+    touched. The gateway re-reads display config each turn, so the reasoning
+    and interim gates take effect on the next reply; the busy knobs at the next
+    restart. Best-effort: a config we can't read or write must not stop the
+    platform from connecting.
+    """
+    try:
+        written = seed_display_defaults(announce=False)
+    except Exception as exc:
+        logger.warning("filament-fcm: could not seed display defaults: %s", exc)
+        return
+    if written:
+        logger.info("filament-fcm: set display defaults %s", ", ".join(written))
+
+
 slog = get_logger()
 
 _DEFAULT_MCP_URL = "https://api.filament.dm/mcp/agents"
@@ -599,6 +624,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 connect_attempt_id=connect_attempt_id,
                 mcp_url=self._filament_api._mcp_url,
             )
+            _seed_display_defaults()
 
             if not await self._initialize_api():
                 if self._reserved:
