@@ -191,7 +191,11 @@ def wake_signal(
     Returns:
         The header block, with no trailing newline.
     """
-    where = "direct message" if is_direct else sanitize_meta(channel_name)
+    where = (
+        "direct message"
+        if is_direct
+        else (sanitize_meta(channel_name) or "unnamed room")
+    )
     return (
         "[WAKE-UP SIGNAL]\n"
         f"channel: {where} ({channel})\n"
