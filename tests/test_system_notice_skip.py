@@ -106,6 +106,9 @@ class _AlwaysWakePolicy:
     """A wake policy that admits every message — so a skipped turn can only be
     the system-notice gate, never the policy."""
 
+    def wake_mode(self, room_id):
+        return "all"
+
     def should_wake_message(self, room_id, is_mention):
         return True
 
@@ -146,6 +149,7 @@ def _make_adapter():
     )
     a._engaged_threads = _NoEngagedThreads()
     a._sender_is_agent_cache = {}
+    a._addressing_holds = {}
     a._filament_api = None
     a._server_config = _NoopServerConfig()
     a._is_new_event = lambda event_id: True

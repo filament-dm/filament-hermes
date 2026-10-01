@@ -19,7 +19,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import ClassVar
 
@@ -219,6 +219,27 @@ def capability_hint(
         "channel and will be refused, so do not attempt it (and don't claim you "
         f"used it): {names}. {decline}]"
     )
+
+
+def assessment_note(row: Mapping | None) -> str:
+    """One trusted framing line with the server's reading of the trigger.
+
+    The read tools attach ``is_implicitly_mentioned`` and ``reply_expected``
+    to a message only when the server has judged it, so a row without them
+    yields "". The row comes from the server's read tools, never from the
+    message itself. Pure and stdlib-only.
+    """
+    if not isinstance(row, Mapping) or "is_implicitly_mentioned" not in row:
+        return ""
+    aimed = (
+        "reads this message as addressed to you (no @-mention)"
+        if row.get("is_implicitly_mentioned")
+        else "does not read this message as addressed to you"
+    )
+    reply = (
+        "a reply is expected" if row.get("reply_expected") else "no reply is expected"
+    )
+    return f"Server: {aimed}; {reply}."
 
 
 def principal_note(sender: str | None, owner: str | None) -> str:
@@ -922,6 +943,12 @@ class WakePolicyStore:
     def _channel(self, policy: dict, room_id: str) -> dict:
         per = policy.get("per_channel") or {}
         return per.get(room_id, {}) if isinstance(per, dict) else {}
+
+    def wake_mode(self, room_id: str) -> str:
+        """The channel's message wake mode: "mention", "all" or "off"."""
+        policy = self.read()
+        ch = self._channel(policy, room_id)
+        return ch.get("reactive_wake", policy.get("reactive_wake", "mention"))
 
     def should_wake_message(self, room_id: str, is_mention: bool) -> bool:
         policy = self.read()

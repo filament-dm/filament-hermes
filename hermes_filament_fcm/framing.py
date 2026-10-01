@@ -163,6 +163,7 @@ def wake_signal(
     target_event_id: str | None,
     sender_note: str = "",
     is_direct: bool = False,
+    assessment_note: str = "",
 ) -> str:
     """Builds the trusted header of a data-plane turn.
 
@@ -187,6 +188,10 @@ def wake_signal(
             no name of its own: the push names it after the other party, so
             channel_name is that party's display name and is left out, or the
             sender's name would appear twice.
+        assessment_note: The server's reading of the message from
+            reactive.assessment_note, or an empty string. It comes from the
+            server's read tools, never from the message, so it rides in the
+            trusted header too.
 
     Returns:
         The header block, with no trailing newline.
@@ -204,6 +209,7 @@ def wake_signal(
         + f"trigger: {sanitize_meta(trigger)}"
         + (f" on message {target_event_id}" if target_event_id else "")
         + (f"\n{sender_note}" if sender_note else "")
+        + (f"\n{assessment_note}" if assessment_note else "")
     )
 
 
