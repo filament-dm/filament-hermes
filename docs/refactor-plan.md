@@ -112,10 +112,10 @@ The split is whether configuration has a say:
 -   **Phase 3, `wake_policy`.** The principal's own per-channel choice,
     retuned conversationally from the backchannel with no restart.
 
-Order matters, not just grouping. A principal may configure 👀 as a wake
-trigger, and the adapter adds 👀 to every message it handles, so if that guard
-sat in phase 3 the policy would admit it and the agent would answer its own
-marker in a loop.
+Order matters, not just grouping. A principal may configure any emoji as a
+wake trigger, including one the agent itself reacts with, so if the own-sender
+guard sat in phase 3 the policy would admit the agent's own reaction and it
+would answer itself in a loop.
 
 The config sync between the two phases is what forces them apart. Merging them
 would mean either syncing on every duplicate push, or reading policy the sync
@@ -126,7 +126,7 @@ the two call sites read the same way despite the names reading differently.
 
 ## Drop reasons
 
-Drops become a closed set rather than nine string literals spread across two
+Drops become a closed set rather than six string literals spread across two
 methods.
 The enum value is the string written to the structured log, and the existing
 values are kept verbatim so log queries keep working.
@@ -137,7 +137,6 @@ class DropReason(StrEnum):
     DUPLICATE = "event_id_seen"
     OWN_MESSAGE = "own_message"
     OWN_REACTION = "own_reaction"
-    PROCESSING_MARKER = "processing_reaction"
     SYSTEM_NOTICE = "system_notice"
 
     # Phase 2, routing: the event has no turn to spend in its plane.
@@ -201,20 +200,17 @@ Phase | Decision
 The cost is the config sync and the channel's wake policy. No attachment
 lookup, no history read, no standing instructions read, and no turn.
 
-### Trace C: the agent's own processing marker, dropped at phase 1
+### Trace C: the agent's own reaction, dropped at phase 1
 
-The adapter adds a 👀 reaction to `$evt1` while handling trace A, and that
-reaction arrives back as a push.
+The agent reacts to `$evt1` during trace A, and that reaction arrives back as
+a push.
 
 Phase | Decision
 --- | ---
 1 filter | The reaction is a new event, so deduplication passes, but the sender is the agent itself. Drops with `OWN_REACTION`.
 
-Two independent guards catch this case, and both are in phase 1: the
-own-sender check, and the list of reactions the adapter itself adds.
-The second guard covers a different user adding 👀 to a channel where the
-principal configured 👀 as a wake trigger.
-If either guard were missing, the agent would wake itself in a loop.
+The own-sender check is in phase 1 because no policy may override it.
+If it were missing, the agent would wake itself in a loop.
 
 This trace also shows the drift described above.
 The reaction path has its own copy of the deduplication and own-sender checks
