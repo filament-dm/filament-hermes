@@ -428,7 +428,7 @@ class StatusPublisher:
             self._prune()
             entry = _Pending(scope=scope, created=time.monotonic(), api=self._api)
             self._pending[trigger_event_id] = entry
-        self._publish(entry, "reading a new message")
+        self._publish(entry, "processing")
         # Exempt the first real phrase from the floor, or a single-tool
         # turn's only phrase would be suppressed.
         entry.last_ts = time.monotonic() - MIN_INTERVAL_SECONDS

@@ -313,7 +313,7 @@ class TestPublishLifecycle:
             await pub.end_turn("$m")
             texted = [c for c in api.calls if c.get("status_text")]
             assert len(texted) >= 2
-            assert all(c["status_text"] == "reading a new message" for c in texted)
+            assert all(c["status_text"] == "processing" for c in texted)
             assert entry.ended and entry.refresh_task.cancelled
 
         asyncio.run(go())
@@ -566,7 +566,7 @@ class TestEnsureTurn:
             await asyncio.sleep(0.01)
             texted = [c for c in api.calls if c.get("status_text")]
             assert len(texted) == 1
-            assert texted[0]["status_text"] == "reading a new message"
+            assert texted[0]["status_text"] == "processing"
             await pub.end_turn("$m")
 
         asyncio.run(go())
