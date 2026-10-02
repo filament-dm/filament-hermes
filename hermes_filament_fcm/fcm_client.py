@@ -332,7 +332,11 @@ def _build_push_message(env: Envelope) -> PushMessage | None:
     return PushMessage(
         event_id=env.payload.get("event_id", ""),
         room_id=env.payload.get("room_id", ""),
-        room_name=branch.get("channel", branch.get("sender", "")),
+        # A channel branch names the room in ``channel``; a direct-message
+        # branch (DMs and group chats alike) names it in ``room_name``. Never
+        # fall back to the sender's display name: that is the sender's own
+        # text, and it already reaches the model on the sender line.
+        room_name=branch.get("channel") or branch.get("room_name") or "",
         sender=branch.get("sender_id", branch.get("sender", "")),
         sender_display_name=branch.get("sender", ""),
         body=body,

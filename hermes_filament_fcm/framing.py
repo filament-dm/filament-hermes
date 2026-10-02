@@ -162,6 +162,7 @@ def wake_signal(
     trigger: str,
     target_event_id: str | None,
     sender_note: str = "",
+    is_direct: bool = False,
 ) -> str:
     """Builds the trusted header of a data-plane turn.
 
@@ -182,13 +183,22 @@ def wake_signal(
             or an empty string. It is decided from server-attributed ids, which
             is why it may ride in the trusted header rather than in the event
             data.
+        is_direct: Whether the room is a direct message. A direct message has
+            no name of its own: the push names it after the other party, so
+            channel_name is that party's display name and is left out, or the
+            sender's name would appear twice.
 
     Returns:
         The header block, with no trailing newline.
     """
+    where = (
+        "direct message"
+        if is_direct
+        else (sanitize_meta(channel_name) or "unnamed room")
+    )
     return (
         "[WAKE-UP SIGNAL]\n"
-        f"channel: {sanitize_meta(channel_name)} ({channel})\n"
+        f"channel: {where} ({channel})\n"
         + (f"group: {sanitize_meta(group_name)}\n" if group_name else "")
         + f"sender: {sanitize_meta(sender_name)} ({sender})  tier: data\n"
         + f"trigger: {sanitize_meta(trigger)}"

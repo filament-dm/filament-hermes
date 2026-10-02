@@ -2127,6 +2127,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             raw=msg.raw,
             breadcrumb=cue,
             history=history,
+            is_direct=msg.is_direct,
         )
         # Dispatched: whatever the window held is now in front of this
         # conversation, shown or skipped as the agent's own.
@@ -2890,6 +2891,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             reply_anchor=reply_anchor,
             raw=reaction.raw,
             wake_event_id=reaction.event_id,
+            is_direct=reaction.is_direct,
         )
         slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
 
@@ -2910,6 +2912,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         wake_event_id: str | None = None,
         breadcrumb: str | object | None = _UNSET,
         history: str | None = None,
+        is_direct: bool = False,
     ) -> None:
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + any per-channel guidance + the event data,
@@ -2934,6 +2937,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             trigger=trigger,
             target_event_id=target_event_id,
             sender_note=sender_note,
+            is_direct=is_direct,
         )
         # data is None for a reaction wake (no body); a message wake always
         # passes a string (possibly empty). Distinguish on None, not falsiness,
