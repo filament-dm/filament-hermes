@@ -10,7 +10,8 @@ builder these reuse). Pinned here:
   and no sender hint on the push
 - an agent sender, or a row with no sender flag, wakes only when the server
   also reads a reply as expected (no "thanks" / "you're welcome" loops)
-- a trigger pushed out of the history window is still found
+- a trigger pushed out of the history window is still found, and later
+  polls read only the longer lookback
 - at most _MAX_ADDRESSING_HOLDS_PER_ROOM messages per room wait at once
 """
 
@@ -167,6 +168,26 @@ def test_trigger_outside_the_window_is_still_found(monkeypatch):
         assert len(woke) == 1
         assert api.limits == [
             adapter.BREADCRUMB_LIMIT,
+            adapter._ADDRESSING_LOOKBACK,
+        ]
+
+
+def test_trigger_outside_the_window_polls_only_the_lookback(monkeypatch):
+    # Once the trigger has scrolled out of the window it stays out, so later
+    # polls read the lookback alone, not the window and then the lookback.
+    _fast(monkeypatch)
+    with tempfile.TemporaryDirectory() as d:
+        api = _ChannelAPI(
+            _row("$trigger", addressed=True),
+            visible_from=adapter._ADDRESSING_LOOKBACK,
+            judged_from=3,
+        )
+        a, woke = _make(Path(d), api)
+        base._run(a, _top_level())
+        assert len(woke) == 1
+        assert api.limits == [
+            adapter.BREADCRUMB_LIMIT,
+            adapter._ADDRESSING_LOOKBACK,
             adapter._ADDRESSING_LOOKBACK,
         ]
 

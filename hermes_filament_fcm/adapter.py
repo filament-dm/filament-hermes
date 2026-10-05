@@ -2336,34 +2336,37 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         Returns the last window read and the trigger's row (judged or not,
         None when the trigger could not be found).
+
+        A busy channel can push a top-level trigger out of the history window,
+        and once out it never comes back, so from then on each poll reads only
+        the longer lookback.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _ADDRESSING_WAIT_S
         window: list[dict] | None = None
         row: dict | None = None
+        past_window = False
         while True:
             await asyncio.sleep(
                 min(_ADDRESSING_POLL_S, max(0.0, deadline - loop.time()))
             )
-            window = await self._read_window(msg.room_id, msg.thread_id)
-            row = await self._addressing_row(msg, window)
+            if not past_window:
+                window = await self._read_window(msg.room_id, msg.thread_id)
+                row = _trigger_row(window, msg.event_id)
+                # A failed read tries the window again on the next poll.
+                past_window = window is not None and row is None and not msg.thread_id
+            if past_window or (row is None and not msg.thread_id):
+                row = await self._lookback_row(msg)
             if row is not None and "is_implicitly_mentioned" in row:
                 return window, row
             if loop.time() >= deadline:
                 return window, row
 
-    async def _addressing_row(
-        self, msg: PushMessage, window: "list[dict] | None"
-    ) -> "dict | None":
-        """The trigger's row from an addressing read, or None.
-
-        A busy channel can push the trigger out of the history window during
-        the wait, so a top-level trigger missing from it is looked up in a
-        longer read of the channel.
-        """
-        row = _trigger_row(window, msg.event_id)
-        if row is not None or msg.thread_id or not self._filament_api:
-            return row
+    async def _lookback_row(self, msg: PushMessage) -> "dict | None":
+        """The top-level trigger's row from a read _ADDRESSING_LOOKBACK
+        messages deep, or None."""
+        if not self._filament_api:
+            return None
         try:
             parsed = FilamentAPI.parse_tool_result(
                 await self._filament_api.call_tool(
