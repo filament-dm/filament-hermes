@@ -190,7 +190,7 @@ so Filament shows a single presence.
   backchannel; data process: every other sender/location pair). The existing `_seen_events`
   dedup is per-process and won't
   coordinate across them — the partition must be deterministic, and only the claiming
-  process adds (and later removes) the 👀 reaction.
+  process publishes the turn's status line.
 - **Capability boundary = which tools each process registers** (in `register()`),
   independent of token scope. Ideally also mint a reduced-scope token for the data process
   if the agents-api supports it (defense in depth).
