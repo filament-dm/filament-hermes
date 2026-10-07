@@ -49,8 +49,8 @@ def build_reminder(latest: str, current: str) -> str:
     """The small backchannel note shown to the principal."""
     return (
         f"📦 Filament↔Hermes plugin v{latest} is available (this agent runs "
-        f"v{current}). Reply `/fil-upgrade` and I'll pull it, restart, and "
-        f"tell you when I'm back.\n\n"
+        f"v{current}). Tap [/fil-upgrade](filament:message-send) and I'll "
+        f"pull it, restart, and tell you when I'm back.\n\n"
         f"If that reports a problem, re-run the connect command from the "
         f"Filament app instead — it replaces the plugin outright rather than "
         f"updating it in place, so it recovers from any state."
