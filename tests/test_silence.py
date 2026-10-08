@@ -270,3 +270,67 @@ def test_older_hermes_without_the_field_still_dispatches(tmp_path, monkeypatch):
     a, _, dispatched = _make_adapter(tmp_path, monkeypatch)
     _wake(a)
     assert isinstance(dispatched[0], _OldMessageEvent)
+
+
+_NOTICE = (
+    "⚠️ The model returned only a silence marker for a message that needed a reply."
+)
+
+
+def _send_in_turn(a, content, reply_expected):
+    async def main():
+        if reply_expected is not None:
+            adapter.turn_context.activate(
+                adapter.turn_context.data_turn(
+                    capabilities=None,
+                    cursor_channel=None,
+                    reply_anchor=None,
+                    history_key=None,
+                    reply_expected=reply_expected,
+                )
+            )
+        return await a.send(_SHARED, content)
+
+    return asyncio.run(main())
+
+
+def test_older_hermes_notice_is_dropped_on_an_unaddressed_turn(tmp_path, monkeypatch):
+    # Hermes 0.21 has no reply_expected: it swaps [SILENT] for this notice.
+    monkeypatch.setattr(adapter, "_hermes_text", lambda key: _NOTICE)
+    a, api, _ = _make_adapter(tmp_path, monkeypatch)
+    assert _send_in_turn(a, _NOTICE, reply_expected=False).success
+    assert api.posted == []
+
+
+@pytest.mark.parametrize("reply_expected", [True, None])
+def test_notice_still_posts_when_a_reply_was_expected(
+    tmp_path, monkeypatch, reply_expected
+):
+    monkeypatch.setattr(adapter, "_hermes_text", lambda key: _NOTICE)
+    a, api, _ = _make_adapter(tmp_path, monkeypatch)
+    _send_in_turn(a, _NOTICE, reply_expected=reply_expected)
+    assert api.posted == [(_SHARED, _NOTICE)]
+
+
+def test_wake_pins_reply_expected_on_the_turn_context(tmp_path, monkeypatch):
+    a, _, _ = _make_adapter(tmp_path, monkeypatch)
+    seen = []
+
+    async def _record(event):
+        seen.append(adapter.turn_context.current().reply_expected)
+
+    a.handle_message = _record
+    _wake(a)
+    _wake(a, addressed=True)
+    assert seen == [False, True]
+
+
+def test_hermes_021_constant_notice_is_dropped_too(tmp_path, monkeypatch):
+    # 0.21 keeps the notice as a run_turn constant, not a catalog entry.
+    run_turn = types.ModuleType("gateway.run_turn")
+    run_turn._UNEXPECTED_SILENCE_REPLY = _NOTICE
+    monkeypatch.setitem(sys.modules, "gateway.run_turn", run_turn)
+    monkeypatch.setattr(adapter, "_hermes_text", lambda key: key)
+    a, api, _ = _make_adapter(tmp_path, monkeypatch)
+    assert _send_in_turn(a, _NOTICE, reply_expected=False).success
+    assert api.posted == []

@@ -23,6 +23,7 @@ import functools
 import logging
 import os
 import re
+import sys
 import time
 from collections import deque
 from typing import Any
@@ -103,6 +104,13 @@ from .status import TurnScope, is_nonconversational_notice
 from .status import publisher as status_publisher
 from .update_check import UpdateChecker, build_reminder, update_check_disabled
 
+try:  # Hermes's message catalog; absent from older releases
+    from agent.i18n import t as _hermes_text
+except ImportError:
+    _hermes_text = None
+
+_UNEXPECTED_SILENCE_KEY = "gateway.errors.unexpected_silence"
+
 # Use the gateway logger hierarchy so messages appear in gateway.log.
 # Marker written into config.extra alongside the plugin-managed session
 # keying knob, so a later adapter construction can tell the flag's own
@@ -124,6 +132,33 @@ def _reply_expected_kwargs(reply_expected: bool) -> dict:
     except TypeError:
         return {}
     return {"reply_expected": reply_expected} if "reply_expected" in names else {}
+
+
+def _unexpected_silence_notices() -> set[str]:
+    """Every form of Hermes's "model returned only a silence marker" reply.
+
+    Hermes 0.21 keeps it as a gateway.run_turn constant; later releases move it
+    to the message catalog. The gateway has run_turn loaded by send time.
+    """
+    notices = set()
+    run_turn = sys.modules.get("gateway.run_turn")
+    legacy = getattr(run_turn, "_UNEXPECTED_SILENCE_REPLY", None)
+    if isinstance(legacy, str):
+        notices.add(legacy.strip())
+    if _hermes_text is not None:
+        try:
+            text = _hermes_text(_UNEXPECTED_SILENCE_KEY)
+        except Exception:
+            text = None
+        # An unknown key comes back as the key itself.
+        if isinstance(text, str) and text != _UNEXPECTED_SILENCE_KEY:
+            notices.add(text.strip())
+    return notices
+
+
+def _is_unexpected_silence_notice(content: str | None) -> bool:
+    """Whether content is Hermes's "model returned only a silence marker" reply."""
+    return bool(content) and content.strip() in _unexpected_silence_notices()
 
 
 @functools.cache  # once per gateway process, not per reconnect
@@ -1626,7 +1661,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # The model's "I chose not to reply" token is never a message. Hermes
         # normally drops it before send; this covers a gateway that doesn't.
-        if framing.is_silence_marker(content):
+        # A Hermes without MessageEvent.reply_expected swaps the marker for a
+        # warning instead; on an unaddressed turn that warning is dropped too.
+        if framing.is_silence_marker(content) or (
+            turn_context.current().reply_expected is False
+            and _is_unexpected_silence_notice(content)
+        ):
             slog.info(
                 "filament_fcm.send.silenced",
                 installation_id=self._installation_id,
@@ -2993,6 +3033,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             tool_hint=tool_hint,
         )
         message_id = target_event_id or f"wake:{channel}"
+        # Only an @-mention or a DM expects an answer. A thread follow-up, a
+        # wake-on-every-message channel, or a reaction may go [SILENT].
+        reply_expected = addressed or is_direct
         source = self.build_source(
             chat_id=channel,
             chat_name=channel_name,
@@ -3028,9 +3071,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             raw_message=raw,
             channel_context=breadcrumb if isinstance(breadcrumb, str) else None,
             channel_prompt=framing.TOOL_MAP_PROMPT,
-            # Only an @-mention or a DM expects an answer. A thread follow-up,
-            # a wake-on-every-message channel, or a reaction may go [SILENT].
-            **_reply_expected_kwargs(addressed or is_direct),
+            **_reply_expected_kwargs(reply_expected),
         )
         logger.info(
             "filament-fcm: WAKE → reactive turn: trigger=%s channel=%s sender=%s "
@@ -3091,6 +3132,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 reply_anchor=(channel, reply_anchor)
                 if reply_anchor and reply_anchor != thread_id
                 else None,
+                reply_expected=reply_expected,
             )
         )
         # Same last-moment keying application as the control path.
