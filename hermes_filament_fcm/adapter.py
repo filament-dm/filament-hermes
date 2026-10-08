@@ -18,6 +18,7 @@ Startup is staged:
 
 import asyncio
 import contextlib
+import dataclasses
 import functools
 import logging
 import os
@@ -110,6 +111,19 @@ _SESSION_KEYING_MANAGED_KEY = "_filament_fcm_managed_session_keying"
 
 
 logger = logging.getLogger("gateway.filament_fcm")
+
+
+def _reply_expected_kwargs(reply_expected: bool) -> dict:
+    """MessageEvent's reply_expected keyword, when this Hermes has the field.
+
+    False lets a bare [SILENT] reply stay silent instead of Hermes posting its
+    "unexpected silence" fallback. An older MessageEvent rejects the keyword.
+    """
+    try:
+        names = {f.name for f in dataclasses.fields(MessageEvent)}
+    except TypeError:
+        return {}
+    return {"reply_expected": reply_expected} if "reply_expected" in names else {}
 
 
 @functools.cache  # once per gateway process, not per reconnect
@@ -1610,6 +1624,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         content_hash = fingerprint(content or "")
         metadata_keys = _metadata_keys(metadata)
 
+        # The model's "I chose not to reply" token is never a message. Hermes
+        # normally drops it before send; this covers a gateway that doesn't.
+        if framing.is_silence_marker(content):
+            slog.info(
+                "filament_fcm.send.silenced",
+                installation_id=self._installation_id,
+                send_id=send_id,
+                send_kind=send_kind,
+                chat_id=chat_id,
+                content_fingerprint=content_hash,
+            )
+            return SendResult(success=True)
+
         with bound_context(
             installation_id=self._installation_id,
             call_origin="adapter_send",
@@ -2122,6 +2149,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             breadcrumb=cue,
             history=history,
             is_direct=msg.is_direct,
+            addressed=mentioned,
         )
         # Dispatched: whatever the window held is now in front of this
         # conversation, shown or skipped as the agent's own.
@@ -2898,6 +2926,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         breadcrumb: str | object | None = _UNSET,
         history: str | None = None,
         is_direct: bool = False,
+        addressed: bool = False,
     ) -> None:
         """Dispatch a reactive turn: wrap the wake-up signal + the (fresh-read)
         standing instructions + any per-channel guidance + the event data,
@@ -2999,6 +3028,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             raw_message=raw,
             channel_context=breadcrumb if isinstance(breadcrumb, str) else None,
             channel_prompt=framing.TOOL_MAP_PROMPT,
+            # Only an @-mention or a DM expects an answer. A thread follow-up,
+            # a wake-on-every-message channel, or a reaction may go [SILENT].
+            **_reply_expected_kwargs(addressed or is_direct),
         )
         logger.info(
             "filament-fcm: WAKE → reactive turn: trigger=%s channel=%s sender=%s "
