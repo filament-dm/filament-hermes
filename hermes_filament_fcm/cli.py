@@ -2,6 +2,7 @@
 
 hermes plugins install filament-dm/filament-hermes --enable --force
 hermes filament connect fmcp_YOURTOKEN
+hermes filament login
 """
 
 from __future__ import annotations
@@ -45,11 +46,61 @@ def _setup(parser: Any) -> None:
         help="save the configuration but leave the gateway alone",
     )
 
+    login = sub.add_parser(
+        "login",
+        help="Connect this agent to Filament by signing in, with no token",
+        description=(
+            "Sign in to Filament in a browser. The agent you pressed Connect on "
+            "in the app is connected; there is nothing to copy or pick. Then "
+            "save the configuration and restart the gateway, as connect does."
+        ),
+    )
+    login.add_argument(
+        "--url",
+        default=None,
+        help="MCP endpoint (default: the saved value, else production)",
+    )
+    login.add_argument(
+        "--device",
+        action="store_const",
+        const="device",
+        dest="flow",
+        default="auto",
+        help="sign in from another device with a short link",
+    )
+    login.add_argument(
+        "--browser",
+        action="store_const",
+        const="browser",
+        dest="flow",
+        help="sign in with a browser and a local callback",
+    )
+    login.add_argument(
+        "--no-open",
+        action="store_true",
+        help="print the sign-in link rather than opening a browser",
+    )
+    login.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="save the configuration but leave the gateway alone",
+    )
+
 
 def _handler(args: Any) -> int:
     """Dispatch target Hermes calls as ``args.func(args)``."""
-    if getattr(args, "filament_command", None) != "connect":
-        print("usage: hermes filament connect <token>")
+    command = getattr(args, "filament_command", None)
+    if command == "login":
+        from .setup_cli import login  # noqa: PLC0415 — keep CLI import off the load path
+
+        return login(
+            url=args.url,
+            flow=args.flow,
+            open_browser=not args.no_open,
+            restart=not args.no_restart,
+        )
+    if command != "connect":
+        print("usage: hermes filament connect <token> | hermes filament login")
         return 2
 
     from .setup_cli import connect  # noqa: PLC0415 — keep CLI import off the load path
