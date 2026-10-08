@@ -91,7 +91,7 @@ def _handler(args: Any) -> int:
     """Dispatch target Hermes calls as ``args.func(args)``."""
     command = getattr(args, "filament_command", None)
     if command == "login":
-        from .setup_cli import login  # noqa: PLC0415 — keep CLI import off the load path
+        from .setup_cli import login  # noqa: PLC0415
 
         return login(
             url=args.url,
