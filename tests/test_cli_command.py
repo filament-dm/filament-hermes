@@ -19,18 +19,16 @@ from pathlib import Path
 
 import pytest
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _load_cli():
-    pkg = types.ModuleType("hermes_filament_fcm")
+    pkg = types.ModuleType("filament")
     pkg.__path__ = [str(_PKG_DIR)]
-    sys.modules["hermes_filament_fcm"] = pkg
-    spec = importlib.util.spec_from_file_location(
-        "hermes_filament_fcm.cli", _PKG_DIR / "cli.py"
-    )
+    sys.modules["filament"] = pkg
+    spec = importlib.util.spec_from_file_location("filament.cli", _PKG_DIR / "cli.py")
     module = importlib.util.module_from_spec(spec)
-    sys.modules["hermes_filament_fcm.cli"] = module
+    sys.modules["filament.cli"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -151,9 +149,9 @@ def test_handler_calls_connect_and_returns_its_code(monkeypatch):
         calls.update(token=token, url=url, restart=restart, from_stdin=from_stdin)
         return 0
 
-    stub = types.ModuleType("hermes_filament_fcm.setup_cli")
+    stub = types.ModuleType("filament.setup_cli")
     stub.connect = fake_connect
-    monkeypatch.setitem(sys.modules, "hermes_filament_fcm.setup_cli", stub)
+    monkeypatch.setitem(sys.modules, "filament.setup_cli", stub)
 
     rc = cli._handler(_parse(["connect", "fmcp_abc", "--no-restart"]))
     assert rc == 0
@@ -168,11 +166,11 @@ def test_handler_calls_connect_and_returns_its_code(monkeypatch):
 def test_handler_passes_the_stdin_flag_through(monkeypatch):
     seen = {}
 
-    stub = types.ModuleType("hermes_filament_fcm.setup_cli")
+    stub = types.ModuleType("filament.setup_cli")
     stub.connect = lambda token, url=None, restart=True, from_stdin=False: (
         seen.update(from_stdin=from_stdin) or 0
     )
-    monkeypatch.setitem(sys.modules, "hermes_filament_fcm.setup_cli", stub)
+    monkeypatch.setitem(sys.modules, "filament.setup_cli", stub)
 
     cli._handler(_parse(["connect", "-p"]))
     assert seen == {"from_stdin": True}
@@ -180,7 +178,7 @@ def test_handler_passes_the_stdin_flag_through(monkeypatch):
 
 @pytest.mark.parametrize("code", [0, 1, 2])
 def test_handler_propagates_failure_codes(monkeypatch, code):
-    stub = types.ModuleType("hermes_filament_fcm.setup_cli")
+    stub = types.ModuleType("filament.setup_cli")
     stub.connect = lambda token, url=None, restart=True, from_stdin=False: code
-    monkeypatch.setitem(sys.modules, "hermes_filament_fcm.setup_cli", stub)
+    monkeypatch.setitem(sys.modules, "filament.setup_cli", stub)
     assert cli._handler(_parse(["connect", "fmcp_abc"])) == code

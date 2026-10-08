@@ -16,7 +16,7 @@ def _load_filament_api():
         stub = types.ModuleType("httpx")
         stub.AsyncClient = type("AsyncClient", (), {})  # annotation-only use
         sys.modules["httpx"] = stub
-    base = Path(__file__).parent.parent / "hermes_filament_fcm"
+    base = Path(__file__).parent.parent / "filament"
     pkg_name = "hfcm_standalone"
     if pkg_name not in sys.modules:
         pkg = types.ModuleType(pkg_name)
@@ -50,9 +50,7 @@ def test_success_and_junk_are_none():
     assert api.result_error({"error": ""}) is None
 
 
-_INIT_SRC = (
-    Path(__file__).parent.parent / "hermes_filament_fcm" / "__init__.py"
-).read_text()
+_INIT_SRC = (Path(__file__).parent.parent / "filament" / "__init__.py").read_text()
 
 
 def _tool_handler_src() -> str:

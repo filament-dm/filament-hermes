@@ -56,7 +56,7 @@ from .reactive import (
     WakePolicyStore,
 )
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
 SECTION_CAPABILITY_POLICY = "capability_policy"
 SECTION_WAKE_POLICY = "wake_policy"
@@ -184,7 +184,7 @@ def _read_json_file(path: Path) -> Any:
         return None
     except Exception:
         logger.warning(
-            "filament-fcm: unreadable %s — omitting from server-config document",
+            "filament: unreadable %s — omitting from server-config document",
             path,
             exc_info=True,
         )
@@ -199,7 +199,7 @@ def _read_text_file(path: Path) -> str | None:
         return None
     except Exception:
         logger.warning(
-            "filament-fcm: unreadable %s — omitting from server-config document",
+            "filament: unreadable %s — omitting from server-config document",
             path,
             exc_info=True,
         )
@@ -251,7 +251,7 @@ class ServerConfigSync:
         self._disabled = server_config_disabled()
         if self._disabled:
             logger.info(
-                "filament-fcm: server-config sync disabled (FILAMENT_SERVER_CONFIG)"
+                "filament: server-config sync disabled (FILAMENT_SERVER_CONFIG)"
             )
         # Set when the server answers 404 (endpoint absent — an older server):
         # the sync goes quiet for the rest of the process and the plugin runs
@@ -329,7 +329,7 @@ class ServerConfigSync:
             return
         self._revision = revision
         logger.info(
-            "filament-fcm: applied server config revision %d (sections: %s)",
+            "filament: applied server config revision %d (sections: %s)",
             revision,
             ", ".join(sorted(config)) or "none",
         )
@@ -368,7 +368,7 @@ class ServerConfigSync:
             except Exception:
                 ok = False
                 self._warn_sync_failure(
-                    f"filament-fcm: applying server-config section {section} "
+                    f"filament: applying server-config section {section} "
                     "to its local file failed; continuing on the existing file",
                     exc_info=True,
                 )
@@ -436,20 +436,20 @@ class ServerConfigSync:
             status, body = await self._api.get_config()
         except Exception:
             self._warn_sync_failure(
-                "filament-fcm: server-config fetch failed; continuing on local files",
+                "filament: server-config fetch failed; continuing on local files",
                 exc_info=True,
             )
             return
         if status == 404:
             self._config_unavailable = True
             logger.info(
-                "filament-fcm: server has no /config endpoint — server-config "
+                "filament: server has no /config endpoint — server-config "
                 "sync disabled for this process"
             )
             return
         if status != 200:
             self._warn_sync_failure(
-                f"filament-fcm: server-config fetch returned HTTP {status}; "
+                f"filament: server-config fetch returned HTTP {status}; "
                 "continuing on local files"
             )
             return
@@ -466,7 +466,7 @@ class ServerConfigSync:
             return
         if not isinstance(config, dict):
             self._warn_sync_failure(
-                "filament-fcm: server config document is not an object; ignoring"
+                "filament: server config document is not an object; ignoring"
             )
             return
         if self._revision is not None and revision <= self._revision:
@@ -492,7 +492,7 @@ class ServerConfigSync:
             )
         except Exception:
             self._warn_sync_failure(
-                "filament-fcm: server-config seed failed; continuing on local files",
+                "filament: server-config seed failed; continuing on local files",
                 exc_info=True,
             )
             return
@@ -501,7 +501,7 @@ class ServerConfigSync:
             if isinstance(rev, int):
                 self._revision = rev
             logger.info(
-                "filament-fcm: seeded server config from local files "
+                "filament: seeded server config from local files "
                 "(revision %s, sections: %s)",
                 rev,
                 ", ".join(sorted(doc)) or "none",
@@ -513,7 +513,7 @@ class ServerConfigSync:
                 status2, body2 = await self._api.get_config()
             except Exception:
                 self._warn_sync_failure(
-                    "filament-fcm: server-config refetch after seed conflict "
+                    "filament: server-config refetch after seed conflict "
                     "failed; continuing on local files",
                     exc_info=True,
                 )
@@ -529,12 +529,12 @@ class ServerConfigSync:
         if status == 404:
             self._config_unavailable = True
             logger.info(
-                "filament-fcm: server has no /config endpoint — server-config "
+                "filament: server has no /config endpoint — server-config "
                 "sync disabled for this process"
             )
             return
         self._warn_sync_failure(
-            f"filament-fcm: server-config seed returned HTTP {status}; "
+            f"filament: server-config seed returned HTTP {status}; "
             "continuing on local files"
         )
 
@@ -581,7 +581,7 @@ class ServerConfigSync:
                 status, body = await self._api.get_config()
             except Exception:
                 self._warn_sync_failure(
-                    "filament-fcm: server-config write-back fetch failed; "
+                    "filament: server-config write-back fetch failed; "
                     "local change kept, server copy is stale",
                     exc_info=True,
                 )
@@ -589,13 +589,13 @@ class ServerConfigSync:
             if status == 404:
                 self._config_unavailable = True
                 logger.info(
-                    "filament-fcm: server has no /config endpoint — "
+                    "filament: server has no /config endpoint — "
                     "server-config sync disabled for this process"
                 )
                 return True
             if status != 200:
                 self._warn_sync_failure(
-                    f"filament-fcm: server-config write-back fetch returned "
+                    f"filament: server-config write-back fetch returned "
                     f"HTTP {status}; local change kept, server copy is stale"
                 )
                 return False
@@ -619,7 +619,7 @@ class ServerConfigSync:
                 )
             except Exception:
                 self._warn_sync_failure(
-                    "filament-fcm: server-config write-back failed; local "
+                    "filament: server-config write-back failed; local "
                     "change kept, server copy is stale",
                     exc_info=True,
                 )
@@ -636,7 +636,7 @@ class ServerConfigSync:
                 if applied and isinstance(rev, int):
                     self._revision = rev
                 logger.info(
-                    "filament-fcm: server config updated (%s, revision %s)",
+                    "filament: server config updated (%s, revision %s)",
                     ", ".join(sorted(sections)),
                     rev,
                 )
@@ -646,17 +646,17 @@ class ServerConfigSync:
             if status == 404:
                 self._config_unavailable = True
                 logger.info(
-                    "filament-fcm: server has no /config endpoint — "
+                    "filament: server has no /config endpoint — "
                     "server-config sync disabled for this process"
                 )
                 return True
             self._warn_sync_failure(
-                f"filament-fcm: server-config write-back returned HTTP "
+                f"filament: server-config write-back returned HTTP "
                 f"{status}; local change kept, server copy is stale"
             )
             return False
         self._warn_sync_failure(
-            "filament-fcm: server-config write-back kept conflicting; "
+            "filament: server-config write-back kept conflicting; "
             "local change kept, server copy is stale"
         )
         return False
@@ -687,28 +687,28 @@ class ServerConfigSync:
         try:
             tools = self._inventory_provider() or []
         except Exception:
-            logger.debug("filament-fcm: tool inventory unavailable", exc_info=True)
+            logger.debug("filament: tool inventory unavailable", exc_info=True)
             return
         if not tools:
             return
         try:
             status, _ = await self._api.post_tools(tools)
         except Exception:
-            self._warn_tools_failure("filament-fcm: tool-inventory report failed")
+            self._warn_tools_failure("filament: tool-inventory report failed")
             return
         if status == 404:
             self._tools_unavailable = True
             logger.info(
-                "filament-fcm: server has no /tools endpoint — tool-inventory "
+                "filament: server has no /tools endpoint — tool-inventory "
                 "reporting disabled for this process"
             )
         elif status >= 300:
             self._warn_tools_failure(
-                f"filament-fcm: tool-inventory report returned HTTP {status}"
+                f"filament: tool-inventory report returned HTTP {status}"
             )
         else:
             logger.info(
-                "filament-fcm: reported %d registered tool(s) to the server",
+                "filament: reported %d registered tool(s) to the server",
                 len(tools),
             )
 

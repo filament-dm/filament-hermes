@@ -9,7 +9,7 @@ has to be made deliberately.
 import importlib.util
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 _spec = importlib.util.spec_from_file_location("framing", _PKG_DIR / "framing.py")
 framing = importlib.util.module_from_spec(_spec)

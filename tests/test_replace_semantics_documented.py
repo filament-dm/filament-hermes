@@ -15,7 +15,7 @@ bare test env, and only the description strings are under test.
 import ast
 from pathlib import Path
 
-_INIT = Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "__init__.py"
+_INIT = Path(__file__).resolve().parent.parent / "filament" / "__init__.py"
 
 
 def _descriptions() -> dict[str, str]:

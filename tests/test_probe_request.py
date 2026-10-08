@@ -23,7 +23,7 @@ import time
 import types
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _install_stubs() -> None:
@@ -84,17 +84,17 @@ def _install_stubs() -> None:
 
 def _load_adapter():
     _install_stubs()
-    pkg = types.ModuleType("hermes_filament_fcm")
+    pkg = types.ModuleType("filament")
     pkg.__path__ = [str(_PKG_DIR)]
-    sys.modules["hermes_filament_fcm"] = pkg
+    sys.modules["filament"] = pkg
     for name in ("credentials", "fcm_client", "filament_api", "reactive", "adapter"):
         spec = importlib.util.spec_from_file_location(
-            f"hermes_filament_fcm.{name}", _PKG_DIR / f"{name}.py"
+            f"filament.{name}", _PKG_DIR / f"{name}.py"
         )
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"hermes_filament_fcm.{name}"] = module
+        sys.modules[f"filament.{name}"] = module
         spec.loader.exec_module(module)
-    return sys.modules["hermes_filament_fcm.adapter"]
+    return sys.modules["filament.adapter"]
 
 
 adapter = _load_adapter()

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 # ── firebase_messaging stub ─────────────────────────────────────────
@@ -77,18 +77,18 @@ def _use_firebase_stub():
 def _load_fcm_client_module():
     sys.modules["firebase_messaging"] = _FIREBASE_STUB
 
-    pkg = types.ModuleType("hermes_filament_fcm")
+    pkg = types.ModuleType("filament")
     pkg.__path__ = [str(_PKG_DIR)]
-    sys.modules["hermes_filament_fcm"] = pkg
+    sys.modules["filament"] = pkg
 
     for name in ("credentials", "fcm_client"):
         spec = importlib.util.spec_from_file_location(
-            f"hermes_filament_fcm.{name}", _PKG_DIR / f"{name}.py"
+            f"filament.{name}", _PKG_DIR / f"{name}.py"
         )
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"hermes_filament_fcm.{name}"] = module
+        sys.modules[f"filament.{name}"] = module
         spec.loader.exec_module(module)
-    return sys.modules["hermes_filament_fcm.fcm_client"]
+    return sys.modules["filament.fcm_client"]
 
 
 fcm_client = _load_fcm_client_module()

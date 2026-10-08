@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-_PKG = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG = Path(__file__).resolve().parent.parent / "filament"
 _ADAPTER = _PKG / "adapter.py"
 
 
@@ -28,7 +28,7 @@ def _load(name):
     """Load one module under a stub package - importing the real package
     pulls in Hermes, but these modules use relative imports, so they need a
     parent to resolve against (same pattern as test_server_guide_lifetime)."""
-    pkg_name = "hermes_filament_fcm"
+    pkg_name = "filament"
     if pkg_name not in sys.modules:
         pkg = types.ModuleType(pkg_name)
         pkg.__path__ = [str(_PKG)]

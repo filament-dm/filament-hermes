@@ -1,4 +1,4 @@
-"""Tests for the auto-status narrator (hermes_filament_fcm.status)."""
+"""Tests for the auto-status narrator (filament.status)."""
 
 import asyncio
 import importlib.util
@@ -7,7 +7,7 @@ from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
     "status",
-    Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "status.py",
+    Path(__file__).resolve().parent.parent / "filament" / "status.py",
 )
 status = importlib.util.module_from_spec(_spec)
 sys.modules["status"] = status

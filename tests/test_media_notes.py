@@ -23,7 +23,7 @@ import sys
 import types
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 # ── Stubs for firebase_messaging and the Hermes gateway modules ─────
@@ -94,9 +94,9 @@ def _install_stubs() -> None:
 
 def _load_modules():
     _install_stubs()
-    pkg = types.ModuleType("hermes_filament_fcm")
+    pkg = types.ModuleType("filament")
     pkg.__path__ = [str(_PKG_DIR)]
-    sys.modules["hermes_filament_fcm"] = pkg
+    sys.modules["filament"] = pkg
     for name in (
         "credentials",
         "fcm_client",
@@ -107,16 +107,16 @@ def _load_modules():
         "media_tool",
     ):
         spec = importlib.util.spec_from_file_location(
-            f"hermes_filament_fcm.{name}", _PKG_DIR / f"{name}.py"
+            f"filament.{name}", _PKG_DIR / f"{name}.py"
         )
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"hermes_filament_fcm.{name}"] = module
+        sys.modules[f"filament.{name}"] = module
         spec.loader.exec_module(module)
     return (
-        sys.modules["hermes_filament_fcm.fcm_client"],
-        sys.modules["hermes_filament_fcm.adapter"],
-        sys.modules["hermes_filament_fcm.media_tool"],
-        sys.modules["hermes_filament_fcm.framing"],
+        sys.modules["filament.fcm_client"],
+        sys.modules["filament.adapter"],
+        sys.modules["filament.media_tool"],
+        sys.modules["filament.framing"],
     )
 
 
@@ -210,7 +210,7 @@ class _FakeAPI:
     """Stands in for FilamentAPI: canned get_thread responses."""
 
     parse_tool_result = staticmethod(
-        sys.modules["hermes_filament_fcm.filament_api"].FilamentAPI.parse_tool_result
+        sys.modules["filament.filament_api"].FilamentAPI.parse_tool_result
     )
 
     def __init__(self, thread=None, error=False):
@@ -428,7 +428,7 @@ class _FakeHTTPClient:
 
 
 def _api_with_fake_client(response):
-    fa_mod = sys.modules["hermes_filament_fcm.filament_api"]
+    fa_mod = sys.modules["filament.filament_api"]
     api = fa_mod.FilamentAPI("https://hs.example/mcp/agents", "fmcp_test")
     client = _FakeHTTPClient(response)
     api._client_for_loop = lambda: client

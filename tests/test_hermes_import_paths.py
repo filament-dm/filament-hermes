@@ -20,7 +20,7 @@ REMOVED = {
 
 
 def _imports():
-    package = sorted((ROOT / "hermes_filament_fcm").glob("*.py"))
+    package = sorted((ROOT / "filament").glob("*.py"))
     for path in [ROOT / "__init__.py", *package]:
         for node in ast.walk(ast.parse(path.read_text(), str(path))):
             if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:

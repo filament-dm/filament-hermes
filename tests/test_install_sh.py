@@ -9,11 +9,14 @@ so it passes; the failure is non-fatal, so the install continues on the
 hardcoded fallback dependency list. Nothing about it is visible on bash 5.
 """
 
+import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = ROOT / "install.sh"
@@ -112,3 +115,92 @@ def test_dep_read_block_yields_every_declared_dependency():
         env={"PATH": str(Path(sys.executable).parent) + ":/usr/bin:/bin"},
     )
     assert out.stdout.splitlines() == _declared_dependencies()
+
+
+def _setup_selection_and_launch() -> str:
+    source = INSTALL_SH.read_text()
+    selection_start = source.index("# BEGIN setup-package")
+    selection_end = source.index("# END setup-package")
+    swap_start = source.index('if [ -d "$PLUGIN_DIR" ]; then')
+    swap_end = source.index("trap - EXIT", swap_start) + len("trap - EXIT")
+    launch_start = source.index("run_setup() {")
+    launch_end = source.index("\n}\n", launch_start) + len("\n}")
+    assert selection_start < swap_start
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            'err() { printf "%s\\n" "$*" >&2; exit 1; }',
+            "info() { :; }",
+            source[selection_start:selection_end],
+            source[swap_start:swap_end],
+            source[launch_start:launch_end],
+            'run_setup --url "https://example.org/with spaces"',
+        ]
+    )
+
+
+def _setup_layout(clone: Path, package: str):
+    directory = clone / package
+    directory.mkdir(parents=True)
+    (directory / "__init__.py").write_text("")
+    (directory / "setup_cli.py").write_text(
+        "import os, sys\n"
+        "def main():\n"
+        f'    print("package={package}")\n'
+        '    print("args=" + repr(sys.argv[1:]))\n'
+        '    print("skip_restart=" + os.environ["FILAMENT_SETUP_SKIP_RESTART"])\n'
+    )
+
+
+def _run_setup_block(tmp_path, packages):
+    clone, installed = tmp_path / "clone with spaces", tmp_path / "installed"
+    clone.mkdir()
+    for package in packages:
+        _setup_layout(clone, package)
+    installed.mkdir()
+    (installed / "working-plugin").write_text("keep if invalid")
+    result = subprocess.run(
+        ["bash", "-c", _setup_selection_and_launch()],
+        check=False,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "CLONE_TMP": str(clone),
+            "PLUGIN_DIR": str(installed),
+            "PLUGIN_REF": "pinned-ref",
+            "PY": sys.executable,
+            "PYPATH_PREFIX": "",
+            "PYTHONPATH": "",
+            "SCRIPT_OWNS_RESTART": "1",
+        },
+    )
+    return result, installed
+
+
+@pytest.mark.parametrize(
+    "packages, expected",
+    [
+        (["filament"], "filament"),
+        (["hermes_filament_fcm"], "hermes_filament_fcm"),
+        (["filament", "hermes_filament_fcm"], "filament"),
+    ],
+)
+def test_installer_runs_setup_from_the_selected_clone(tmp_path, packages, expected):
+    result, installed = _run_setup_block(tmp_path, packages)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"package={expected}",
+        "args=['--url', 'https://example.org/with spaces']",
+        "skip_restart=1",
+    ]
+    assert (installed / expected / "setup_cli.py").is_file()
+    assert not (installed / "working-plugin").exists()
+
+
+def test_unsupported_setup_layout_keeps_the_working_install(tmp_path):
+    result, installed = _run_setup_block(tmp_path, [])
+    assert result.returncode == 1
+    assert "no supported setup package" in result.stderr
+    assert (installed / "working-plugin").read_text() == "keep if invalid"

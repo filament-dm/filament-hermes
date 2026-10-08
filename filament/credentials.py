@@ -5,9 +5,9 @@ plugin doesn't re-register with Google on every startup, and the
 persistent ids of already-received pushes so Google MCS doesn't
 redeliver them after a gateway restart.
 
-Credentials are stored at $HERMES_HOME/filament-fcm/fcm_credentials.json
-and received ids at $HERMES_HOME/filament-fcm/received_persistent_ids.json
-(or the directory specified by FILAMENT_FCM_CREDENTIALS_DIR). Keying the
+Credentials are stored at $HERMES_HOME/filament/fcm_credentials.json
+and received ids at $HERMES_HOME/filament/received_persistent_ids.json
+(or the directory specified by FILAMENT_CREDENTIALS_DIR). Keying the
 default off HERMES_HOME rather than $HOME matters for Hermes profiles: each
 profile is its own HERMES_HOME, and each profile connected to Filament is a
 distinct agent that needs its own FCM registration — two profiles sharing
@@ -28,9 +28,9 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
-_STATE_DIR_NAME = "filament-fcm"
+_LEGACY_STATE_DIR_NAME = "filament-fcm"
 
 # Cap on how many received persistent ids we keep. MCS only redelivers
 # recent unacked messages, so a bounded tail is plenty; this just keeps
@@ -41,52 +41,56 @@ MAX_RECEIVED_PERSISTENT_IDS = 1000
 def default_state_dir() -> Path:
     """Resolve (and, once, migrate) the plugin's state directory.
 
-    ``FILAMENT_FCM_CREDENTIALS_DIR`` wins when set. Otherwise the directory is
-    ``$HERMES_HOME/filament-fcm`` — per Hermes profile, since every profile is
-    its own HERMES_HOME — falling back to ``~/.hermes/filament-fcm`` when
-    HERMES_HOME is unset (hermes's own default home, so the path is unchanged
-    for plain installs).
+    ``FILAMENT_CREDENTIALS_DIR`` wins, followed by the legacy override
+    ``FILAMENT_FCM_CREDENTIALS_DIR``. Fresh installs use ``$HERMES_HOME/filament``
+    (``~/.hermes/filament`` when unset). Existing ``filament-fcm`` state remains
+    in place so credentials, policies and instructions survive an upgrade.
 
-    Migration: earlier versions always used ``~/.hermes/filament-fcm``. When
-    the resolved directory doesn't exist yet but that legacy one does, it is
-    renamed into place so the agent keeps its FCM identity across the upgrade —
-    but only for the *root* profile. A named profile (a HERMES_HOME under
-    ``profiles/``) is a different agent: it must register fresh, never adopt
-    the root profile's identity. If the rename fails (permissions, cross-
-    device), stay on the legacy path rather than orphan a working identity.
+    Pre-profile installs used ``~/.hermes/filament-fcm`` unconditionally. A root
+    profile with a different HERMES_HOME relocates that state under its home,
+    keeping the legacy name. Named profiles never adopt the root's identity.
+    If relocation fails (permissions, cross-device), use the original directory.
 
     ``reactive._default_dir`` mirrors the resolution rules, including the
     prefer-legacy-when-unmigrated fallback (but not the migration itself,
     which this module owns and runs first at gateway start via the adapter's
     CredentialStore) — keep them in sync.
     """
-    override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
+    override = os.environ.get("FILAMENT_CREDENTIALS_DIR") or os.environ.get(
+        "FILAMENT_FCM_CREDENTIALS_DIR"
+    )
     if override:
         return Path(override)
     home = os.environ.get("HERMES_HOME")
     hermes_home = Path(home) if home else Path.home() / ".hermes"
-    state_dir = hermes_home / _STATE_DIR_NAME
-    legacy = Path.home() / ".hermes" / _STATE_DIR_NAME
-    if state_dir == legacy or state_dir.exists() or not legacy.exists():
+    state_dir = hermes_home / "filament"
+    # Prefer an existing canonical directory; never merge two identities.
+    if state_dir.exists():
         return state_dir
-    if hermes_home.parent.name == "profiles":
+    profile_legacy = hermes_home / "filament-fcm"
+    if profile_legacy.exists():
+        return profile_legacy
+    legacy = Path.home() / ".hermes" / "filament-fcm"
+    if hermes_home.parent.name == "profiles" or not legacy.exists():
         return state_dir
-    marker = legacy.with_name(_STATE_DIR_NAME + ".moved")
+    # Preserve the old platform/state key when relocating pre-profile state.
+    state_dir = profile_legacy
+    marker = legacy.with_name(_LEGACY_STATE_DIR_NAME + ".moved")
     try:
         state_dir.parent.mkdir(parents=True, exist_ok=True)
         os.replace(legacy, state_dir)
         # A one-way door: warn (not info), and leave a breadcrumb next to
         # where the directory was for anyone later debugging the old agent.
-        logger.warning("Migrated filament-fcm state from %s to %s", legacy, state_dir)
+        logger.warning("Migrated filament state from %s to %s", legacy, state_dir)
         try:
             marker.write_text(
-                f"filament-fcm state moved to: {state_dir}\n", encoding="utf-8"
+                f"Filament state moved to: {state_dir}\n", encoding="utf-8"
             )
         except OSError:
             logger.debug("Could not write migration marker %s", marker, exc_info=True)
     except OSError:
         logger.warning(
-            "Could not migrate filament-fcm state from %s to %s; "
+            "Could not migrate Filament state from %s to %s; "
             "continuing on the legacy path",
             legacy,
             state_dir,
@@ -97,7 +101,7 @@ def default_state_dir() -> Path:
 
 
 class CredentialStore:
-    """Manages persisted FCM credentials for the filament-fcm plugin."""
+    """Manages persisted FCM credentials for the Filament plugin."""
 
     def __init__(self, base_dir: str | None = None) -> None:
         self._dir = Path(base_dir) if base_dir else default_state_dir()

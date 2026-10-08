@@ -12,9 +12,9 @@
 #
 # Optional environment overrides:
 #   FILAMENT_MCP_URL     point at staging/local instead of production
-#   FILAMENT_FCM_REPO    clone the plugin from a different repo URL
+#   FILAMENT_REPO        clone the plugin from a different repo URL
 #                        (default: https github main)
-#   FILAMENT_FCM_REF     clone a specific branch/tag/commit (default: repo's
+#   FILAMENT_REF         clone a specific branch/tag/commit (default: repo's
 #                        default branch — used to test unreleased plugin changes)
 #   VIRTUAL_ENV          Hermes venv (default: auto-detected, see below)
 #   HERMES_HOME          Hermes home (default: ~/.hermes)
@@ -35,14 +35,14 @@ set -euo pipefail
 # ([project.dependencies]) — the single source of truth — so a dependency added
 # there is never silently missed by this installer.
 
-# Where to clone the plugin from. FILAMENT_FCM_REPO accepts either a plain git
+# Where to clone the plugin from. FILAMENT_REPO accepts either a plain git
 # URL or a pip-style "git+<url>[@<ref>]" requirement — the Filament app and some
 # tooling set it in the pip form. Strip a leading git+, and (unless
-# FILAMENT_FCM_REF is set) treat a trailing "@<ref>" as the branch/tag/commit —
+# FILAMENT_REF is set) treat a trailing "@<ref>" as the branch/tag/commit —
 # whether or not the URL carries the optional ".git" suffix.
-_repo_spec="${FILAMENT_FCM_REPO:-https://github.com/filament-dm/filament-hermes.git}"
+_repo_spec="${FILAMENT_REPO:-${FILAMENT_FCM_REPO:-https://github.com/filament-dm/filament-hermes.git}}"
 _repo_spec="${_repo_spec#git+}"
-PLUGIN_REF="${FILAMENT_FCM_REF:-}"
+PLUGIN_REF="${FILAMENT_REF:-${FILAMENT_FCM_REF:-}}"
 # Only URLs with a scheme (https://, ssh://, ...) can carry a "@<ref>" suffix we
 # split on; the "@" then reliably sits after "://host/path", not in a
 # scp-style "git@host:owner/repo" address (which has no scheme and is left
@@ -281,10 +281,11 @@ if [ "$SEALED" = 1 ] && [ -n "$LAZY_TARGET" ]; then
   # already in the venv win over the version we just installed.
   if [ -w "$SITE" ]; then
     if printf 'import sys; sys.path.insert(0, %s)\n' "\"$LAZY_TARGET\"" \
-        > "$SITE/zzz-filament-fcm-lazy-packages.pth" 2>/dev/null; then
+        > "$SITE/zzz-filament-lazy-packages.pth" 2>/dev/null; then
+      rm -f "$SITE/zzz-filament-fcm-lazy-packages.pth" 2>/dev/null || true
       info "Put $LAZY_TARGET on the gateway's import path."
     else
-      warn "could not write $SITE/zzz-filament-fcm-lazy-packages.pth — the \
+      warn "could not write $SITE/zzz-filament-lazy-packages.pth — the \
 gateway may not see the dependencies; set HERMES_LAZY_INSTALL_TARGET to a dir \
 it already activates."
     fi
@@ -387,7 +388,7 @@ else
 fi
 
 # The entry point is committed as of 0.8.0 and no longer generated here, so a ref
-# from before that has none. Only FILAMENT_FCM_REF reaches this. Stop rather than
+# from before that has none. Only FILAMENT_REF reaches this. Stop rather than
 # install a tree the loader cannot enter, which would surface much later as "No
 # messaging platforms enabled".
 [ -f "$CLONE_TMP/__init__.py" ] || err \
@@ -395,6 +396,19 @@ fi
 predates 0.8.0. Install an older ref with that ref's own installer instead: \
 curl -fsSL https://raw.githubusercontent.com/filament-dm/filament-hermes/\
 ${PLUGIN_REF:-main}/install.sh | CONNECT_TOKEN=... bash"
+
+# Select from the clone before replacing a working install. A pinned ref may
+# predate the package rename; a current clone also contains a legacy alias, so
+# prefer the maintained package when both layouts are present.
+# BEGIN setup-package (extracted and run by tests/test_install_sh.py)
+if [ -f "$CLONE_TMP/filament/setup_cli.py" ]; then
+  SETUP_PACKAGE=filament
+elif [ -f "$CLONE_TMP/hermes_filament_fcm/setup_cli.py" ]; then
+  SETUP_PACKAGE=hermes_filament_fcm
+else
+  err "ref '${PLUGIN_REF:-default}' has no supported setup package; leaving the existing plugin in place."
+fi
+# END setup-package
 
 # Install the plugin's declared runtime dependencies, read straight from the
 # cloned pyproject.toml ([project.dependencies]) so this installer never drifts
@@ -558,14 +572,15 @@ fi
 # overwrite an untracked file now that the file is committed. Nobody has to delete
 # it by hand.
 
-[ -z "$UV" ] || "$UV" pip uninstall hermes-filament-fcm >/dev/null 2>&1 || true
+[ -z "$UV" ] || "$UV" pip uninstall filament hermes-filament-fcm >/dev/null 2>&1 || true
 if [ -n "$LAZY_TARGET" ] && [ -d "$LAZY_TARGET" ]; then
-  rm -rf "$LAZY_TARGET"/hermes_filament_fcm "$LAZY_TARGET"/hermes_filament_fcm-*.dist-info 2>/dev/null || true
+  rm -rf "$LAZY_TARGET"/filament "$LAZY_TARGET"/filament-*.dist-info \
+    "$LAZY_TARGET"/hermes_filament_fcm "$LAZY_TARGET"/hermes_filament_fcm-*.dist-info 2>/dev/null || true
 fi
 
 info "Connecting to Filament ..."
 # Run the setup wizard with the venv Python and the plugin dir (plus any durable
-# dep target) on PYTHONPATH, so `hermes_filament_fcm` imports from the clone.
+# dep target) on PYTHONPATH, so the selected package imports from the clone.
 # The package is not pip-installed, so there is no console script to run.
 run_setup() {
   # When this script owns the gateway restart — an s6 bounce (any supervised
@@ -576,8 +591,8 @@ run_setup() {
   # bounce moments later.
   PYTHONPATH="$PLUGIN_DIR${PYPATH_PREFIX:+:$PYPATH_PREFIX}${PYTHONPATH:+:$PYTHONPATH}" \
     FILAMENT_SETUP_SKIP_RESTART="${SCRIPT_OWNS_RESTART:-}" \
-    "$PY" -c 'from hermes_filament_fcm.setup_cli import main; main()' "$@"
-  # Not `-m hermes_filament_fcm.setup_cli`: the package __init__ imports
+    "$PY" -c "from $SETUP_PACKAGE.setup_cli import main; main()" "$@"
+  # Not `-m <package>.setup_cli`: the package __init__ imports
   # setup_cli, so runpy then finds it already in sys.modules and prints a
   # RuntimeWarning at the top of the wizard.
 }

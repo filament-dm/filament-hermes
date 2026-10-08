@@ -13,13 +13,13 @@ from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
     "reactive",
-    Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "reactive.py",
+    Path(__file__).resolve().parent.parent / "filament" / "reactive.py",
 )
 reactive = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(reactive)
 
 _ADAPTER_SRC = (
-    Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "adapter.py"
+    Path(__file__).resolve().parent.parent / "filament" / "adapter.py"
 ).read_text()
 
 

@@ -7,7 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 _spec = importlib.util.spec_from_file_location(
     "upload_hint", _PKG_DIR / "upload_hint.py"

@@ -20,7 +20,7 @@ from typing import Any
 
 from .filament_api import FilamentAPI
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
 # Filenames are sender-controlled: reduce them to a safe basename component
 # so a hostile name can't traverse directories or hide the file.
@@ -93,11 +93,9 @@ def make_download_media_handler(api: FilamentAPI):
             # Streamed straight to disk — media can be large (video/document).
             nbytes = await api.download_media(mxc_url, str(path))
         except Exception as exc:
-            logger.exception("filament-fcm: download_media failed for %s", mxc_url)
+            logger.exception("filament: download_media failed for %s", mxc_url)
             return json.dumps({"error": f"download failed: {exc}"})
-        logger.info(
-            "filament-fcm: downloaded %s (%d bytes) → %s", mxc_url, nbytes, path
-        )
+        logger.info("filament: downloaded %s (%d bytes) → %s", mxc_url, nbytes, path)
         return json.dumps({"ok": True, "path": str(path), "bytes": nbytes})
 
     handler.__name__ = "filament_download_media"

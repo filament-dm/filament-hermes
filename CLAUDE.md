@@ -16,7 +16,7 @@ uv run --group dev ruff check .            # lint (config in pyproject.toml)
 python3 scripts/plugin-scan.py              # Hermes plugin security scan — must say SAFE (CI runs it)
 ```
 
-There is no build step. End users never install this by hand — the Filament app hands them a one-liner that runs `install.sh` with a `CONNECT_TOKEN`, which pip-installs the package into the Hermes venv and runs the `filament-fcm-setup` wizard (`setup_cli.py`).
+There is no build step. End users never install this by hand — the Filament app hands them a one-liner that runs `install.sh` with a `CONNECT_TOKEN`, which pip-installs the package into the Hermes venv and runs the `filament-setup` wizard (`setup_cli.py`).
 
 `install.sh` has to run under **bash 3.2** — that is `/bin/bash` on macOS, so it is what the Filament app's one-liner (curl piped into bash) executes there. Never open a here-doc inside a `$(...)` or `<(...)`: 3.2 rescans the substitution's raw text at expansion time and an apostrophe in a comment silently breaks the whole thing. `bash -n` does not catch it. `tests/test_install_sh.py` guards the shape statically and `tests/install-dep-read.sh` runs the dependency-read block for real (under `/bin/bash` in the macOS CI job).
 
@@ -26,7 +26,7 @@ There is no build step. End users never install this by hand — the Filament ap
 
 The package imports `gateway.*`, `agent.*`, and `hermes_cli.*` from hermes-agent at runtime, but hermes-agent is **not** a declared dependency (the plugin is installed into an existing Hermes venv). Consequently:
 
-- Importing `hermes_filament_fcm` fails in a bare dev environment.
+- Importing `filament` fails in a bare dev environment.
 - Tests load modules **standalone** via `importlib.util.spec_from_file_location`, bypassing `__init__.py`, and stub non-stdlib deps (see `test_fcm_receiver_death.py` for the `firebase_messaging` stub pattern). Follow this pattern for new tests.
 - Keep unit-testable logic in stdlib-only modules (`reactive.py`, `credentials.py`) or behind stub-able seams; `adapter.py` and `__init__.py` can't be imported without Hermes.
 
@@ -42,7 +42,7 @@ The package imports `gateway.*`, `agent.*`, and `hermes_cli.*` from hermes-agent
 
 `filament_api.py` — `FilamentAPI`, the MCP-over-HTTP client (JSON-RPC). One instance is shared by the adapter and every tool handler. Its httpx client is recreated per event loop because calls arrive from both the gateway loop and the firebase-messaging thread.
 
-`credentials.py` — persists FCM credentials and received persistent ids under `$HERMES_HOME/filament-fcm/` (`~/.hermes/filament-fcm/` when HERMES_HOME is unset; `FILAMENT_FCM_CREDENTIALS_DIR` to override). Per-HERMES_HOME so every Hermes *profile* — each its own HERMES_HOME — gets its own FCM identity; `default_state_dir()` migrates the pre-profile `~/.hermes/filament-fcm` forward for the root profile only. The persistent ids seed the next MCS login so Google doesn't redeliver already-handled pushes after a restart.
+`credentials.py` — persists FCM credentials and received persistent ids under `$HERMES_HOME/filament/` (`~/.hermes/filament/` when HERMES_HOME is unset; `FILAMENT_CREDENTIALS_DIR` to override), retaining existing `filament-fcm` directories on upgrade. Per-HERMES_HOME so every Hermes *profile* — each its own HERMES_HOME — gets its own FCM identity; `default_state_dir()` migrates the pre-profile `~/.hermes/filament-fcm` forward for the root profile only. The persistent ids seed the next MCS login so Google doesn't redeliver already-handled pushes after a restart.
 
 `server_config.py` — server-side agent config sync (see the dedicated section below). Stdlib-only; the HTTP client is injected (`FilamentAPI.get_config` / `put_config` / `post_tools`), so it is unit-testable without Hermes.
 
@@ -96,7 +96,7 @@ The server holds one revisioned config document per agent on bearer-authenticate
 
 ## Configuration (environment variables)
 
-`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra gateway-admitted users; only the `get_self` owner carries sender authority outside the backchannel), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_FCM_CREDENTIALS_DIR`, `FILAMENT_CAPABILITY_POLICY_FILE` (override the data-plane capability policy path; default `<creds dir>/capability_policy.json`), `FILAMENT_FEATURE_FLAGS_FILE` (override the feature-flag path; default `<creds dir>/feature_flags.json`), `FILAMENT_ENGAGED_THREADS_FILE` (override the engaged-thread record path; default `<creds dir>/engaged_threads.json`), `FILAMENT_DISABLE_UPDATE_CHECK` (set true to turn off the daily new-version check/reminder — see `update_check.py`), `FILAMENT_UPDATE_CHECK_URL` (override the pyproject.toml URL the update check fetches — a test seam so a harness can stand in for "the version on main"; production never sets it), `FILAMENT_SERVER_CONFIG` (set `off` to disable the server-side config sync and tool-inventory reporting), `HERMES_HOME`.
+`FILAMENT_MCP_TOKEN` (required), `FILAMENT_MCP_URL` (default production `https://api.filament.dm/mcp/agents`), `FILAMENT_CONTROL_USERS` (extra gateway-admitted users; only the `get_self` owner carries sender authority outside the backchannel), `FILAMENT_ALLOW_DATA_USERS` (default true — set false for a control-plane-only agent), `FILAMENT_HOME_ROOM`, `FILAMENT_CREDENTIALS_DIR` (legacy `FILAMENT_FCM_CREDENTIALS_DIR` accepted), `FILAMENT_CAPABILITY_POLICY_FILE` (override the data-plane capability policy path; default `<creds dir>/capability_policy.json`), `FILAMENT_FEATURE_FLAGS_FILE` (override the feature-flag path; default `<creds dir>/feature_flags.json`), `FILAMENT_ENGAGED_THREADS_FILE` (override the engaged-thread record path; default `<creds dir>/engaged_threads.json`), `FILAMENT_DISABLE_UPDATE_CHECK` (set true to turn off the daily new-version check/reminder — see `update_check.py`), `FILAMENT_UPDATE_CHECK_URL` (override the pyproject.toml URL the update check fetches — a test seam so a harness can stand in for "the version on main"; production never sets it), `FILAMENT_SERVER_CONFIG` (set `off` to disable the server-side config sync and tool-inventory reporting), `HERMES_HOME`.
 
 ## Versioning
 

@@ -6,9 +6,7 @@ Loaded standalone: the function is pure, and setup_cli's imports need Hermes.
 import ast
 from pathlib import Path
 
-_SETUP_CLI = (
-    Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "setup_cli.py"
-)
+_SETUP_CLI = Path(__file__).resolve().parent.parent / "filament" / "setup_cli.py"
 
 
 # ── token_source: where the credential is read from ──────────────────

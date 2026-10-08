@@ -37,7 +37,7 @@ from typing import Any, Callable, ClassVar
 from .credentials import CredentialStore, ReceivedPersistentIds
 from .observability import fingerprint, get_logger, new_id
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 slog = get_logger()
 
 # Enable firebase-messaging library logging so connection state is visible
@@ -47,7 +47,7 @@ slog = get_logger()
 # The heartbeat is the one message at that level that repeats forever: a healthy
 # client sends one every 20s, so it buries the lines worth reading and puts a
 # pair on the console of anyone running the gateway in the foreground. Drop it.
-# Set FILAMENT_FCM_LOG_HEARTBEAT=1 to keep it while diagnosing a stalled push —
+# Set FILAMENT_LOG_HEARTBEAT=1 to keep it while diagnosing a stalled push —
 # an absent heartbeat is evidence, so it has to stay reachable.
 #
 # Filtered on the format string, not the rendered message, so the match does not
@@ -64,7 +64,10 @@ class _DropHeartbeats(logging.Filter):
 
 _fb_logger = logging.getLogger("firebase_messaging")
 _fb_logger.setLevel(logging.DEBUG)
-if not os.environ.get("FILAMENT_FCM_LOG_HEARTBEAT"):
+if not (
+    os.environ.get("FILAMENT_LOG_HEARTBEAT")
+    or os.environ.get("FILAMENT_FCM_LOG_HEARTBEAT")
+):
     # On the logger, not the handler, so it applies wherever these records go.
     _fb_logger.addFilter(_DropHeartbeats())
 if not _fb_logger.handlers:
@@ -110,7 +113,9 @@ def _register_retry_sleep(attempt: int) -> float:
 
 
 def _register_attempts() -> int:
-    raw = os.environ.get("FILAMENT_FCM_REGISTER_ATTEMPTS")
+    raw = os.environ.get(
+        "FILAMENT_REGISTER_ATTEMPTS", os.environ.get("FILAMENT_FCM_REGISTER_ATTEMPTS")
+    )
     if raw:
         try:
             return max(1, int(raw))
@@ -439,7 +444,7 @@ class FilamentFCMClient:
         self._death_reported = False
         self._fcm_client_id = new_id("fcm")
         slog.info(
-            "filament_fcm.client.created",
+            "filament.client.created",
             fcm_client_id=self._fcm_client_id,
             seeded_persistent_ids=len(self._received_ids.ids),
         )
@@ -473,7 +478,7 @@ class FilamentFCMClient:
 
         saved_creds = self._credential_store.load_fcm_credentials()
         slog.info(
-            "filament_fcm.checkin.start",
+            "filament.checkin.start",
             fcm_client_id=self._fcm_client_id,
             credential_mode="saved" if saved_creds else "fresh",
             seeded_persistent_ids=len(self._received_ids.ids),
@@ -483,7 +488,7 @@ class FilamentFCMClient:
 
         def on_credentials_updated(creds: dict) -> None:
             slog.info(
-                "filament_fcm.credentials.updated",
+                "filament.credentials.updated",
                 fcm_client_id=self._fcm_client_id,
                 has_fcm_token=bool((creds.get("fcm") or {}).get("token"))
                 if isinstance(creds, dict)
@@ -521,7 +526,7 @@ class FilamentFCMClient:
             except Exception as e:
                 last_exc = e
                 logger.warning(
-                    "filament-fcm: FCM registration attempt %s/%s failed: %s",
+                    "filament: FCM registration attempt %s/%s failed: %s",
                     i,
                     attempts,
                     e,
@@ -537,7 +542,7 @@ class FilamentFCMClient:
                     attempts,
                 )
                 slog.info(
-                    "filament_fcm.checkin.complete",
+                    "filament.checkin.complete",
                     fcm_client_id=self._fcm_client_id,
                     fcm_token_fingerprint=fingerprint(self._fcm_token),
                     attempt=i,
@@ -564,7 +569,7 @@ class FilamentFCMClient:
         self._death_reported = False
 
         logger.info("Starting FCM push listener")
-        slog.info("filament_fcm.listener.start", fcm_client_id=self._fcm_client_id)
+        slog.info("filament.listener.start", fcm_client_id=self._fcm_client_id)
 
         try:
             await self._push_client.start()
@@ -578,7 +583,7 @@ class FilamentFCMClient:
 
         self._watch_receiver_tasks()
         slog.info(
-            "filament_fcm.listener.started",
+            "filament.listener.started",
             fcm_client_id=self._fcm_client_id,
             task_count=len(getattr(self._push_client, "tasks", []) or []),
         )
@@ -591,7 +596,7 @@ class FilamentFCMClient:
                 if not task.done():
                     task.cancel()
         logger.info("FCM push listener stopped")
-        slog.info("filament_fcm.listener.stopped", fcm_client_id=self._fcm_client_id)
+        slog.info("filament.listener.stopped", fcm_client_id=self._fcm_client_id)
 
     # ── Death detection ────────────────────────────────────────────
     #
@@ -608,7 +613,7 @@ class FilamentFCMClient:
         """Attach done-callbacks that report receiver death upward."""
         tasks = getattr(self._push_client, "tasks", None)
         if not tasks:
-            logger.warning("filament-fcm: no push client tasks to watch")
+            logger.warning("filament: no push client tasks to watch")
             return
         for task in tasks:
             task.add_done_callback(self._on_push_task_done)
@@ -626,7 +631,7 @@ class FilamentFCMClient:
             )
         logger.error("FCM push receiver died (%s)", detail)
         slog.error(
-            "filament_fcm.listener.dead",
+            "filament.listener.dead",
             fcm_client_id=self._fcm_client_id,
             detail=detail,
         )
@@ -662,12 +667,12 @@ class FilamentFCMClient:
         """
         push_receive_id = new_id("push")
         logger.info(
-            "filament-fcm: FCM notification received (keys=%s, persistent_id=%s)",
+            "filament: FCM notification received (keys=%s, persistent_id=%s)",
             list(data.keys()) if isinstance(data, dict) else type(data).__name__,
             persistent_id,
         )
         slog.info(
-            "filament_fcm.notification.received",
+            "filament.notification.received",
             fcm_client_id=self._fcm_client_id,
             push_receive_id=push_receive_id,
             persistent_id=persistent_id,
@@ -679,11 +684,11 @@ class FilamentFCMClient:
         # kill the process) and drop redeliveries we've already processed.
         if not self._received_ids.record(persistent_id):
             logger.info(
-                "filament-fcm: dropping already-processed push (persistent_id=%s)",
+                "filament: dropping already-processed push (persistent_id=%s)",
                 persistent_id,
             )
             slog.info(
-                "filament_fcm.notification.dedup",
+                "filament.notification.dedup",
                 fcm_client_id=self._fcm_client_id,
                 push_receive_id=push_receive_id,
                 persistent_id=persistent_id,
@@ -692,7 +697,7 @@ class FilamentFCMClient:
             )
             return
         slog.info(
-            "filament_fcm.notification.dedup",
+            "filament.notification.dedup",
             fcm_client_id=self._fcm_client_id,
             push_receive_id=push_receive_id,
             persistent_id=persistent_id,
@@ -700,9 +705,9 @@ class FilamentFCMClient:
         )
 
         if not isinstance(data, dict):
-            logger.warning("filament-fcm: unexpected notification type: %s", type(data))
+            logger.warning("filament: unexpected notification type: %s", type(data))
             slog.warning(
-                "filament_fcm.notification.invalid",
+                "filament.notification.invalid",
                 fcm_client_id=self._fcm_client_id,
                 push_receive_id=push_receive_id,
                 persistent_id=persistent_id,
@@ -714,9 +719,9 @@ class FilamentFCMClient:
         # The FCM payload wraps the DirectPusher data under a "data" key.
         inner = data.get("data", data)
         if not isinstance(inner, dict):
-            logger.warning("filament-fcm: unexpected inner data type: %s", type(inner))
+            logger.warning("filament: unexpected inner data type: %s", type(inner))
             slog.warning(
-                "filament_fcm.notification.invalid",
+                "filament.notification.invalid",
                 fcm_client_id=self._fcm_client_id,
                 push_receive_id=push_receive_id,
                 persistent_id=persistent_id,
@@ -727,9 +732,9 @@ class FilamentFCMClient:
 
         # Skip badge-only updates before parsing the body JSON.
         if inner.get("badge_only") == "true":
-            logger.info("filament-fcm: skipping badge-only update")
+            logger.info("filament: skipping badge-only update")
             slog.info(
-                "filament_fcm.notification.skipped",
+                "filament.notification.skipped",
                 fcm_client_id=self._fcm_client_id,
                 push_receive_id=push_receive_id,
                 persistent_id=persistent_id,
@@ -741,11 +746,11 @@ class FilamentFCMClient:
         env = parse_envelope(inner)
         if env is None:
             logger.warning(
-                "filament-fcm: could not parse envelope: %s",
+                "filament: could not parse envelope: %s",
                 json.dumps(inner, default=str),
             )
             slog.warning(
-                "filament_fcm.notification.invalid",
+                "filament.notification.invalid",
                 fcm_client_id=self._fcm_client_id,
                 push_receive_id=push_receive_id,
                 persistent_id=persistent_id,
@@ -757,7 +762,7 @@ class FilamentFCMClient:
         env.push_receive_id = push_receive_id
         env.fcm_client_id = self._fcm_client_id
         slog.info(
-            "filament_fcm.notification.parsed",
+            "filament.notification.parsed",
             fcm_client_id=self._fcm_client_id,
             push_receive_id=push_receive_id,
             persistent_id=persistent_id,
@@ -770,9 +775,9 @@ class FilamentFCMClient:
         # Dispatch on branch type (or top-level type for branch-less payloads).
         handler_name = self._DISPATCH.get(env.branch_type)
         if handler_name is None:
-            logger.debug("filament-fcm: unhandled branch type: %s", env.branch_type)
+            logger.debug("filament: unhandled branch type: %s", env.branch_type)
             slog.debug(
-                "filament_fcm.notification.unhandled",
+                "filament.notification.unhandled",
                 fcm_client_id=self._fcm_client_id,
                 push_receive_id=push_receive_id,
                 persistent_id=persistent_id,
@@ -785,12 +790,12 @@ class FilamentFCMClient:
             handler(env)
         except Exception:
             logger.exception(
-                "filament-fcm: error in %s handler for %s",
+                "filament: error in %s handler for %s",
                 handler_name,
                 env.branch_type,
             )
             slog.exception(
-                "filament_fcm.notification.handler_failed",
+                "filament.notification.handler_failed",
                 fcm_client_id=self._fcm_client_id,
                 push_receive_id=push_receive_id,
                 persistent_id=persistent_id,
@@ -801,7 +806,7 @@ class FilamentFCMClient:
     def _dispatch_ping(self, env: Envelope) -> None:
         """Handle ``io.filament.ping`` — liveness probe from the principal."""
         logger.info(
-            "filament-fcm: liveness ping received (nonce=%s)",
+            "filament: liveness ping received (nonce=%s)",
             env.payload.get("nonce"),
         )
         if self._on_ping is not None:
@@ -816,7 +821,7 @@ class FilamentFCMClient:
         invite.push_receive_id = env.push_receive_id
         invite.fcm_client_id = env.fcm_client_id
         logger.info(
-            "filament-fcm: invite received (%s to %s from %s)",
+            "filament: invite received (%s to %s from %s)",
             invite.branch_type,
             invite.room_name or invite.room_id,
             invite.inviter,
@@ -830,7 +835,7 @@ class FilamentFCMClient:
         if vouch is None:
             return
         logger.info(
-            "filament-fcm: vouch received (into %s from %s)",
+            "filament: vouch received (into %s from %s)",
             vouch.loop_name or vouch.loop_id,
             vouch.inviter,
         )
@@ -846,7 +851,7 @@ class FilamentFCMClient:
         reaction.push_receive_id = env.push_receive_id
         reaction.fcm_client_id = env.fcm_client_id
         logger.info(
-            "filament-fcm: reaction %s by %s on %s in %s",
+            "filament: reaction %s by %s on %s in %s",
             reaction.key,
             reaction.sender_display_name or reaction.sender,
             reaction.target_event_id,
@@ -871,7 +876,7 @@ class FilamentFCMClient:
             msg.branch_type,
         )
         slog.info(
-            "filament_fcm.message.dispatch",
+            "filament.message.dispatch",
             fcm_client_id=env.fcm_client_id,
             push_receive_id=env.push_receive_id,
             persistent_id=env.persistent_id,

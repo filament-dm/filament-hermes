@@ -64,3 +64,20 @@ To update:
 ```
 hermes plugins update filament && hermes gateway restart
 ```
+
+### Upgrading older installations
+
+Re-run the setup command above to move an older plugin installation to the
+`filament` plugin ID. Existing credentials, instructions, wake policies and
+Hermes conversation keys are preserved. Older installations continue to use their
+existing `filament-fcm` state directory and internal platform key; fresh installs
+use `filament` for both. Update the plugin with `hermes plugins update filament`.
+
+The Python package is now `filament`, and the setup executable is
+`filament-setup`. The old `hermes_filament_fcm` import path and
+`filament-fcm-setup` command remain compatibility aliases. Installer overrides
+are now `FILAMENT_REPO` and `FILAMENT_REF`; the old `FILAMENT_FCM_REPO` and
+`FILAMENT_FCM_REF` variables still work. Runtime overrides likewise accept
+`FILAMENT_CREDENTIALS_DIR`, `FILAMENT_LOG_HEARTBEAT` and
+`FILAMENT_REGISTER_ATTEMPTS`, with their old `FILAMENT_FCM_*` names as fallbacks.
+When both spellings are set, the new spelling takes precedence.

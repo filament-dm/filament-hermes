@@ -48,6 +48,7 @@ from .fcm_client import (
     VouchMessage,
 )
 from .filament_api import FilamentAPI
+from .naming import platform_name
 from .observability import (
     bound_context,
     current_context,
@@ -106,10 +107,11 @@ from .update_check import UpdateChecker, build_reminder, update_check_disabled
 # Marker written into config.extra alongside the plugin-managed session
 # keying knob, so a later adapter construction can tell the flag's own
 # residue from a genuine operator pin.
-_SESSION_KEYING_MANAGED_KEY = "_filament_fcm_managed_session_keying"
+_SESSION_KEYING_MANAGED_KEY = "_filament_managed_session_keying"
+_LEGACY_SESSION_KEYING_MANAGED_KEY = "_filament_fcm_managed_session_keying"
 
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
 
 @functools.cache  # once per gateway process, not per reconnect
@@ -127,10 +129,10 @@ def _seed_display_defaults() -> None:
     try:
         written = seed_display_defaults(announce=False)
     except Exception as exc:
-        logger.warning("filament-fcm: could not seed display defaults: %s", exc)
+        logger.warning("filament: could not seed display defaults: %s", exc)
         return
     if written:
-        logger.info("filament-fcm: set display defaults %s", ", ".join(written))
+        logger.info("filament: set display defaults %s", ", ".join(written))
 
 
 slog = get_logger()
@@ -182,9 +184,7 @@ def _registry_toolset_tools(toolset: str) -> list[str]:
 
         return [str(n) for n in registry.get_tool_names_for_toolset(toolset)]
     except Exception:
-        logger.debug(
-            "filament-fcm: toolset lookup failed for %r", toolset, exc_info=True
-        )
+        logger.debug("filament: toolset lookup failed for %r", toolset, exc_info=True)
         return []
 
 
@@ -205,7 +205,7 @@ def _mcp_server_inventory() -> dict[str, int]:
                 out[server] = len(list(registry.get_tool_names_for_toolset(name)))
         return out
     except Exception:
-        logger.debug("filament-fcm: mcp server inventory unavailable", exc_info=True)
+        logger.debug("filament: mcp server inventory unavailable", exc_info=True)
         return {}
 
 
@@ -260,7 +260,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         filament_api: FilamentAPI,
         server_sync: ServerConfigSync | None = None,
     ) -> None:
-        super().__init__(config, Platform("filament-fcm"))
+        super().__init__(config, Platform(platform_name()))
+        extra = getattr(config, "extra", None)
+        if isinstance(extra, dict) and _LEGACY_SESSION_KEYING_MANAGED_KEY in extra:
+            extra.setdefault(
+                _SESSION_KEYING_MANAGED_KEY,
+                extra.pop(_LEGACY_SESSION_KEYING_MANAGED_KEY),
+            )
 
         # ── Control plane vs reactive plane ───────────────────────────────
         # The principal (owner_id, learned in Stage 1) carries CONTROL authority
@@ -399,7 +405,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._installation_id = self._credentials.load_or_create_installation_id()
         self._gateway_instance_id = new_id("gw")
         slog.info(
-            "filament_fcm.adapter.created",
+            "filament.adapter.created",
             installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             mcp_url=self._filament_api._mcp_url,
@@ -424,7 +430,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         fut = safe_schedule_threadsafe(
             coro,
             self._loop,
-            log_message=f"filament-fcm: could not schedule {label}",
+            log_message=f"filament: could not schedule {label}",
         )
         if fut is None:
             return
@@ -435,7 +441,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             except Exception:
                 return
             if exc is not None:
-                logger.error("filament-fcm: %s failed: %s", label, exc, exc_info=exc)
+                logger.error("filament: %s failed: %s", label, exc, exc_info=exc)
 
         fut.add_done_callback(_log_result)
 
@@ -537,7 +543,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 note = framing.summarize_media(target.get("media"))
         except Exception:
             logger.warning(
-                "filament-fcm: could not fetch media details for %s",
+                "filament: could not fetch media details for %s",
                 msg.event_id,
                 exc_info=True,
             )
@@ -607,12 +613,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # handling, and the shared httpx client, on a single loop.
             self._loop = asyncio.get_running_loop()
             logger.info(
-                "filament-fcm: starting connection (url=%s, plugin=v%s)",
+                "filament: starting connection (url=%s, plugin=v%s)",
                 self._filament_api._mcp_url,
                 PLUGIN_VERSION,
             )
             slog.info(
-                "filament_fcm.connect.start",
+                "filament.connect.start",
                 installation_id=self._installation_id,
                 gateway_instance_id=self._gateway_instance_id,
                 connect_attempt_id=connect_attempt_id,
@@ -632,19 +638,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         retryable=True,
                     )
                 else:
-                    logger.error("filament-fcm: Stage 1 (MCP init) failed")
+                    logger.error("filament: Stage 1 (MCP init) failed")
                     slog.error(
-                        "filament_fcm.connect.stage_failed",
+                        "filament.connect.stage_failed",
                         stage="initialize_api",
                     )
                 return False
             if not await self._register_fcm():
-                logger.error("filament-fcm: Stage 2 (FCM registration) failed")
-                slog.error("filament_fcm.connect.stage_failed", stage="register_fcm")
+                logger.error("filament: Stage 2 (FCM registration) failed")
+                slog.error("filament.connect.stage_failed", stage="register_fcm")
                 return False
             if not await self._register_pusher():
-                logger.error("filament-fcm: Stage 3 (push token registration) failed")
-                slog.error("filament_fcm.connect.stage_failed", stage="register_pusher")
+                logger.error("filament: Stage 3 (push token registration) failed")
+                slog.error("filament.connect.stage_failed", stage="register_pusher")
                 return False
             # Pull the server-held agent config into the local store files (or
             # seed the server from them if it holds no document yet) BEFORE
@@ -661,13 +667,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "filament-fcm: startup config sync timed out; "
+                        "filament: startup config sync timed out; "
                         "continuing on local files"
                     )
 
             if not await self._start_listener():
-                logger.error("filament-fcm: Stage 4 (FCM listener) failed")
-                slog.error("filament_fcm.connect.stage_failed", stage="start_listener")
+                logger.error("filament: Stage 4 (FCM listener) failed")
+                slog.error("filament.connect.stage_failed", stage="start_listener")
                 return False
 
             # Offline catch-up for vouches, after Stage 4 on purpose. Run before
@@ -683,9 +689,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             with bound_context(call_origin="startup"):
                 await self._server_config.maybe_report_tools()
 
-            logger.info("filament-fcm: connected successfully")
+            logger.info("filament: connected successfully")
             slog.info(
-                "filament_fcm.connect.complete",
+                "filament.connect.complete",
                 agent_id=self._user_id,
                 principal_id=self._owner_id,
                 backchannel_id=self._cc_room_id,
@@ -701,8 +707,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             await self._maybe_greet()
             return True
         except Exception:
-            logger.exception("filament-fcm: unexpected error during connect")
-            slog.exception("filament_fcm.connect.failed")
+            logger.exception("filament: unexpected error during connect")
+            slog.exception("filament.connect.failed")
             self._set_fatal_error("connect_failed", "Connection failed", retryable=True)
             return False
 
@@ -724,7 +730,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return
         if not self._cc_room_id:
             logger.info(
-                "filament-fcm: greet directive present but no backchannel — skipping"
+                "filament: greet directive present but no backchannel — skipping"
             )
             return
 
@@ -738,7 +744,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # pure wait and could say anything. Personality gets its chance on
             # the first real exchange.
             logger.info(
-                "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
+                "filament: first-contact greet → backchannel %s", self._cc_room_id
             )
             with bound_context(
                 installation_id=self._installation_id,
@@ -746,7 +752,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 call_origin="first_contact_greet",
             ):
                 slog.info(
-                    "filament_fcm.greet.dispatch",
+                    "filament.greet.dispatch",
                     channel_id=self._cc_room_id,
                     principal_id=self._owner_id,
                 )
@@ -758,7 +764,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     ),
                 )
                 slog.info(
-                    "filament_fcm.greet.dispatched",
+                    "filament.greet.dispatched",
                     channel_id=self._cc_room_id,
                     principal_id=self._owner_id,
                 )
@@ -771,8 +777,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 task = asyncio.get_running_loop().create_task(self._greet_intro_turn())
                 self._background_greet_task = task
         except Exception:
-            logger.exception("filament-fcm: greet post failed")
-            slog.exception("filament_fcm.greet.failed")
+            logger.exception("filament: greet post failed")
+            slog.exception("filament.greet.failed")
 
     async def _greet_intro_turn(self) -> None:
         """Background capabilities intro (see _maybe_greet). Best-effort."""
@@ -817,7 +823,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             ):
                 await self.handle_message(event)
         except Exception:
-            logger.debug("filament-fcm: greet intro turn failed", exc_info=True)
+            logger.debug("filament: greet intro turn failed", exc_info=True)
 
     def _note_reserved(self) -> None:
         """Mark this connect attempt blocked on an unfinalized agent, and tell
@@ -826,7 +832,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not self._reserved_notified:
             self._reserved_notified = True
             logger.info(
-                "filament-fcm: this agent isn't finished setting up yet — go "
+                "filament: this agent isn't finished setting up yet — go "
                 "back to the Filament app and finish the connect flow (naming "
                 "your agent creates it). This will connect automatically once "
                 "you're done."
@@ -837,14 +843,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         self._reserved = False
         try:
             logger.info(
-                "filament-fcm: [Stage 1] initializing MCP session at %s",
+                "filament: [Stage 1] initializing MCP session at %s",
                 self._filament_api._mcp_url,
             )
-            slog.info("filament_fcm.stage.start", stage="initialize_api")
+            slog.info("filament.stage.start", stage="initialize_api")
             with bound_context(call_origin="startup"):
                 init = await self._filament_api.initialize()
-            logger.info("filament-fcm: [Stage 1] MCP session established")
-            slog.info("filament_fcm.stage.complete", stage="initialize_api")
+            logger.info("filament: [Stage 1] MCP session established")
+            slog.info("filament.stage.complete", stage="initialize_api")
 
             # The initialize response's `instructions` is the server describing
             # itself: how Filament is organized, and how to write member and
@@ -898,12 +904,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     )
                     if not principal_id:
                         raise RuntimeError(
-                            "filament-fcm: get_self response missing "
+                            "filament: get_self response missing "
                             "owner.user_id — cannot determine principal"
                         )
-                    logger.info("filament-fcm: [Stage 1] principal is %s", principal_id)
+                    logger.info("filament: [Stage 1] principal is %s", principal_id)
                     slog.info(
-                        "filament_fcm.identity.loaded",
+                        "filament.identity.loaded",
                         agent_id=self._user_id,
                         principal_id=principal_id,
                         backchannel_id=self._cc_room_id,
@@ -933,13 +939,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
                             save_env_value("FILAMENT_HOME_ROOM", self._cc_room_id)
                             logger.info(
-                                "filament-fcm: [Stage 1] home channel set to "
+                                "filament: [Stage 1] home channel set to "
                                 "backchannel %s (persisted to .env)",
                                 self._cc_room_id,
                             )
                         except Exception:
                             logger.warning(
-                                "filament-fcm: [Stage 1] could not persist "
+                                "filament: [Stage 1] could not persist "
                                 "FILAMENT_HOME_ROOM to .env; using process env "
                                 "only (cron delivery may miss the home room "
                                 "after a restart)",
@@ -947,23 +953,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                             )
                 else:
                     raise RuntimeError(
-                        "filament-fcm: get_self returned unexpected data "
+                        "filament: get_self returned unexpected data "
                         "— cannot determine principal"
                     )
 
                 if self._user_id:
-                    logger.info(
-                        "filament-fcm: [Stage 1] agent identity: %s", self._user_id
-                    )
+                    logger.info("filament: [Stage 1] agent identity: %s", self._user_id)
                 else:
                     logger.warning(
-                        "filament-fcm: [Stage 1] could not determine agent mxid "
+                        "filament: [Stage 1] could not determine agent mxid "
                         "— mention stripping disabled"
                     )
             except Exception:
                 logger.exception(
-                    "filament-fcm: [Stage 1] get_self failed "
-                    "— cannot determine principal"
+                    "filament: [Stage 1] get_self failed — cannot determine principal"
                 )
                 raise
 
@@ -973,8 +976,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
             return True
         except Exception:
-            logger.exception("filament-fcm: [Stage 1] MCP initialization failed")
-            slog.exception("filament_fcm.stage.failed", stage="initialize_api")
+            logger.exception("filament: [Stage 1] MCP initialization failed")
+            slog.exception("filament.stage.failed", stage="initialize_api")
             return False
 
     async def _accept_pending_invites(self) -> None:
@@ -993,7 +996,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 return
             rooms = invites.get("rooms") or invites.get("invites") or []
             if not rooms:
-                logger.info("filament-fcm: no pending invites")
+                logger.info("filament: no pending invites")
                 return
             for invite in rooms:
                 loop_id = invite.get("room_id") if isinstance(invite, dict) else invite
@@ -1002,17 +1005,15 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 try:
                     with bound_context(call_origin="startup"):
                         await self._filament_api.accept_invite(loop_id)
-                    logger.info("filament-fcm: accepted invite to %s", loop_id)
+                    logger.info("filament: accepted invite to %s", loop_id)
                 except Exception:
                     logger.warning(
-                        "filament-fcm: failed to accept invite to %s",
+                        "filament: failed to accept invite to %s",
                         loop_id,
                         exc_info=True,
                     )
         except Exception:
-            logger.warning(
-                "filament-fcm: failed to list pending invites", exc_info=True
-            )
+            logger.warning("filament: failed to list pending invites", exc_info=True)
 
     async def _accept_vouch(
         self, loop_id: str, label: str | None = None, inviter: str | None = None
@@ -1029,11 +1030,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         ``FilamentAPI.is_retryable_error``); it is a decision, not a blip.
         """
         if not self._filament_api:
-            logger.warning("filament-fcm: vouch for %s but API not ready", loop_id)
+            logger.warning("filament: vouch for %s but API not ready", loop_id)
             return False
         name = label or loop_id
         if loop_id in self._vouch_accepts_in_flight:
-            logger.debug("filament-fcm: vouch for %s already being accepted", name)
+            logger.debug("filament: vouch for %s already being accepted", name)
             return False
         self._vouch_accepts_in_flight.add(loop_id)
         try:
@@ -1044,7 +1045,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     err = self._filament_api.result_error(result)
                     if not err:
                         logger.info(
-                            "filament-fcm: accepted vouch into %s%s "
+                            "filament: accepted vouch into %s%s "
                             "(pending loop-admin approval)",
                             name,
                             f" from {inviter}" if inviter else "",
@@ -1052,21 +1053,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         return True
                     if not self._filament_api.is_retryable_error(err) or last:
                         logger.warning(
-                            "filament-fcm: accept_vouch for %s REJECTED by "
+                            "filament: accept_vouch for %s REJECTED by "
                             "server after %d attempt(s): %s",
                             name,
                             attempt,
                             err,
                         )
                         slog.warning(
-                            "filament_fcm.vouch.accept_failed",
+                            "filament.vouch.accept_failed",
                             loop_id=loop_id,
                             attempts=attempt,
                             error=err,
                         )
                         return False
                     logger.warning(
-                        "filament-fcm: accept_vouch for %s failed transiently "
+                        "filament: accept_vouch for %s failed transiently "
                         "(attempt %d/%d): %s",
                         name,
                         attempt,
@@ -1076,21 +1077,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 except Exception:
                     if last:
                         logger.warning(
-                            "filament-fcm: accept_vouch for %s failed after "
-                            "%d attempt(s)",
+                            "filament: accept_vouch for %s failed after %d attempt(s)",
                             name,
                             attempt,
                             exc_info=True,
                         )
                         slog.warning(
-                            "filament_fcm.vouch.accept_failed",
+                            "filament.vouch.accept_failed",
                             loop_id=loop_id,
                             attempts=attempt,
                             error="exception",
                         )
                         return False
                     logger.warning(
-                        "filament-fcm: accept_vouch for %s raised "
+                        "filament: accept_vouch for %s raised "
                         "(attempt %d/%d), retrying",
                         name,
                         attempt,
@@ -1125,7 +1125,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 return
             vouches = parsed.get("vouches") or []
             if not vouches:
-                logger.info("filament-fcm: no pending vouches")
+                logger.info("filament: no pending vouches")
                 return
             for vouch in vouches:
                 loop_id = vouch.get("loop_id") if isinstance(vouch, dict) else vouch
@@ -1133,13 +1133,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     continue
                 await self._accept_vouch(loop_id)
         except Exception:
-            logger.warning("filament-fcm: failed to list vouches", exc_info=True)
+            logger.warning("filament: failed to list vouches", exc_info=True)
 
     async def _register_fcm(self) -> bool:
         """Stage 2: FCM checkin + registration → FCM token."""
         try:
-            logger.info("filament-fcm: [Stage 2] registering with FCM")
-            slog.info("filament_fcm.stage.start", stage="register_fcm")
+            logger.info("filament: [Stage 2] registering with FCM")
+            slog.info("filament.stage.start", stage="register_fcm")
             fcm_config = FCMConfig.from_env()
             self._fcm_client = FilamentFCMClient(
                 config=fcm_config,
@@ -1153,18 +1153,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             fcm_token = await self._fcm_client.checkin_or_register()
             logger.info(
-                "filament-fcm: [Stage 2] FCM registered (token fingerprint: %s)",
+                "filament: [Stage 2] FCM registered (token fingerprint: %s)",
                 fingerprint(fcm_token),
             )
             slog.info(
-                "filament_fcm.stage.complete",
+                "filament.stage.complete",
                 stage="register_fcm",
                 fcm_token_fingerprint=fingerprint(fcm_token),
             )
             return True
         except Exception:
-            logger.exception("filament-fcm: [Stage 2] FCM registration failed")
-            slog.exception("filament_fcm.stage.failed", stage="register_fcm")
+            logger.exception("filament: [Stage 2] FCM registration failed")
+            slog.exception("filament.stage.failed", stage="register_fcm")
             return False
 
     def _on_fcm_receiver_dead(self, detail: str) -> None:
@@ -1189,19 +1189,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def _register_pusher(self) -> bool:
         """Stage 3: Register FCM token with the Filament server via MCP tool."""
         if not self._filament_api or not self._fcm_client:
-            logger.error("filament-fcm: [Stage 3] skipped — missing API or FCM client")
+            logger.error("filament: [Stage 3] skipped — missing API or FCM client")
             return False
 
         try:
             fcm_token = self._fcm_client.fcm_token
             if not fcm_token:
-                logger.error("filament-fcm: [Stage 3] no FCM token available")
+                logger.error("filament: [Stage 3] no FCM token available")
                 return False
-            logger.info(
-                "filament-fcm: [Stage 3] registering push token with the server"
-            )
+            logger.info("filament: [Stage 3] registering push token with the server")
             slog.info(
-                "filament_fcm.stage.start",
+                "filament.stage.start",
                 stage="register_pusher",
                 fcm_token_fingerprint=fingerprint(fcm_token),
             )
@@ -1223,40 +1221,40 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
                 if error_msg:
                     logger.error(
-                        "filament-fcm: [Stage 3] push token registration error: %s",
+                        "filament: [Stage 3] push token registration error: %s",
                         error_msg,
                     )
                     slog.error(
-                        "filament_fcm.stage.failed",
+                        "filament.stage.failed",
                         stage="register_pusher",
                         error=error_msg,
                     )
                     return False
 
-            logger.info("filament-fcm: [Stage 3] push token registered successfully")
-            slog.info("filament_fcm.stage.complete", stage="register_pusher")
+            logger.info("filament: [Stage 3] push token registered successfully")
+            slog.info("filament.stage.complete", stage="register_pusher")
             return True
         except Exception:
-            logger.exception("filament-fcm: [Stage 3] push token registration failed")
-            slog.exception("filament_fcm.stage.failed", stage="register_pusher")
+            logger.exception("filament: [Stage 3] push token registration failed")
+            slog.exception("filament.stage.failed", stage="register_pusher")
             return False
 
     async def _start_listener(self) -> bool:
         """Stage 4: Start FCM push listener."""
         if not self._fcm_client:
-            logger.error("filament-fcm: [Stage 4] skipped — no FCM client")
+            logger.error("filament: [Stage 4] skipped — no FCM client")
             return False
 
         try:
-            logger.info("filament-fcm: [Stage 4] starting FCM listener")
-            slog.info("filament_fcm.stage.start", stage="start_listener")
+            logger.info("filament: [Stage 4] starting FCM listener")
+            slog.info("filament.stage.start", stage="start_listener")
             # start() creates internal asyncio tasks and returns immediately.
             # The client watches its own internal tasks and reports receiver
             # death via on_receiver_dead (see _on_fcm_receiver_dead).
             await self._fcm_client.start()
 
-            logger.info("filament-fcm: [Stage 4] FCM listener started")
-            slog.info("filament_fcm.stage.complete", stage="start_listener")
+            logger.info("filament: [Stage 4] FCM listener started")
+            slog.info("filament.stage.complete", stage="start_listener")
 
             # Presence heartbeat: a cheap authenticated MCP call every ~20s.
             # Server-side, any authenticated traffic marks the agent's
@@ -1267,8 +1265,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             return True
         except Exception:
-            logger.exception("filament-fcm: [Stage 4] failed to start FCM listener")
-            slog.exception("filament_fcm.stage.failed", stage="start_listener")
+            logger.exception("filament: [Stage 4] failed to start FCM listener")
+            slog.exception("filament.stage.failed", stage="start_listener")
             return False
 
     async def _heartbeat_loop(self, interval_seconds: int = 20) -> None:
@@ -1292,9 +1290,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             try:
                 with bound_context(call_origin="heartbeat"):
                     await self._filament_api.heartbeat()
-                logger.debug("filament-fcm: presence heartbeat sent")
+                logger.debug("filament: presence heartbeat sent")
             except Exception:
-                logger.warning("filament-fcm: presence heartbeat failed", exc_info=True)
+                logger.warning("filament: presence heartbeat failed", exc_info=True)
             # The hourly tool-inventory refresh piggybacks this timer: the
             # call rate-limits itself (at most one POST per hour) and never
             # raises, so it can't disturb the presence cadence.
@@ -1334,23 +1332,21 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             with bound_context(call_origin="probe_request"):
                 result = await self._filament_api.request_probe()
         except Exception:
-            logger.warning("filament-fcm: probe request failed", exc_info=True)
+            logger.warning("filament: probe request failed", exc_info=True)
             return
         if isinstance(result, dict) and result.get("no_push_tokens"):
             # We never registered for push, so no probe can arrive. Worth
             # saying out loud: the gateway is running but unreachable.
-            logger.warning(
-                "filament-fcm: probe requested but no push token is registered"
-            )
+            logger.warning("filament: probe requested but no push token is registered")
         else:
-            logger.debug("filament-fcm: probe requested")
+            logger.debug("filament: probe requested")
 
     # ── Update check ────────────────────────────────────────────────
 
     def _start_update_check(self) -> None:
         """Kick off the daily update-available check (idempotent)."""
         if update_check_disabled():
-            logger.info("filament-fcm: update check disabled by env")
+            logger.info("filament: update check disabled by env")
             return
         if self._update_check_task and not self._update_check_task.done():
             return
@@ -1369,7 +1365,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 if newer:
                     await self._notify_update_available(newer)
             except Exception:
-                logger.debug("filament-fcm: update check failed", exc_info=True)
+                logger.debug("filament: update check failed", exc_info=True)
             await asyncio.sleep(interval_seconds)
 
     async def _notify_update_available(self, latest: str) -> None:
@@ -1387,7 +1383,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         if isinstance(result, dict) and result.get("error"):
             logger.warning(
-                "filament-fcm: update reminder failed to send: %s",
+                "filament: update reminder failed to send: %s",
                 result.get("error"),
             )
             return
@@ -1413,11 +1409,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         try:
             result = await self._filament_api.post_message(room, text)
         except Exception:
-            logger.warning("filament-fcm: backchannel post failed", exc_info=True)
+            logger.warning("filament: backchannel post failed", exc_info=True)
             return False
         if isinstance(result, dict) and result.get("error"):
             logger.warning(
-                "filament-fcm: backchannel post rejected: %s", result.get("error")
+                "filament: backchannel post rejected: %s", result.get("error")
             )
             return False
         return True
@@ -1449,10 +1445,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         ok, output = await asyncio.to_thread(git_pull)
         if not ok:
-            logger.error("filament-fcm: upgrade git pull failed: %s", output)
+            logger.error("filament: upgrade git pull failed: %s", output)
             await self._post_backchannel(build_failure_notice(None, output))
             return
-        logger.info("filament-fcm: upgrade pulled: %s", output)
+        logger.info("filament: upgrade pulled: %s", output)
 
         # What the tree holds now, not what was advertised: a pull that left
         # us where we were (already current, or a checkout tracking something
@@ -1494,7 +1490,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 )
             )
             return
-        logger.info("filament-fcm: upgrade to v%s staged — gateway restarting", pulled)
+        logger.info("filament: upgrade to v%s staged — gateway restarting", pulled)
 
     async def _announce_completed_upgrade(self) -> None:
         """Post the result of an upgrade that restarted us. No-op otherwise.
@@ -1508,7 +1504,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         except Exception:
             # Announcing an upgrade is never worth failing a connect over.
             logger.warning(
-                "filament-fcm: could not read the pending-upgrade marker",
+                "filament: could not read the pending-upgrade marker",
                 exc_info=True,
             )
             return
@@ -1531,7 +1527,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # is a load problem (stale bytecode, a second copy winning on
             # sys.path), not something a retry fixes.
             logger.error(
-                "filament-fcm: upgrade to v%s did not take effect — still running v%s",
+                "filament: upgrade to v%s did not take effect — still running v%s",
                 target,
                 PLUGIN_VERSION,
             )
@@ -1542,7 +1538,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 room_id=room_id,
             )
             return
-        logger.info("filament-fcm: upgrade to v%s complete", PLUGIN_VERSION)
+        logger.info("filament: upgrade to v%s complete", PLUGIN_VERSION)
         await self._post_backchannel(
             build_complete_notice(PLUGIN_VERSION), room_id=room_id
         )
@@ -1576,7 +1572,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         logger.info("Disconnected")
         slog.info(
-            "filament_fcm.adapter.disconnected",
+            "filament.adapter.disconnected",
             gateway_instance_id=self._gateway_instance_id,
             had_fcm_client=self._fcm_client is not None,
             had_heartbeat=self._heartbeat_task is not None,
@@ -1630,7 +1626,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     and hasattr(self._filament_api, "set_status")
                 ):
                     slog.info(
-                        "filament_fcm.send.notice_as_status",
+                        "filament.send.notice_as_status",
                         installation_id=self._installation_id,
                         send_id=send_id,
                         chat_id=chat_id,
@@ -1651,12 +1647,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         # A failed status must not swallow the notice — fall
                         # through and post it like before.
                         logger.debug(
-                            "filament-fcm: notice status failed; posting",
+                            "filament: notice status failed; posting",
                             exc_info=True,
                         )
 
                 slog.info(
-                    "filament_fcm.send.start",
+                    "filament.send.start",
                     installation_id=self._installation_id,
                     send_id=send_id,
                     send_kind=send_kind,
@@ -1684,7 +1680,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 event_id = _result_event_id(result)
                 if isinstance(result, dict) and result.get("error"):
                     slog.warning(
-                        "filament_fcm.send.complete",
+                        "filament.send.complete",
                         installation_id=self._installation_id,
                         send_id=send_id,
                         send_kind=send_kind,
@@ -1702,7 +1698,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     )
 
                 slog.info(
-                    "filament_fcm.send.complete",
+                    "filament.send.complete",
                     installation_id=self._installation_id,
                     send_id=send_id,
                     send_kind=send_kind,
@@ -1716,7 +1712,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.exception("Failed to send message")
                 slog.exception(
-                    "filament_fcm.send.failed",
+                    "filament.send.failed",
                     installation_id=self._installation_id,
                     send_id=send_id,
                     send_kind=send_kind,
@@ -1742,14 +1738,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         async def _pong() -> None:
             if not self._filament_api:
-                logger.warning("filament-fcm: ping received but API not ready")
+                logger.warning("filament: ping received but API not ready")
                 return
             try:
                 with bound_context(call_origin="ping_pong"):
                     await self._filament_api.pong(nonce)
-                logger.info("filament-fcm: pong sent (nonce=%s)", nonce)
+                logger.info("filament: pong sent (nonce=%s)", nonce)
             except Exception:
-                logger.exception("filament-fcm: pong failed")
+                logger.exception("filament: pong failed")
 
         self._schedule_async(_pong(), "pong")
 
@@ -1762,20 +1758,20 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         async def _accept() -> None:
             if not self._filament_api:
-                logger.warning("filament-fcm: invite received but API not ready")
+                logger.warning("filament: invite received but API not ready")
                 return
             try:
                 with bound_context(call_origin="invite_accept"):
                     await self._filament_api.accept_invite(invite.room_id)
                 logger.info(
-                    "filament-fcm: accepted invite to %s (%s) from %s",
+                    "filament: accepted invite to %s (%s) from %s",
                     invite.room_name or invite.room_id,
                     invite.branch_type,
                     invite.inviter,
                 )
             except Exception:
                 logger.exception(
-                    "filament-fcm: failed to accept invite to %s",
+                    "filament: failed to accept invite to %s",
                     invite.room_id,
                 )
 
@@ -1807,7 +1803,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         Schedules async handling on the event loop.
         """
         slog.info(
-            "filament_fcm.message.scheduled",
+            "filament.message.scheduled",
             installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             fcm_client_id=msg.fcm_client_id,
@@ -1903,7 +1899,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         principal message is control and every other message is reactive data.
         """
         logger.info(
-            "filament-fcm: message event=%s from %s (%s) in %s (room=%s, "
+            "filament: message event=%s from %s (%s) in %s (room=%s, "
             "direct=%s, thread=%s, is_mention=%s, everyone=%s)",
             msg.event_id,
             msg.sender_display_name or msg.sender,
@@ -1916,7 +1912,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             msg.is_everyone_mention,
         )
         slog.info(
-            "filament_fcm.turn.start",
+            "filament.turn.start",
             turn_id=turn_id,
             event_id=msg.event_id,
             room_id=msg.room_id,
@@ -1931,9 +1927,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
 
         if not self._is_new_event(msg.event_id):
-            logger.info("filament-fcm: duplicate event %s — skipping", msg.event_id)
+            logger.info("filament: duplicate event %s — skipping", msg.event_id)
             slog.info(
-                "filament_fcm.turn.skipped",
+                "filament.turn.skipped",
                 turn_id=turn_id,
                 event_id=msg.event_id,
                 reason="event_id_seen",
@@ -1941,9 +1937,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return
 
         if self._user_id and msg.sender == self._user_id:
-            logger.info("filament-fcm: ignoring our own message %s", msg.event_id)
+            logger.info("filament: ignoring our own message %s", msg.event_id)
             slog.info(
-                "filament_fcm.turn.skipped",
+                "filament.turn.skipped",
                 turn_id=turn_id,
                 event_id=msg.event_id,
                 reason="own_message",
@@ -1959,26 +1955,24 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         is_backchannel = self._is_control_channel(msg.room_id)
         is_principal = self._is_principal(msg.sender)
         if is_backchannel:
-            logger.info("filament-fcm: → CONTROL plane (backchannel %s)", msg.room_id)
-            slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
+            logger.info("filament: → CONTROL plane (backchannel %s)", msg.room_id)
+            slog.info("filament.turn.route", turn_id=turn_id, plane="control")
             await self._handle_control_message(msg)
-            slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="control")
+            slog.info("filament.turn.dispatched", turn_id=turn_id, plane="control")
             return
 
         # DMs have no shared audience whose wake policy needs to be respected.
         # The owner carries authority into any DM, including one other than the
         # designated backchannel. Non-owner DMs keep the existing reactive path.
         if is_principal and msg.is_direct:
-            logger.info(
-                "filament-fcm: → CONTROL plane (principal DM in %s)", msg.room_id
-            )
-            slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
+            logger.info("filament: → CONTROL plane (principal DM in %s)", msg.room_id)
+            slog.info("filament.turn.route", turn_id=turn_id, plane="control")
             await self._handle_control_message(msg)
-            slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="control")
+            slog.info("filament.turn.dispatched", turn_id=turn_id, plane="control")
             return
 
         logger.info(
-            "filament-fcm: applying shared-channel wake gate in %s (backchannel=%s)",
+            "filament: applying shared-channel wake gate in %s (backchannel=%s)",
             msg.room_id,
             self._cc_room_id,
         )
@@ -1997,12 +1991,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # treated as system.
         if is_system_sender(msg.sender, self._user_id):
             logger.info(
-                "filament-fcm: skipping system notice from %s in %s",
+                "filament: skipping system notice from %s in %s",
                 msg.sender,
                 msg.room_name,
             )
             slog.info(
-                "filament_fcm.turn.skipped",
+                "filament.turn.skipped",
                 turn_id=turn_id,
                 event_id=msg.event_id,
                 reason="system_notice",
@@ -2038,7 +2032,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             msg.room_id, mentioned or thread_follow_up
         ):
             logger.info(
-                "filament-fcm: skipping message in %s (wake policy: not woken; "
+                "filament: skipping message in %s (wake policy: not woken; "
                 "mention=%s, everyone=%s, thread_follow_up=%s, "
                 "reply_to_me=%s)",
                 msg.room_name,
@@ -2048,7 +2042,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 msg.is_reply_to_me,
             )
             slog.info(
-                "filament_fcm.turn.skipped",
+                "filament.turn.skipped",
                 turn_id=turn_id,
                 reason="wake_policy",
                 mentioned=mentioned,
@@ -2068,16 +2062,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # never through the data-plane envelope below.
         if is_principal:
             logger.info(
-                "filament-fcm: → CONTROL plane (principal in shared room %s)",
+                "filament: → CONTROL plane (principal in shared room %s)",
                 msg.room_id,
             )
-            slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="control")
+            slog.info("filament.turn.route", turn_id=turn_id, plane="control")
             await self._handle_control_message(msg)
-            slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="control")
+            slog.info("filament.turn.dispatched", turn_id=turn_id, plane="control")
             return
 
-        logger.info("filament-fcm: → REACTIVE plane (non-principal sender)")
-        slog.info("filament_fcm.turn.route", turn_id=turn_id, plane="reactive")
+        logger.info("filament: → REACTIVE plane (non-principal sender)")
+        slog.info("filament.turn.route", turn_id=turn_id, plane="reactive")
 
         # Where the reply lands is a per-channel wake-policy choice. Default
         # ("thread") threads off the triggering message: a top-level message
@@ -2127,7 +2121,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # conversation, shown or skipped as the agent's own.
         if newest:
             self._seen_history.record(key, newest[0], newest[1])
-        slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
+        slog.info("filament.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     @staticmethod
     def _server_guidance_text(instructions: str) -> str:
@@ -2166,7 +2160,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             messages = parsed.get("messages", []) if isinstance(parsed, dict) else []
         except Exception:  # enrichment only, never fatal to a turn
             logger.warning(
-                "filament-fcm: context breadcrumb read failed for %s",
+                "filament: context breadcrumb read failed for %s",
                 channel,
                 exc_info=True,
             )
@@ -2232,7 +2226,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 if newest:
                     cursors.record(channel, newest)
             logger.info(
-                "filament-fcm: inline context for %s: %d unseen of %d read",
+                "filament: inline context for %s: %d unseen of %d read",
                 channel,
                 len(unseen),
                 len(messages),
@@ -2245,7 +2239,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             last_seen_event_id=cursor,
         )
         logger.info(
-            "filament-fcm: context breadcrumb for %s: %d messages read, cue=%s",
+            "filament: context breadcrumb for %s: %d messages read, cue=%s",
             channel,
             len(messages),
             "set" if crumb else "none",
@@ -2295,7 +2289,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 messages = [m for m in messages if isinstance(m, dict)]
         except Exception:  # enrichment only, never fatal to a turn
             logger.warning(
-                "filament-fcm: history read failed for %s", channel, exc_info=True
+                "filament: history read failed for %s", channel, exc_info=True
             )
             return None, None, None
         seen = self._seen_history.get(key)
@@ -2305,7 +2299,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         newest = timeline.newest_message({"messages": messages})
         if not unseen:
             logger.info(
-                "filament-fcm: history for %s: %d read, nothing new", key, len(messages)
+                "filament: history for %s: %d read, nothing new", key, len(messages)
             )
             return None, None, newest
         try:
@@ -2322,7 +2316,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 newest,
             )
         logger.info(
-            "filament-fcm: history for %s: %d unseen of %d read, inlined",
+            "filament: history for %s: %d unseen of %d read, inlined",
             key,
             len(unseen),
             len(messages),
@@ -2355,7 +2349,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             parsed = FilamentAPI.parse_tool_result(raw)
         except Exception:
             logger.warning(
-                "filament-fcm: get_thread failed classifying sender %s in %s",
+                "filament: get_thread failed classifying sender %s in %s",
                 msg.sender,
                 msg.room_id,
                 exc_info=True,
@@ -2365,7 +2359,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if verdict is not None:
             self._sender_is_agent_cache[msg.sender] = verdict
         logger.info(
-            "filament-fcm: sender %s classified is_agent=%s (thread %s)",
+            "filament: sender %s classified is_agent=%s (thread %s)",
             msg.sender,
             verdict,
             msg.thread_id,
@@ -2540,7 +2534,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             msg.room_id,
         )
         slog.info(
-            "filament_fcm.control.dispatch",
+            "filament.control.dispatch",
             event_id=msg.event_id,
             room_id=msg.room_id,
             thread_id=thread_id,
@@ -2605,7 +2599,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             parsed = FilamentAPI.parse_tool_result(raw)
         except Exception:
             logger.warning(
-                "filament-fcm: list_channels failed for slash command",
+                "filament: list_channels failed for slash command",
                 exc_info=True,
             )
             return [], backchannel
@@ -2635,7 +2629,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         server document, and sends the confirmation/help reply. No LLM is
         ever involved, in success or failure."""
         slog.info(
-            "filament_fcm.slash.dispatch",
+            "filament.slash.dispatch",
             event_id=msg.event_id,
             room_id=msg.room_id,
         )
@@ -2743,7 +2737,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         else:
             text = slash.render_reply(result)
         logger.info(
-            "filament-fcm: slash command → %s (sections=%s)",
+            "filament: slash command → %s (sections=%s)",
             type(result).__name__,
             list(sections),
         )
@@ -2758,14 +2752,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         send_result = await self.send(msg.room_id, text, metadata=metadata)
         if not send_result.success:
             logger.warning(
-                "filament-fcm: slash reply failed to send: %s",
+                "filament: slash reply failed to send: %s",
                 send_result.error,
             )
 
     def _on_reaction(self, reaction: ReactionMessage) -> None:
         """An emoji reaction arrived via FCM (a potential wake-up signal)."""
         slog.info(
-            "filament_fcm.reaction.scheduled",
+            "filament.reaction.scheduled",
             installation_id=self._installation_id,
             gateway_instance_id=self._gateway_instance_id,
             fcm_client_id=reaction.fcm_client_id,
@@ -2797,7 +2791,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """Reactive plane: an emoji reaction wakes the agent if the wake policy
         lists that emoji as a trigger for the channel."""
         logger.info(
-            "filament-fcm: reaction %s by %s (%s) on %s in %s (room=%s)",
+            "filament: reaction %s by %s (%s) on %s in %s (room=%s)",
             reaction.key,
             reaction.sender_display_name or reaction.sender,
             reaction.sender,
@@ -2806,11 +2800,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             reaction.room_id,
         )
         if not self._is_new_event(reaction.event_id):
-            logger.info(
-                "filament-fcm: duplicate reaction %s — skipping", reaction.event_id
-            )
+            logger.info("filament: duplicate reaction %s — skipping", reaction.event_id)
             slog.info(
-                "filament_fcm.turn.skipped",
+                "filament.turn.skipped",
                 turn_id=turn_id,
                 event_id=reaction.event_id,
                 reason="event_id_seen",
@@ -2819,36 +2811,34 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Never wake on our own reactions - otherwise the agent would re-wake
         # itself in an infinite loop if one were configured as a trigger.
         if self._user_id and reaction.sender == self._user_id:
-            logger.info("filament-fcm: ignoring our own reaction %s", reaction.key)
-            slog.info(
-                "filament_fcm.turn.skipped", turn_id=turn_id, reason="own_reaction"
-            )
+            logger.info("filament: ignoring our own reaction %s", reaction.key)
+            slog.info("filament.turn.skipped", turn_id=turn_id, reason="own_reaction")
             return
         # Same server-config refresh as the message path, before the wake
         # policy below is read fresh. TTL-cached; never raises.
         await self._server_config.sync()
         if self._is_control_channel(reaction.room_id):
-            logger.info("filament-fcm: ignoring reaction in backchannel")
+            logger.info("filament: ignoring reaction in backchannel")
             slog.info(
-                "filament_fcm.turn.skipped",
+                "filament.turn.skipped",
                 turn_id=turn_id,
                 reason="backchannel_reaction",
             )
             return  # reactions in the backchannel are not wake signals
         if not self._wake_policy.should_wake_reaction(reaction.room_id, reaction.key):
             logger.info(
-                "filament-fcm: reaction %s not a wake trigger — skipping",
+                "filament: reaction %s not a wake trigger — skipping",
                 reaction.key,
             )
             slog.info(
-                "filament_fcm.turn.skipped",
+                "filament.turn.skipped",
                 turn_id=turn_id,
                 reason="wake_policy",
                 key=reaction.key,
             )
             return
         slog.info(
-            "filament_fcm.turn.start",
+            "filament.turn.start",
             turn_id=turn_id,
             event_id=reaction.event_id,
             target_event_id=reaction.target_event_id,
@@ -2878,7 +2868,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             wake_event_id=reaction.event_id,
             is_direct=reaction.is_direct,
         )
-        slog.info("filament_fcm.turn.dispatched", turn_id=turn_id, plane="reactive")
+        slog.info("filament.turn.dispatched", turn_id=turn_id, plane="reactive")
 
     async def _wake(
         self,
@@ -3001,7 +2991,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             channel_prompt=framing.TOOL_MAP_PROMPT,
         )
         logger.info(
-            "filament-fcm: WAKE → reactive turn: trigger=%s channel=%s sender=%s "
+            "filament: WAKE → reactive turn: trigger=%s channel=%s sender=%s "
             "(instructions=%d chars, envelope=%d chars, zone=data)",
             trigger,
             channel_name,
@@ -3010,7 +3000,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             len(envelope),
         )
         slog.info(
-            "filament_fcm.reactive.dispatch",
+            "filament.reactive.dispatch",
             channel_id=channel,
             channel_name=channel_name,
             sender=sender,
@@ -3024,7 +3014,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # makes each turn's resolution greppable in gateway.log.
         scope_kind, scope_id = conversation_key(channel, thread_id)
         logger.info(
-            "filament-fcm: session scope: %s %s (%s)",
+            "filament: session scope: %s %s (%s)",
             scope_kind,
             scope_id,
             "root + replies"
@@ -3093,7 +3083,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not target or not self._filament_api:
             return
         slog.debug(
-            "filament_fcm.processing.start",
+            "filament.processing.start",
             target_event_id=target,
         )
         room_id = getattr(event, "chat_id", None)
@@ -3114,7 +3104,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not target or not self._filament_api:
             return
         slog.debug(
-            "filament_fcm.processing.complete",
+            "filament.processing.complete",
             target_event_id=target,
             outcome=str(outcome),
         )

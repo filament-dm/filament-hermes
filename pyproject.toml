@@ -1,5 +1,5 @@
 [project]
-name = "hermes-filament-fcm"
+name = "filament"
 version = "0.14.1"
 description = "Hermes gateway adapter for Filament"
 requires-python = ">=3.9"
@@ -26,11 +26,12 @@ dev = [
 ]
 
 [project.scripts]
-filament-fcm-setup = "hermes_filament_fcm.setup_cli:main"
+filament-setup = "filament.setup_cli:main"
+filament-fcm-setup = "filament.setup_cli:main"
 
 # NOTE: no ``[project.entry-points."hermes_agent.plugins"]`` here.
 # This plugin installs as a *directory plugin* (git-cloned into
-# ~/.hermes/plugins/filament-fcm by `hermes plugins install`), discovered via
+# ~/.hermes/plugins/filament by `hermes plugins install`), discovered via
 # its root plugin.yaml + __init__.py — NOT as a pip entry-point plugin.
 # Registering an entry point too would shadow the directory copy (entry points
 # win the loader's dedup), so `hermes plugins update` would git-pull code that
@@ -48,7 +49,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["hermes_filament_fcm"]
+packages = ["filament", "hermes_filament_fcm"]
 
 [tool.ruff]
 # vendor/ is third-party code unpacked byte-for-byte — from PyPI wheels, and for

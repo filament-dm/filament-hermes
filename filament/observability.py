@@ -35,7 +35,7 @@ class _FallbackLogger:
     **fields)``, rendering ``event key=value`` so logs stay readable.
     """
 
-    def __init__(self, name: str = "gateway.filament_fcm", **bound: Any) -> None:
+    def __init__(self, name: str = "gateway.filament", **bound: Any) -> None:
         self._logger = logging.getLogger(name)
         self._bound = bound
 
@@ -118,7 +118,7 @@ _CONTEXT_KEYS = {
 }
 
 
-def get_logger(name: str = "gateway.filament_fcm") -> Any:
+def get_logger(name: str = "gateway.filament") -> Any:
     if structlog is None:
         return _FallbackLogger(name)
     return structlog.get_logger(name)

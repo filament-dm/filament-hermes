@@ -1,4 +1,4 @@
-"""Exit-code semantics of the filament-fcm-setup entry point.
+"""Exit-code semantics of the filament-setup entry point.
 
 A scripted (hosted) install must fail loudly when setup does not complete,
 but an interactive operator declining "Reconfigure?" on a working install
@@ -16,9 +16,7 @@ from pathlib import Path
 
 import pytest
 
-_SETUP_CLI = (
-    Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "setup_cli.py"
-)
+_SETUP_CLI = Path(__file__).resolve().parent.parent / "filament" / "setup_cli.py"
 
 
 def _extract(name: str, ns: dict):
