@@ -397,6 +397,19 @@ predates 0.8.0. Install an older ref with that ref's own installer instead: \
 curl -fsSL https://raw.githubusercontent.com/filament-dm/filament-hermes/\
 ${PLUGIN_REF:-main}/install.sh | CONNECT_TOKEN=... bash"
 
+# Select from the clone before replacing a working install. A pinned ref may
+# predate the package rename; a current clone also contains a legacy alias, so
+# prefer the maintained package when both layouts are present.
+# BEGIN setup-package (extracted and run by tests/test_install_sh.py)
+if [ -f "$CLONE_TMP/filament/setup_cli.py" ]; then
+  SETUP_PACKAGE=filament
+elif [ -f "$CLONE_TMP/hermes_filament_fcm/setup_cli.py" ]; then
+  SETUP_PACKAGE=hermes_filament_fcm
+else
+  err "ref '${PLUGIN_REF:-default}' has no supported setup package; leaving the existing plugin in place."
+fi
+# END setup-package
+
 # Install the plugin's declared runtime dependencies, read straight from the
 # cloned pyproject.toml ([project.dependencies]) so this installer never drifts
 # from what the code needs. Done before the swap below, so a failed dep install
@@ -567,7 +580,7 @@ fi
 
 info "Connecting to Filament ..."
 # Run the setup wizard with the venv Python and the plugin dir (plus any durable
-# dep target) on PYTHONPATH, so `filament` imports from the clone.
+# dep target) on PYTHONPATH, so the selected package imports from the clone.
 # The package is not pip-installed, so there is no console script to run.
 run_setup() {
   # When this script owns the gateway restart — an s6 bounce (any supervised
@@ -578,8 +591,8 @@ run_setup() {
   # bounce moments later.
   PYTHONPATH="$PLUGIN_DIR${PYPATH_PREFIX:+:$PYPATH_PREFIX}${PYTHONPATH:+:$PYTHONPATH}" \
     FILAMENT_SETUP_SKIP_RESTART="${SCRIPT_OWNS_RESTART:-}" \
-    "$PY" -c 'from filament.setup_cli import main; main()' "$@"
-  # Not `-m filament.setup_cli`: the package __init__ imports
+    "$PY" -c "from $SETUP_PACKAGE.setup_cli import main; main()" "$@"
+  # Not `-m <package>.setup_cli`: the package __init__ imports
   # setup_cli, so runpy then finds it already in sys.modules and prints a
   # RuntimeWarning at the top of the wizard.
 }
