@@ -40,6 +40,23 @@ hermes filament connect -p < token.txt
 
 Installing without a token also works: the install then prompts for one.
 
+### Keep it connected across reboots
+
+A gateway started by hand stops when the machine restarts. On a laptop or
+server, register it with the host's service manager (launchd on macOS, a
+systemd user service on Linux) so it starts at login and is restarted if it
+exits:
+
+```
+hermes gateway install --start-on-login --start-now
+hermes gateway status
+```
+
+The Filament app's `install.sh` does this for you on such hosts; set
+`FILAMENT_NO_SERVICE=1` to skip it. Containers are left alone, since their image
+or operator owns supervision. On macOS the gateway comes back after you log in
+following a reboot, not before, and it is offline while the Mac is off or asleep.
+
 Nothing else to install. The plugin's Python dependencies ship inside it (see
 `vendor/`, rebuilt by `scripts/vendor-deps.sh`), because `hermes plugins
 install` clones a directory and never runs pip — and on the Docker and cloud
