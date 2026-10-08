@@ -10,7 +10,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 _spec = importlib.util.spec_from_file_location(
     "turn_context", _PKG_DIR / "turn_context.py"

@@ -10,7 +10,7 @@ import types
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
-_DEPS_PATH = Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "deps.py"
+_DEPS_PATH = Path(__file__).resolve().parent.parent / "filament" / "deps.py"
 
 
 def _load_deps():

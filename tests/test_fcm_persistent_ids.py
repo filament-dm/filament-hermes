@@ -16,7 +16,7 @@ from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
     "credentials",
-    Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "credentials.py",
+    Path(__file__).resolve().parent.parent / "filament" / "credentials.py",
 )
 credentials = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(credentials)

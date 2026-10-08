@@ -1,4 +1,4 @@
-# Filament (FCM) installed
+# Filament installed
 
 Connect it with the agent token from Filament's connect flow:
 
@@ -33,7 +33,7 @@ Then check it came up:
 hermes gateway status
 ```
 
-The gateway log should show `filament-fcm connected` and `push token
+The gateway log should show `filament: connected successfully` and `push token
 registered`. If the platform stays down, the log says why — the usual cause is
 `FILAMENT_MCP_TOKEN` not being set (re-run the install, or add it to your
 `.env`).

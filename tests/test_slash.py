@@ -14,7 +14,7 @@ redirect, pinned here too.
 import importlib.util
 from pathlib import Path
 
-_PKG = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _load(name):

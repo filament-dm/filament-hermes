@@ -32,7 +32,7 @@ from ._version import (
 )
 from .credentials import CredentialStore
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 
@@ -76,11 +76,11 @@ async def fetch_latest_version(timeout: float = 10.0) -> str | None:
         ) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
-                logger.debug("filament-fcm: update check got HTTP %d", resp.status_code)
+                logger.debug("filament: update check got HTTP %d", resp.status_code)
                 return None
             return version_from_pyproject(resp.text)
     except Exception:
-        logger.debug("filament-fcm: update check fetch failed", exc_info=True)
+        logger.debug("filament: update check fetch failed", exc_info=True)
         return None
 
 
@@ -105,15 +105,14 @@ class UpdateChecker:
         latest = await fetch_latest_version()
         if not latest or not is_newer(latest, self._current):
             logger.debug(
-                "filament-fcm: update check — running v%s, latest v%s",
+                "filament: update check — running v%s, latest v%s",
                 self._current,
                 latest,
             )
             return None
         # Always log (operator-visible), remind at most once per version.
         logger.warning(
-            "filament-fcm: plugin update available — v%s is out, this agent "
-            "runs v%s (%s)",
+            "filament: plugin update available — v%s is out, this agent runs v%s (%s)",
             latest,
             self._current,
             REPO_URL,

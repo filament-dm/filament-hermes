@@ -7,18 +7,16 @@ AST: setup_cli's imports need Hermes.
 """
 
 import ast
+import importlib.util
 import os
 from pathlib import Path
 
 import pytest
 import yaml
 
-_SETUP_CLI = (
-    Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "setup_cli.py"
-)
+_SETUP_CLI = Path(__file__).resolve().parent.parent / "filament" / "setup_cli.py"
 
 _WANTED = (
-    "PLATFORM_NAME",
     "_BUSY_DEFAULTS",
     "_PLATFORM_DISPLAY_DEFAULTS",
     "_find_hermes_home",
@@ -45,9 +43,15 @@ def _load():
     return ns
 
 
+_spec = importlib.util.spec_from_file_location(
+    "filament_naming", _SETUP_CLI.parent / "naming.py"
+)
+naming = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(naming)
 _ns = _load()
+_ns["platform_name"] = naming.platform_name
 seed_display_defaults = _ns["seed_display_defaults"]
-PLATFORM_NAME = _ns["PLATFORM_NAME"]
+PLATFORM_NAME = naming.PLATFORM_NAME
 
 
 @pytest.fixture
@@ -144,3 +148,33 @@ def test_empty_display_section_is_filled(config_path):
     config_path.write_text("display:\n")
     seed_display_defaults()
     assert _read(config_path)["display"]["busy_input_mode"] == "queue"
+
+
+@pytest.mark.parametrize("section", ["platforms", "display.platforms"])
+def test_legacy_platform_keeps_sessions_and_explicit_choices(config_path, section):
+    legacy = naming.LEGACY_PLATFORM_NAME
+    config = {"platforms": {legacy: {"enabled": True, "extra": {"custom": True}}}}
+    if section == "display.platforms":
+        config = {"display": {"platforms": {legacy: {"show_reasoning": True}}}}
+    config_path.write_text(yaml.safe_dump(config))
+    assert naming.platform_name() == legacy
+    seed_display_defaults()
+    saved = _read(config_path)
+    assert PLATFORM_NAME not in saved["display"]["platforms"]
+    if section == "platforms":
+        assert saved["platforms"] == config["platforms"]
+    else:
+        assert saved["display"]["platforms"][legacy]["show_reasoning"] is True
+
+
+def test_named_profile_does_not_inherit_root_platform(config_path, monkeypatch):
+    root = config_path.parent
+    monkeypatch.setenv("HOME", str(root))
+    (root / ".hermes" / naming.LEGACY_PLATFORM_NAME).mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root / ".hermes/profiles/new-agent"))
+    assert naming.platform_name() == PLATFORM_NAME
+
+
+def test_legacy_state_selects_legacy_platform(config_path):
+    (config_path.parent / naming.LEGACY_PLATFORM_NAME).mkdir()
+    assert naming.platform_name() == naming.LEGACY_PLATFORM_NAME

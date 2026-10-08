@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Setup CLI for hermes-filament-fcm.
+"""Setup CLI for filament.
 
 Handles the chicken-and-egg problem where `hermes gateway setup` can't
 see the plugin until it's in `plugins.enabled`, but the setup wizard is
 supposed to handle enabling it.
 
 This script:
-  1. Adds 'filament-fcm' to plugins.enabled in config.yaml
+  1. Adds 'filament' to plugins.enabled in config.yaml
   2. Runs the interactive setup (prompts for token, senders, URL)
   3. Restarts the gateway
 
 Usage:
-    filament-fcm-setup
+    filament-setup
 """
 
 import asyncio
@@ -35,6 +35,7 @@ from hermes_cli.setup import (
 )
 
 from .filament_api import FilamentAPI
+from .naming import platform_name
 
 # PyYAML on the venv-layout Hermes every existing host runs. Hermes on its newer
 # pm-managed layout no longer ships PyYAML and routes all YAML through its own
@@ -73,8 +74,8 @@ def _find_hermes_home() -> Path:
 # LEGACY_PLUGIN_ID is what it was called before, which an older install
 # still has enabled.
 #
-# Neither the platform name nor the state directory ~/.hermes/filament-fcm/
-# follows this id — both keep the old spelling, so renaming moves no state.
+# Existing installations retain their platform key and state directory to keep
+# Hermes sessions and per-platform operator settings intact.
 PLUGIN_ID = "filament"
 LEGACY_PLUGIN_ID = "filament-fcm"
 
@@ -104,7 +105,7 @@ def legacy_dir_is_ours(path: Path) -> bool:
     """
     if path.is_symlink() or not path.is_dir():
         return False
-    return (path / "hermes_filament_fcm").is_dir()
+    return any((path / name).is_dir() for name in ("filament", "hermes_filament_fcm"))
 
 
 def running_from(path: Path) -> bool:
@@ -221,7 +222,7 @@ def _enable_plugin() -> None:
 # writes the same per-platform key). The interim and reasoning gates are scoped
 # to our platform, and a per-platform value beats the global one; the busy
 # knobs have no per-platform form in Hermes, and the gateway reads them at start.
-PLATFORM_NAME = "filament-fcm"
+
 _BUSY_DEFAULTS = {"busy_input_mode": "queue", "busy_ack_enabled": False}
 _PLATFORM_DISPLAY_DEFAULTS = {
     "interim_assistant_messages": False,
@@ -251,7 +252,8 @@ def seed_display_defaults(*, announce: bool = True) -> list[str]:
             config = yaml.safe_load(f) or {}
 
     display = _subdict(config, "display")
-    ours = _subdict(_subdict(display, "platforms"), PLATFORM_NAME)
+    name = platform_name()
+    ours = _subdict(_subdict(display, "platforms"), name)
     missing = {k: v for k, v in _BUSY_DEFAULTS.items() if k not in display}
     missing_ours = {
         k: v for k, v in _PLATFORM_DISPLAY_DEFAULTS.items() if k not in ours
@@ -267,7 +269,7 @@ def seed_display_defaults(*, announce: bool = True) -> list[str]:
     if announce:
         print_info(f"Set chat display defaults in {config_path}")
     return [f"display.{k}" for k in missing] + [
-        f"display.platforms.{PLATFORM_NAME}.{k}" for k in missing_ours
+        f"display.platforms.{name}.{k}" for k in missing_ours
     ]
 
 
@@ -712,9 +714,9 @@ def _restart_gateway() -> None:
 
 
 def main() -> None:
-    """Entry point for the filament-fcm-setup command."""
+    """Entry point for the filament-setup command."""
     print()
-    print_header("filament-fcm-setup")
+    print_header("filament-setup")
 
     migrate_legacy_install()
     seed_display_defaults()

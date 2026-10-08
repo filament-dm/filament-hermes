@@ -32,7 +32,7 @@ def register(ctx) -> None:
     # top-level import of the package then fails, and every test errors. Hermes
     # calls register() inside the try/except that guards the module exec, so an
     # ImportError is still reported as the plugin's load error.
-    from .hermes_filament_fcm import register as _register  # noqa: PLC0415
+    from .filament import register as _register  # noqa: PLC0415
 
     return _register(ctx)
 

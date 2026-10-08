@@ -36,7 +36,7 @@ from pathlib import Path
 from ._version import version_from_pyproject
 from .credentials import CredentialStore
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
 # git pull over a slow link, with the vendor tree in the same repo.
 GIT_PULL_TIMEOUT_SECONDS = 120
@@ -81,7 +81,7 @@ def build_failure_notice(latest: str | None, reason: str) -> str:
 def plugin_root() -> Path:
     """The plugin's own directory — this package's parent.
 
-    ``<plugin_root>/hermes_filament_fcm/self_update.py``, so two levels up
+    ``<plugin_root>/filament/self_update.py``, so two levels up
     is the tree ``hermes plugins install`` cloned (and the repo root in a
     dev checkout).
     """
@@ -164,7 +164,7 @@ def working_tree_is_clean(root: Path | None = None) -> tuple[bool, str]:
 def on_a_tracking_branch(root: Path | None = None) -> tuple[bool, str]:
     """Whether the tree is on a branch that tracks a remote.
 
-    ``FILAMENT_FCM_REF`` accepts a commit as well as a branch, and installing
+    ``FILAMENT_REF`` accepts a commit as well as a branch, and installing
     at a commit leaves a detached HEAD. ``git pull`` there fails with "you are
     not currently on a branch" after printing its whole fetch - naming the
     situation is far more use to the principal than that.
@@ -318,7 +318,7 @@ def request_gateway_restart() -> bool:
         from gateway.run import _gateway_runner_ref  # noqa: PLC0415
     except Exception:
         logger.warning(
-            "filament-fcm: cannot reach the gateway runner to restart "
+            "filament: cannot reach the gateway runner to restart "
             "(hermes internals moved?)",
             exc_info=True,
         )
@@ -326,7 +326,7 @@ def request_gateway_restart() -> bool:
 
     runner = _gateway_runner_ref()
     if runner is None:
-        logger.warning("filament-fcm: no live gateway runner to restart")
+        logger.warning("filament: no live gateway runner to restart")
         return False
 
     via_service = _under_service_manager()
@@ -335,5 +335,5 @@ def request_gateway_restart() -> bool:
             runner.request_restart(detached=not via_service, via_service=via_service)
         )
     except Exception:
-        logger.warning("filament-fcm: gateway restart request failed", exc_info=True)
+        logger.warning("filament: gateway restart request failed", exc_info=True)
         return False

@@ -293,7 +293,7 @@ agents will answer each other indefinitely.
 ## Module layout
 
 Use flat modules rather than a `turn/` package.
-The test loaders build a stand-in `hermes_filament_fcm` module and register
+The test loaders build a stand-in `filament` module and register
 submodules by dotted name, so a subpackage would need extra registration in
 every test file.
 Flat modules also match the existing `slash.py`, `timeline.py`, and

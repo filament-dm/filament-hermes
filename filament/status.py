@@ -32,7 +32,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
 # One status per this many seconds when the phrase is unchanged: a resend
 # only exists to outlive the server timeout.
@@ -655,7 +655,7 @@ class StatusPublisher:
                 thread_id=entry.scope.thread_id,
             )
         except Exception:
-            logger.debug("filament-fcm: status clear failed", exc_info=True)
+            logger.debug("filament: status clear failed", exc_info=True)
 
     async def _refresh(self, entry: _Pending) -> None:
         while not entry.ended:
@@ -681,7 +681,7 @@ class StatusPublisher:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.debug("filament-fcm: status call failed", exc_info=True)
+                logger.debug("filament: status call failed", exc_info=True)
 
         def _closed_if_cancelled(handle: Any) -> None:
             self._tasks.discard(handle)
@@ -716,5 +716,5 @@ def pre_tool_call_hook(**kwargs: Any) -> None:
             str(kwargs.get("session_id") or ""),
         )
     except Exception:
-        logger.debug("filament-fcm: status hook failed", exc_info=True)
+        logger.debug("filament: status hook failed", exc_info=True)
     return None

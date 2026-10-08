@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-logger = logging.getLogger("gateway.filament_fcm")
+logger = logging.getLogger("gateway.filament")
 
 
 def _setup(parser: Any) -> None:
@@ -72,7 +72,7 @@ def register_cli(ctx: Any) -> None:
     register = getattr(ctx, "register_cli_command", None)
     if register is None:
         logger.debug(
-            "filament-fcm: this Hermes has no plugin CLI commands; "
+            "filament: this Hermes has no plugin CLI commands; "
             "`hermes filament connect` unavailable"
         )
         return
@@ -86,6 +86,6 @@ def register_cli(ctx: Any) -> None:
         )
     except Exception:
         logger.warning(
-            "filament-fcm: could not register the `hermes filament` command",
+            "filament: could not register the `hermes filament` command",
             exc_info=True,
         )

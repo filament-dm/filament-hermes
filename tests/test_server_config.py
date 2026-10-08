@@ -15,17 +15,17 @@ import sys
 import types
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _load(name: str):
-    mod_name = f"hermes_filament_fcm.{name}"
+    mod_name = f"filament.{name}"
     if mod_name in sys.modules:
         return sys.modules[mod_name]
-    if "hermes_filament_fcm" not in sys.modules:
-        pkg = types.ModuleType("hermes_filament_fcm")
+    if "filament" not in sys.modules:
+        pkg = types.ModuleType("filament")
         pkg.__path__ = [str(_PKG_DIR)]
-        sys.modules["hermes_filament_fcm"] = pkg
+        sys.modules["filament"] = pkg
     spec = importlib.util.spec_from_file_location(mod_name, _PKG_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module
@@ -275,7 +275,7 @@ def test_network_error_warns_once_and_keeps_local_files(tmp_path, caplog):
     (tmp_path / "wake_policy.json").write_text('{"reactive_wake": "all"}')
     api = FakeAPI(get_results=[OSError("connect refused")])
     sync, stores = _make_sync(tmp_path, api)
-    with caplog.at_level(logging.DEBUG, logger="gateway.filament_fcm"):
+    with caplog.at_level(logging.DEBUG, logger="gateway.filament"):
         asyncio.run(sync.sync())
         asyncio.run(sync.sync(force=True))
         asyncio.run(sync.sync(force=True))
@@ -293,7 +293,7 @@ def test_network_error_warns_once_and_keeps_local_files(tmp_path, caplog):
 def test_404_disables_sync_for_process_lifetime(tmp_path, caplog):
     api = FakeAPI(get_results=[(404, {})])
     sync, _ = _make_sync(tmp_path, api)
-    with caplog.at_level(logging.DEBUG, logger="gateway.filament_fcm"):
+    with caplog.at_level(logging.DEBUG, logger="gateway.filament"):
         asyncio.run(sync.sync())
         asyncio.run(sync.sync(force=True))
         asyncio.run(sync.write_back("instructions"))
@@ -438,7 +438,7 @@ def test_write_back_failure_keeps_local_change(tmp_path, caplog):
         put_results=[OSError("boom")],
     )
     sync, _ = _make_sync(tmp_path, api)
-    with caplog.at_level(logging.DEBUG, logger="gateway.filament_fcm"):
+    with caplog.at_level(logging.DEBUG, logger="gateway.filament"):
         asyncio.run(sync.write_back("instructions"))  # must not raise
     assert (tmp_path / "instructions.md").read_text() == "the local edit"
     assert [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -519,7 +519,7 @@ def test_report_tools_rate_limited_and_404_silenced(tmp_path, caplog):
         api404,
         inventory_provider=lambda: [{"name": "x", "origin": "filament"}],
     )
-    with caplog.at_level(logging.DEBUG, logger="gateway.filament_fcm"):
+    with caplog.at_level(logging.DEBUG, logger="gateway.filament"):
         asyncio.run(sync404.maybe_report_tools(force=True))
         asyncio.run(sync404.maybe_report_tools(force=True))
     # One POST discovers the endpoint is absent; then silence, no warnings.

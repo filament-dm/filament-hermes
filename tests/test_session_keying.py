@@ -26,7 +26,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _install_stubs() -> None:
@@ -70,9 +70,9 @@ def _install_stubs() -> None:
 
 def _load_modules():
     _install_stubs()
-    pkg = types.ModuleType("hermes_filament_fcm")
+    pkg = types.ModuleType("filament")
     pkg.__path__ = [str(_PKG_DIR)]
-    sys.modules["hermes_filament_fcm"] = pkg
+    sys.modules["filament"] = pkg
     for name in (
         "credentials",
         "fcm_client",
@@ -82,15 +82,15 @@ def _load_modules():
         "adapter",
     ):
         spec = importlib.util.spec_from_file_location(
-            f"hermes_filament_fcm.{name}", _PKG_DIR / f"{name}.py"
+            f"filament.{name}", _PKG_DIR / f"{name}.py"
         )
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"hermes_filament_fcm.{name}"] = module
+        sys.modules[f"filament.{name}"] = module
         spec.loader.exec_module(module)
     return (
-        sys.modules["hermes_filament_fcm.reactive"],
-        sys.modules["hermes_filament_fcm.turn_context"],
-        sys.modules["hermes_filament_fcm.adapter"],
+        sys.modules["filament.reactive"],
+        sys.modules["filament.turn_context"],
+        sys.modules["filament.adapter"],
     )
 
 
@@ -393,3 +393,23 @@ def test_principal_control_session_scope_uses_originating_room_and_thread():
     assert reactive.conversation_key(origin, "$thread") == ("thread", "$thread")
     assert thread_ctx.history_key == "thread:$thread"
     assert thread_ctx.reply_anchor[0] == origin
+
+
+def test_legacy_managed_marker_does_not_become_an_operator_pin(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    cfg = SimpleNamespace(
+        extra={
+            "group_sessions_per_user": False,
+            "_filament_fcm_managed_session_keying": True,
+        }
+    )
+    a = adapter.FCMFilamentAdapter(
+        cfg,
+        filament_api=SimpleNamespace(_mcp_url="https://example.org/mcp/agents"),
+        server_sync=SimpleNamespace(),
+    )
+    assert a._session_grouping_pinned is False
+    a._apply_session_keying()  # flag off restores the Hermes default
+    assert "group_sessions_per_user" not in cfg.extra
+    assert "_filament_fcm_managed_session_keying" not in cfg.extra

@@ -15,7 +15,9 @@ standalone — importing the package triggers ``__init__`` → the Hermes
 import importlib.util
 from pathlib import Path
 
-_BASE = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+import pytest
+
+_BASE = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _load(name: str):
@@ -35,18 +37,18 @@ def test_override_env_wins(tmp_path, monkeypatch):
     assert credentials.default_state_dir() == tmp_path / "override"
 
 
-def test_hermes_home_unset_falls_back_to_legacy_path(tmp_path, monkeypatch):
+def test_hermes_home_unset_uses_canonical_path(tmp_path, monkeypatch):
     monkeypatch.delenv("FILAMENT_FCM_CREDENTIALS_DIR", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert credentials.default_state_dir() == tmp_path / ".hermes" / "filament-fcm"
+    assert credentials.default_state_dir() == tmp_path / ".hermes" / "filament"
 
 
 def test_hermes_home_set_uses_per_home_dir(tmp_path, monkeypatch):
     monkeypatch.delenv("FILAMENT_FCM_CREDENTIALS_DIR", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "data"))
-    assert credentials.default_state_dir() == tmp_path / "data" / "filament-fcm"
+    assert credentials.default_state_dir() == tmp_path / "data" / "filament"
 
 
 def test_root_profile_migrates_legacy_dir(tmp_path, monkeypatch):
@@ -97,7 +99,7 @@ def test_named_profile_never_adopts_legacy_identity(tmp_path, monkeypatch):
 
     resolved = credentials.default_state_dir()
 
-    assert resolved == profile_home / "filament-fcm"
+    assert resolved == profile_home / "filament"
     assert legacy.exists()
     assert not resolved.exists()
 
@@ -122,7 +124,7 @@ def test_credential_store_uses_resolved_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "data"))
     store = credentials.CredentialStore()
     store.save_fcm_credentials({"gcm": {"token": "t"}})
-    expected = tmp_path / "data" / "filament-fcm" / "fcm_credentials.json"
+    expected = tmp_path / "data" / "filament" / "fcm_credentials.json"
     assert expected.exists()
 
 
@@ -189,3 +191,47 @@ def test_store_constructed_before_migration_follows_the_move(tmp_path, monkeypat
     assert migrated == tmp_path / "data" / "filament-fcm"
     assert store.path == migrated / "instructions.md"
     assert store.path.read_text() == "answer in haiku"
+
+
+@pytest.mark.parametrize("home_name", [".hermes", ".hermes/profiles/scout"])
+def test_existing_profile_identity_and_instructions_are_reused(
+    tmp_path, monkeypatch, home_name
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    home = tmp_path / home_name
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    legacy = home / "filament-fcm"
+    legacy.mkdir(parents=True)
+    (legacy / "fcm_credentials.json").write_text('{"identity":"existing"}')
+    (legacy / "instructions.md").write_text("keep these instructions")
+    assert credentials.CredentialStore().load_fcm_credentials() == {
+        "identity": "existing"
+    }
+    assert reactive.InstructionsStore().path.read_text() == "keep these instructions"
+    assert not (home / "filament").exists()
+
+
+def test_canonical_override_wins_for_every_store(tmp_path, monkeypatch):
+    canonical, legacy = tmp_path / "canonical", tmp_path / "legacy"
+    monkeypatch.setenv("FILAMENT_CREDENTIALS_DIR", str(canonical))
+    monkeypatch.setenv("FILAMENT_FCM_CREDENTIALS_DIR", str(legacy))
+    assert credentials.default_state_dir() == canonical
+    assert reactive._default_dir() == canonical
+
+
+def test_existing_canonical_directory_is_never_overwritten(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    canonical, legacy = [
+        tmp_path / ".hermes" / name for name in ("filament", "filament-fcm")
+    ]
+    for directory, identity in [(canonical, "current"), (legacy, "old")]:
+        directory.mkdir(parents=True)
+        (directory / "fcm_credentials.json").write_text(
+            '{"identity":"' + identity + '"}'
+        )
+    assert credentials.CredentialStore().load_fcm_credentials() == {
+        "identity": "current"
+    }
+    assert reactive._default_dir() == canonical
+    assert (legacy / "fcm_credentials.json").read_text() == '{"identity":"old"}'

@@ -4,7 +4,7 @@ The validator lives in ``__init__.py``, which imports the Hermes ``gateway``
 package at module level via ``adapter.py`` — not present in a bare test
 environment. So the Hermes-side modules are stubbed (same shapes as
 ``test_media_notes.py``) and ``__init__.py`` is loaded under an alias module
-name inside a real ``hermes_filament_fcm`` package entry, letting its
+name inside a real ``filament`` package entry, letting its
 relative imports pull the actual submodules off disk.
 """
 
@@ -13,7 +13,7 @@ import sys
 import types
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _install_stubs() -> None:
@@ -83,14 +83,14 @@ def _install_stubs() -> None:
 
 def _load_plugin_init():
     _install_stubs()
-    pkg = types.ModuleType("hermes_filament_fcm")
+    pkg = types.ModuleType("filament")
     pkg.__path__ = [str(_PKG_DIR)]
-    sys.modules["hermes_filament_fcm"] = pkg
+    sys.modules["filament"] = pkg
     spec = importlib.util.spec_from_file_location(
-        "hermes_filament_fcm.plugin_init", _PKG_DIR / "__init__.py"
+        "filament.plugin_init", _PKG_DIR / "__init__.py"
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules["hermes_filament_fcm.plugin_init"] = module
+    sys.modules["filament.plugin_init"] = module
     spec.loader.exec_module(module)
     return module
 

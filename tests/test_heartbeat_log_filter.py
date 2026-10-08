@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-_SRC = Path(__file__).resolve().parent.parent / "hermes_filament_fcm" / "fcm_client.py"
+_SRC = Path(__file__).resolve().parent.parent / "filament" / "fcm_client.py"
 
 _WANTED = ("_DropHeartbeats", "_HEARTBEAT_MARKERS")
 

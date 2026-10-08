@@ -4,7 +4,7 @@
 # id: the install directory, the entry in `plugins.enabled`, and the argument to
 # `hermes plugins update <id>`.
 name: filament
-label: Filament (FCM)
+label: Filament
 kind: platform
 # Keep in sync with [project].version in pyproject.toml (pyproject is the
 # canonical version _version.py reads; this drives `hermes plugins list`).

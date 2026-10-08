@@ -906,7 +906,7 @@ wheels = [
 ]
 
 [[package]]
-name = "hermes-filament-fcm"
+name = "filament"
 version = "0.14.1"
 source = { editable = "." }
 dependencies = [

@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
-_SETUP_CLI = _ROOT / "hermes_filament_fcm" / "setup_cli.py"
+_SETUP_CLI = _ROOT / "filament" / "setup_cli.py"
 
 
 _WANTED = (
@@ -110,13 +110,11 @@ def test_install_sh_leaves_the_legacy_tree_to_setup():
     assert 'rm -rf "$LEGACY_PLUGIN_DIR"' not in installer
 
 
-def test_state_directory_is_not_renamed():
-    """The runtime state path is hardcoded, not derived from either name. That
-    is what lets the rename leave FCM credentials, standing instructions and the
-    wake policy in place — so it must keep saying filament-fcm."""
-    pkg = _ROOT / "hermes_filament_fcm"
+def test_legacy_state_directory_remains_supported():
+    """The upgrade must still find old credentials, instructions and policies."""
+    pkg = _ROOT / "filament"
     for rel in ("credentials.py", "reactive.py"):
-        assert 'filament-fcm"' in (pkg / rel).read_text()
+        assert '"filament-fcm"' in (pkg / rel).read_text()
 
 
 # ── migrate_enabled ──────────────────────────────────────────────────
@@ -168,7 +166,7 @@ def test_similar_names_are_left_alone(bogus):
 
 
 def test_retires_a_leftover_when_the_current_install_exists(hermes_home):
-    (hermes_home / "plugins" / PLUGIN_ID / "hermes_filament_fcm").mkdir(parents=True)
+    (hermes_home / "plugins" / PLUGIN_ID / "filament").mkdir(parents=True)
     legacy = _make_legacy_install(hermes_home)
     assert retire_legacy_plugin_dir() is True
     assert not legacy.exists()
@@ -199,7 +197,7 @@ def test_the_move_keeps_the_git_remote(hermes_home):
 def test_never_deletes_the_tree_it_is_running_from(hermes_home, monkeypatch):
     """Belt to the move's braces: with a current install present the legacy tree
     is a leftover and gets removed — unless this code is executing out of it."""
-    (hermes_home / "plugins" / PLUGIN_ID / "hermes_filament_fcm").mkdir(parents=True)
+    (hermes_home / "plugins" / PLUGIN_ID / "filament").mkdir(parents=True)
     legacy = _make_legacy_install(hermes_home)
     monkeypatch.setitem(_ns, "running_from", lambda p: True)
     assert retire_legacy_plugin_dir() is False
@@ -223,7 +221,7 @@ def test_refuses_a_symlink(hermes_home):
     """A symlinked plugin dir is how someone develops against a checkout;
     rmtree would refuse anyway, but not before deciding to try."""
     real = hermes_home / "checkout"
-    (real / "hermes_filament_fcm").mkdir(parents=True)
+    (real / "filament").mkdir(parents=True)
     link = hermes_home / "plugins" / LEGACY_PLUGIN_ID
     link.symlink_to(real)
     assert legacy_dir_is_ours(link) is False
@@ -234,7 +232,7 @@ def test_refuses_a_symlink(hermes_home):
 def test_never_touches_the_current_plugin(hermes_home):
     """The new id lives at a different path; retiring must not reach it."""
     current = hermes_home / "plugins" / PLUGIN_ID
-    (current / "hermes_filament_fcm").mkdir(parents=True)
+    (current / "filament").mkdir(parents=True)
     _make_legacy_install(hermes_home)
     retire_legacy_plugin_dir()
     assert current.exists()

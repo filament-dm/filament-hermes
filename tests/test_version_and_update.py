@@ -13,17 +13,17 @@ import sys
 import types
 from pathlib import Path
 
-_PKG_DIR = Path(__file__).resolve().parent.parent / "hermes_filament_fcm"
+_PKG_DIR = Path(__file__).resolve().parent.parent / "filament"
 
 
 def _load(name: str):
-    mod_name = f"hermes_filament_fcm.{name}"
+    mod_name = f"filament.{name}"
     if mod_name in sys.modules:
         return sys.modules[mod_name]
-    if "hermes_filament_fcm" not in sys.modules:
-        pkg = types.ModuleType("hermes_filament_fcm")
+    if "filament" not in sys.modules:
+        pkg = types.ModuleType("filament")
         pkg.__path__ = [str(_PKG_DIR)]
-        sys.modules["hermes_filament_fcm"] = pkg
+        sys.modules["filament"] = pkg
     spec = importlib.util.spec_from_file_location(mod_name, _PKG_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module
@@ -49,7 +49,7 @@ def test_plugin_version_is_string():
 
 def test_version_headers_present():
     headers = _version.version_headers()
-    assert headers["User-Agent"].startswith("hermes-filament-fcm/")
+    assert headers["User-Agent"].startswith("filament/")
     assert headers["X-Filament-Plugin-Version"]
 
 
@@ -261,7 +261,7 @@ def test_async_client_carries_version_headers():
         return dict(api._client_for_loop().headers)
 
     headers = asyncio.run(_get_headers())
-    assert headers.get("user-agent", "").startswith("hermes-filament-fcm/")
+    assert headers.get("user-agent", "").startswith("filament/")
     assert "x-filament-plugin-version" in headers
 
 
@@ -279,7 +279,7 @@ def test_initialize_sends_client_info():
     init = posted[0]
     assert init["method"] == "initialize"
     client_info = init["params"]["clientInfo"]
-    assert client_info["name"] == "hermes-filament-fcm"
+    assert client_info["name"] == "filament"
     assert client_info["version"] == _version.PLUGIN_VERSION
 
 
@@ -319,9 +319,9 @@ def test_fetch_tools_sends_version(monkeypatch):
     tools = filament_api.FilamentAPI.fetch_tools("https://example.test", "tok")
     assert tools == []
     for headers in seen["headers"]:
-        assert headers.get("User-Agent", "").startswith("hermes-filament-fcm/")
+        assert headers.get("User-Agent", "").startswith("filament/")
         assert "X-Filament-Plugin-Version" in headers
-    assert seen["bodies"][0]["params"]["clientInfo"]["name"] == "hermes-filament-fcm"
+    assert seen["bodies"][0]["params"]["clientInfo"]["name"] == "filament"
 
 
 def test_adapter_imports_what_the_reminder_delivery_uses():
@@ -337,3 +337,15 @@ def test_adapter_imports_what_the_reminder_delivery_uses():
             if line.startswith("from .update_check import")
         )
         assert "build_reminder" in import_line
+
+
+def test_legacy_pip_metadata_remains_a_version_fallback(monkeypatch):
+    monkeypatch.setattr(_version, "_version_from_local_pyproject", lambda: None)
+
+    def dist_version(name):
+        if name == _version.LEGACY_DIST_NAME:
+            return "0.13.0"
+        raise LookupError(name)
+
+    monkeypatch.setattr(_version, "_dist_version", dist_version)
+    assert _version.plugin_version() == "0.13.0"

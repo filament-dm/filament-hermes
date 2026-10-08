@@ -24,7 +24,8 @@ import re
 from importlib.metadata import version as _dist_version
 from pathlib import Path
 
-DIST_NAME = "hermes-filament-fcm"
+DIST_NAME = "filament"
+LEGACY_DIST_NAME = "hermes-filament-fcm"
 REPO_URL = "https://github.com/filament-dm/filament-hermes"
 
 # install.sh installs from git main, so the version on main IS the latest
@@ -53,7 +54,7 @@ def version_from_pyproject(text: str) -> str | None:
 def _version_from_local_pyproject() -> str | None:
     """Read the version from the pyproject.toml next to this package.
 
-    This file lives at ``<plugin_root>/hermes_filament_fcm/_version.py``, so the
+    This file lives at ``<plugin_root>/filament/_version.py``, so the
     plugin's pyproject.toml is two levels up. Present in a git checkout and in a
     directory install; absent when only the package (no repo) was pip-installed.
     """
@@ -69,10 +70,12 @@ def plugin_version() -> str:
     local = _version_from_local_pyproject()
     if local:
         return local
-    try:
-        return _dist_version(DIST_NAME)
-    except Exception:
-        return "unknown"
+    for name in (DIST_NAME, LEGACY_DIST_NAME):
+        try:
+            return _dist_version(name)
+        except Exception:
+            continue
+    return "unknown"
 
 
 PLUGIN_VERSION = plugin_version()
