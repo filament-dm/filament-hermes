@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
 
 SCOPE = "filament:agent:control"
 CLIENT_NAME = "Hermes (Filament plugin)"
@@ -80,7 +80,10 @@ def _well_known(base: str, name: str) -> list[str]:
     parts = urllib.parse.urlsplit(base)
     origin = f"{parts.scheme}://{parts.netloc}"
     path = parts.path.rstrip("/")
-    return [f"{origin}/.well-known/{name}{path}", f"{base.rstrip('/')}/.well-known/{name}"]
+    return [
+        f"{origin}/.well-known/{name}{path}",
+        f"{base.rstrip('/')}/.well-known/{name}",
+    ]
 
 
 def discover(mcp_url: str) -> ServerMetadata:
@@ -118,7 +121,9 @@ def register_client(meta: ServerMetadata, redirect_uri: str | None) -> str:
         "client_name": CLIENT_NAME,
         "token_endpoint_auth_method": "none",
         "redirect_uris": [redirect_uri] if redirect_uri else [],
-        "grant_types": [DEVICE_GRANT] if redirect_uri is None else ["authorization_code"],
+        "grant_types": [DEVICE_GRANT]
+        if redirect_uri is None
+        else ["authorization_code"],
         "response_types": [] if redirect_uri is None else ["code"],
     }
     status, doc = _request(meta.registration_endpoint, body=body)
@@ -147,15 +152,19 @@ def _exchange(meta: ServerMetadata, form: dict[str, str]) -> tuple[int, Any]:
 def _token_from(status: int, doc: Any) -> str:
     if status == 200 and isinstance(doc, dict) and doc.get("access_token"):
         return str(doc["access_token"])
-    detail = doc.get("error_description") or doc.get("error") if isinstance(doc, dict) else doc
+    detail = (
+        doc.get("error_description") or doc.get("error")
+        if isinstance(doc, dict)
+        else doc
+    )
     raise LoginError(f"Filament did not issue a token ({status}): {detail}")
 
 
 class _Callback(http.server.BaseHTTPRequestHandler):
-    result: dict[str, str] = {}
-    done = threading.Event()
+    result: ClassVar[dict[str, str]] = {}
+    done: ClassVar[threading.Event] = threading.Event()
 
-    def do_GET(self) -> None:  # noqa: N802 — http.server's name
+    def do_GET(self) -> None:
         type(self).result = parse_redirect(self.path)
         ok = "code" in type(self).result
         self.send_response(200 if ok else 400)
@@ -205,17 +214,21 @@ def authorization_code_login(
         client_id = register_client(meta, redirect_uri)
         verifier, challenge = pkce_pair()
         state = secrets.token_urlsafe(16)
-        url = meta.authorization_endpoint + "?" + urllib.parse.urlencode(
-            {
-                "response_type": "code",
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "scope": SCOPE,
-                "state": state,
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
-                "resource": meta.resource,
-            }
+        url = (
+            meta.authorization_endpoint
+            + "?"
+            + urllib.parse.urlencode(
+                {
+                    "response_type": "code",
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "scope": SCOPE,
+                    "state": state,
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "resource": meta.resource,
+                }
+            )
         )
         out("Sign in to Filament to connect this agent:")
         out(f"  {url}")
@@ -228,13 +241,15 @@ def authorization_code_login(
                 import webbrowser  # noqa: PLC0415 — only when a browser may exist
 
                 webbrowser.open(url)
-            except Exception:  # noqa: BLE001 — opening a browser is best-effort
+            except Exception:
                 pass
         got = _wait_for_redirect(handler.done, lambda: handler.result, timeout_s)
     finally:
         server.shutdown()
     if got.get("error"):
-        raise LoginError(f"Sign-in was refused: {got.get('error_description') or got['error']}")
+        raise LoginError(
+            f"Sign-in was refused: {got.get('error_description') or got['error']}"
+        )
     if got.get("state") != state:
         raise LoginError("Sign-in answered a different request. Run the login again.")
     return _token_from(
@@ -276,7 +291,11 @@ def device_login(
         sleep(interval)
         status, token_doc = _exchange(
             meta,
-            {"grant_type": DEVICE_GRANT, "device_code": doc["device_code"], "client_id": client_id},
+            {
+                "grant_type": DEVICE_GRANT,
+                "device_code": doc["device_code"],
+                "client_id": client_id,
+            },
         )
         error = token_doc.get("error") if isinstance(token_doc, dict) else None
         if error == "authorization_pending":

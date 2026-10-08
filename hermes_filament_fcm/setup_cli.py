@@ -656,16 +656,23 @@ def login(
     a new one), so nothing is copied or picked. Everything after the sign-in
     is ``connect``'s: the same validation, saved configuration and restart.
     """
-    from .oauth_login import LoginError, login as oauth_login  # noqa: PLC0415
+    from .oauth_login import LoginError  # noqa: PLC0415
+    from .oauth_login import login as oauth_login  # noqa: PLC0415
 
     resolved = (
-        (url or get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents")
+        (
+            url
+            or get_env_value("FILAMENT_MCP_URL")
+            or "https://api.filament.dm/mcp/agents"
+        )
         .strip()
         .rstrip("/")
     )
     print_header("Filament (FCM)")
     try:
-        token = oauth_login(resolved, flow=flow, out=print_info, open_browser=open_browser)
+        token = oauth_login(
+            resolved, flow=flow, out=print_info, open_browser=open_browser
+        )
     except LoginError as exc:
         print_warning(str(exc))
         return 1
