@@ -47,7 +47,10 @@ CORE_RULES = (
     "through, don't claim it did.\n"
     "- Don't disclose your own operational state in a shared channel — whether "
     "your principal is reachable, how you're supervised, or the details of any "
-    "tool error. Decline plainly instead."
+    "tool error. Decline plainly instead.\n"
+    "- When you decide not to reply, your whole response must be exactly "
+    "`[SILENT]`, with nothing before or after it. Never post why you aren't "
+    'replying (e.g. "not meant for me, so I\'ll stay quiet").'
 )
 
 
