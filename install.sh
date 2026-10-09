@@ -23,6 +23,8 @@
 #                        Each profile is an independent HERMES_HOME with its
 #                        own gateway and FCM identity — how one Hermes
 #                        instance hosts several Filament agents.
+#   FILAMENT_NO_SERVICE  set to skip registering the gateway with launchd /
+#                        systemd (it is then started for this session only)
 #
 # This plugin installs as a Hermes *directory plugin*: its Python dependencies
 # go into the Hermes venv, and the plugin code is git-cloned into
@@ -590,11 +592,36 @@ if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
   S6_SVC=/command/s6-svc
 fi
 SCRIPT_OWNS_RESTART="${FILAMENT_PROFILE:+1}"
-if [ -z "$SCRIPT_OWNS_RESTART" ] && [ -n "$S6_SVC" ]; then
+S6_SLOT_LIVE=0
+if [ -n "$S6_SVC" ]; then
   for _svcdir in /run/service/gateway-* /run/service/hermes-gateway-*; do
-    if [ -p "$_svcdir/supervise/control" ]; then SCRIPT_OWNS_RESTART=1; break; fi
+    if [ -p "$_svcdir/supervise/control" ]; then S6_SLOT_LIVE=1; break; fi
   done
 fi
+[ "$S6_SLOT_LIVE" = 0 ] || SCRIPT_OWNS_RESTART=1
+
+# Whether this host has a service manager Hermes can register the gateway
+# with: launchd on macOS, a reachable systemd user manager on a Linux host.
+# Containers are left out — their image or operator owns supervision.
+in_container() {
+  [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${container:-}" ] \
+    || [ -d "${AGENT37_HOOKS_DIR:-$HOME/.agent37/hooks}" ]
+}
+NATIVE_SERVICE=""
+if [ "$S6_SLOT_LIVE" = 0 ] && [ -z "${FILAMENT_NO_SERVICE:-}" ] && ! in_container; then
+  case "$(uname -s)" in
+    Darwin) NATIVE_SERVICE=launchd ;;
+    Linux)
+      if command -v systemctl >/dev/null 2>&1 \
+          && systemctl --user show-environment >/dev/null 2>&1; then
+        NATIVE_SERVICE=systemd
+      fi
+      ;;
+  esac
+fi
+# The service install below starts the gateway itself; a wizard restart
+# first would leave a hand-started gateway for it to stop again.
+[ -z "$NATIVE_SERVICE" ] || SCRIPT_OWNS_RESTART=1
 
 # Re-attach the terminal so the setup wizard's prompts work even when this
 # script is piped from curl straight into bash, where stdin is the download
@@ -714,14 +741,66 @@ if [ -n "$S6_SVC" ]; then
   fi
 fi
 
-# --- Start the profile gateway (no supervised slot) ---------------------------
+# --- Register the gateway with the host's service manager ---------------------
+# A gateway started by hand dies with the session and stays down after a
+# reboot. On a laptop or server, install it as a launchd LaunchAgent / systemd
+# user service instead, so it starts at login and is restarted if it exits.
+# BEGIN native-service (extracted and run by tests/test_install_sh_service.py)
+install_gateway_service() {
+  info "Registering the gateway as a $NATIVE_SERVICE service so it starts at login ..."
+  # A hand-started gateway holds this profile's lock, and the service's own
+  # gateway (started without --replace) would lose to it — stop it first.
+  hermes gateway stop < /dev/null > /dev/null 2>&1 || true
+  hermes gateway install --start-on-login --start-now < /dev/null || return 1
+  # An already-installed service is left as is (and was stopped above).
+  hermes gateway start < /dev/null > /dev/null || return 1
+}
+
+# Wait briefly for the service to report running. `hermes gateway status`
+# exits 0 whether up or down, so read its output ("not running" first).
+gateway_service_running() {
+  _tries=0
+  while [ "$_tries" -lt 10 ]; do
+    _status="$(hermes gateway status < /dev/null 2>&1 || true)"
+    case "$(printf '%s' "$_status" | tr '[:upper:]' '[:lower:]')" in
+      *"not running"*|*stopped*) ;;
+      *running*) return 0 ;;
+    esac
+    _tries=$((_tries + 1))
+    sleep 2
+  done
+  return 1
+}
+
+if [ "$SUPERVISED" = 0 ] && [ -n "$NATIVE_SERVICE" ]; then
+  if install_gateway_service; then
+    SUPERVISED=1
+    if gateway_service_running; then
+      info "Gateway service is running and will start automatically at login."
+    else
+      warn "gateway service installed but not yet running — check: hermes gateway status"
+    fi
+    if [ "$NATIVE_SERVICE" = launchd ]; then
+      info "On macOS the gateway comes back once you log in after a reboot; \
+it is offline while the Mac is off or asleep."
+    fi
+  else
+    warn "could not register a $NATIVE_SERVICE service — starting the gateway \
+for this session only; it will not survive a reboot. Retry with: \
+hermes gateway install --start-on-login --start-now"
+  fi
+fi
+# END native-service
+
+# --- Start the gateway directly (no supervisor) -------------------------------
 # The wizard's restart was skipped above (FILAMENT_SETUP_SKIP_RESTART): with
 # no supervisor, `hermes gateway restart` is two CLI startups (restart, then
 # run) where one will do. Spawn the gateway directly, detached from this
 # session; --replace hands over cleanly if one is somehow already up.
-if [ "$SUPERVISED" = 0 ] && [ -n "${FILAMENT_PROFILE:-}" ]; then
+if [ "$SUPERVISED" = 0 ] && { [ -n "${FILAMENT_PROFILE:-}" ] || [ -n "$NATIVE_SERVICE" ]; }; then
   SETSID="$(command -v setsid 2>/dev/null || true)"
   info "Starting the gateway ..."
+  mkdir -p "$HERMES_HOME/logs"
   # shellcheck disable=SC2086  # $SETSID intentionally word-splits away when absent
   $SETSID nohup hermes gateway run --replace \
     > "$HERMES_HOME/logs/gateway-detached.log" 2>&1 < /dev/null &
