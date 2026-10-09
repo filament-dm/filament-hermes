@@ -223,7 +223,7 @@ def test_build_reminder_offers_the_command_not_a_shell():
     # the host and paste something - and `hermes gateway restart` in
     # particular restarts the gateway in the foreground of that terminal.
     note = update_check.build_reminder("0.2.0", "0.1.0")
-    assert "/fil-upgrade" in note
+    assert "[/fil-upgrade](filament:message-send)" in note
     assert "hermes plugins update" not in note
     assert "gateway restart" not in note
 

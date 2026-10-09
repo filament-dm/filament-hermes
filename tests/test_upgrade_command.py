@@ -283,7 +283,8 @@ class TestTheAgentKnowsTheSurfaceExists:
         return framing.command_map_prompt(slash_enabled)
 
     def test_it_names_the_upgrade_command(self):
-        assert "/fil-upgrade" in self._prompt()
+        for enabled in (True, False):
+            assert "[/fil-upgrade](filament:message-send)" in self._prompt(enabled)
 
     def test_it_names_the_restart_command(self):
         assert "/restart" in self._prompt()
@@ -425,7 +426,7 @@ class TestWhereTheCommandsAreNamed:
     def test_the_update_alert_offers_the_command(self):
         update_check = _load("update_check")
         note = update_check.build_reminder("0.2.0", "0.1.0")
-        assert "/fil-upgrade" in note
+        assert "[/fil-upgrade](filament:message-send)" in note
 
     def test_the_update_alert_does_not_send_them_to_a_shell(self):
         update_check = _load("update_check")
