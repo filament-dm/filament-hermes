@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -156,6 +157,10 @@ def test_browser_login_takes_the_loopback_redirect(http, monkeypatch):
         pass
     url = next(line.strip() for line in lines if line.strip().startswith("https://"))
     query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+    # A browser's stray request first: it must neither end nor spoil the login.
+    origin = query["redirect_uri"].rsplit("/", 1)[0]
+    with pytest.raises(urllib.error.HTTPError):
+        urllib.request.urlopen(f"{origin}/favicon.ico").read()
     urllib.request.urlopen(
         f"{query['redirect_uri']}?code=c1&state={query['state']}"
     ).read()
@@ -179,3 +184,34 @@ def test_a_pasted_redirect_is_read_like_the_callback():
         "state": "b",
     }
     assert ol.parse_redirect("code=a&state=b") == {"code": "a", "state": "b"}
+
+
+def test_a_registration_that_is_not_an_object_is_refused(http, monkeypatch):
+    fake = http(_server())
+
+    def null_register(url, *, form=None, body=None):
+        if url.endswith("/register"):
+            return 201, None
+        return fake(url, form=form, body=body)
+
+    monkeypatch.setattr(ol, "_request", null_register)
+    with pytest.raises(ol.LoginError, match="refused to register"):
+        ol.device_login(ol.discover(MCP), out=lambda _: None, sleep=lambda _: None)
+
+
+def test_a_reply_that_is_not_json_is_a_login_error(monkeypatch):
+    class Resp:
+        status = 200
+
+        def read(self):
+            return b"<html>proxy</html>"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(ol.urllib.request, "urlopen", lambda *a, **k: Resp())
+    with pytest.raises(ol.LoginError, match="did not answer with JSON"):
+        ol._request("https://api.example/x")

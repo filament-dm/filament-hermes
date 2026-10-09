@@ -64,7 +64,11 @@ def _request(
     req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-            return resp.status, json.loads(resp.read() or b"null")
+            raw = resp.read()
+            try:
+                return resp.status, json.loads(raw or b"null")
+            except ValueError as exc:
+                raise LoginError(f"{url} did not answer with JSON.") from exc
     except urllib.error.HTTPError as exc:
         raw = exc.read()
         try:
@@ -127,7 +131,7 @@ def register_client(meta: ServerMetadata, redirect_uri: str | None) -> str:
         "response_types": [] if redirect_uri is None else ["code"],
     }
     status, doc = _request(meta.registration_endpoint, body=body)
-    if status not in (200, 201) or "client_id" not in doc:
+    if status not in (200, 201) or not isinstance(doc, dict) or "client_id" not in doc:
         raise LoginError(f"Filament refused to register this agent ({status}).")
     return str(doc["client_id"])
 
@@ -163,10 +167,23 @@ def _token_from(status: int, doc: Any) -> str:
 class _Callback(http.server.BaseHTTPRequestHandler):
     result: ClassVar[dict[str, str]] = {}
     done: ClassVar[threading.Event] = threading.Event()
+    state: ClassVar[str] = ""
 
     def do_GET(self) -> None:
-        type(self).result = parse_redirect(self.path)
-        ok = "code" in type(self).result
+        # Only the redirect for this login counts, once: a browser's stray
+        # request for / or /favicon.ico must not end or overwrite it.
+        got = parse_redirect(self.path)
+        cls = type(self)
+        if (
+            urllib.parse.urlsplit(self.path).path != "/callback"
+            or got.get("state") != cls.state
+            or cls.done.is_set()
+        ):
+            self.send_response(404)
+            self.end_headers()
+            return
+        cls.result = got
+        ok = "code" in got
         self.send_response(200 if ok else 400)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -176,7 +193,7 @@ class _Callback(http.server.BaseHTTPRequestHandler):
             else "Filament sign-in did not finish. Go back to the terminal."
         )
         self.wfile.write(f"<p>{message}</p>".encode())
-        type(self).done.set()
+        cls.done.set()
 
     def log_message(self, *_args: Any) -> None:
         pass
@@ -206,7 +223,8 @@ def authorization_code_login(
     timeout_s: float = 600,
 ) -> str:
     handler = type("Callback", (_Callback,), {"result": {}, "done": threading.Event()})
-    server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    # Threading, so a browser's idle pre-opened connection can't block shutdown.
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -214,6 +232,7 @@ def authorization_code_login(
         client_id = register_client(meta, redirect_uri)
         verifier, challenge = pkce_pair()
         state = secrets.token_urlsafe(16)
+        handler.state = state
         url = (
             meta.authorization_endpoint
             + "?"
@@ -279,7 +298,7 @@ def device_login(
         meta.device_authorization_endpoint,
         form={"client_id": client_id, "scope": SCOPE, "resource": meta.resource},
     )
-    if status != 200 or "device_code" not in doc:
+    if status != 200 or not isinstance(doc, dict) or "device_code" not in doc:
         raise LoginError(f"Filament refused device sign-in ({status}).")
     link = doc.get("verification_uri_complete") or doc["verification_uri"]
     out("To connect this agent, open this on any device signed in to Filament:")
