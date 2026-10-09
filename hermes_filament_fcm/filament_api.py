@@ -344,6 +344,13 @@ class FilamentAPI:
             },
         )
 
+    async def mark_read(self, channel: str, up_to: str) -> dict[str, Any]:
+        """Record the agent's read receipt in *channel* through *up_to*.
+
+        The server writes it as an unthreaded receipt, which is positional
+        across the room: every earlier event in every thread reads as seen."""
+        return await self.call_tool("mark_read", {"channel": channel, "up_to": up_to})
+
     async def get_self(self) -> dict[str, Any]:
         """Get the authenticated agent's own profile (mxid, display name)."""
         return await self.call_tool("get_self", {})

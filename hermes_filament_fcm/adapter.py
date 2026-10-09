@@ -396,6 +396,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Event deduplication — bounded deque + set so memory stays flat.
         self._seen_events: deque[str] = deque(maxlen=2000)
         self._seen_set: set[str] = set()
+        # Arrival receipts in flight; held so the loop keeps them alive.
+        self._receipt_tasks: set[asyncio.Task] = set()
         self._installation_id = self._credentials.load_or_create_installation_id()
         self._gateway_instance_id = new_id("gw")
         slog.info(
@@ -1831,6 +1833,50 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         ):
             await self._handle_push_message_turn(msg, turn_id)
 
+    def _mark_read_on_arrival(self, msg: PushMessage) -> None:
+        """Mark *msg* read without waiting on the result.
+
+        Runs before any admission or wake decision, so a message the agent
+        receives and then ignores still reads as seen. Fire-and-forget: the
+        receipt never delays or fails the turn, and a failure is only logged.
+        The caller's per-event dedup means each event is marked at most once.
+        """
+        if not self._filament_api or not msg.event_id or not msg.room_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._send_arrival_receipt(msg.room_id, msg.event_id))
+        tasks = getattr(self, "_receipt_tasks", None)
+        if tasks is None:
+            tasks = self._receipt_tasks = set()
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _send_arrival_receipt(self, room_id: str, event_id: str) -> None:
+        """Write the arrival receipt. Never raises."""
+        try:
+            raw = await self._filament_api.mark_read(room_id, event_id)
+        except Exception as exc:
+            logger.info(
+                "filament-fcm: mark_read on arrival failed for %s: %s", event_id, exc
+            )
+            return
+        # A server rejection arrives either as a JSON-RPC error envelope or as
+        # an {"error": ...} tool result; the success body ({"ok", "up_to"})
+        # only echoes the event id sent, so nothing else in it is used.
+        parsed = FilamentAPI.parse_tool_result(raw)
+        err = FilamentAPI.result_error(raw) or (
+            parsed.get("error") if isinstance(parsed, dict) else None
+        )
+        if err:
+            logger.info(
+                "filament-fcm: mark_read on arrival rejected for %s: %s", event_id, err
+            )
+        else:
+            logger.debug("filament-fcm: marked %s read on arrival", event_id)
+
     def _shared_sessions_effective(self) -> bool:
         """Whether shared channels currently key to ONE session per channel
         — the fact the read cursor's soundness rests on. An operator pin
@@ -1949,6 +1995,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 reason="own_message",
             )
             return
+
+        # Every pushed message the agent receives reads as seen, whether or
+        # not the wake gate below spends a turn on it.
+        self._mark_read_on_arrival(msg)
 
         # Refresh the local store files from the server-held config before the
         # fresh-read consumers below (wake policy, standing instructions,
@@ -3085,8 +3135,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     # (the agent's thinking indicator) is the working marker: dispatch
     # already announces the turn, and processing-start backstops any wake
     # path that didn't, so the indicator is up the moment work begins and
-    # cleared when the turn finishes. Read receipts tell the sender the
-    # message was seen, so nothing else is posted on the prompt.
+    # cleared when the turn finishes. Every pushed message is marked read
+    # on arrival (``_mark_read_on_arrival``), so the read receipt tells the
+    # sender the message was seen and nothing else is posted on the prompt.
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         target = getattr(event, "message_id", None)
