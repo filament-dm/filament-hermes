@@ -46,6 +46,8 @@ try:
 except ImportError:
     import hermes_yaml as yaml
 
+PRODUCTION_MCP_URL = "https://api.filament.dm/mcp/agents"
+
 # The Firebase project the gateway registers with. It must be the same project
 # the homeserver pushes from, or FCM rejects every token as cross-project and
 # the agent is never woken — it connects, looks healthy, and silently answers
@@ -444,11 +446,7 @@ def _run_interactive_setup() -> bool | None:
     # MCP endpoint URL — never prompted. Use FILAMENT_MCP_URL when set (the
     # connect command exports it; local-dev users can export it or edit
     # ~/.hermes/.env), otherwise default to production.
-    url = (
-        (get_env_value("FILAMENT_MCP_URL") or "https://api.filament.dm/mcp/agents")
-        .strip()
-        .rstrip("/")
-    )
+    url = _resolve_mcp_url(None)
 
     # Validate the token before persisting any configuration. If the token
     # is rejected or the user aborts, the previous working config in
@@ -614,15 +612,7 @@ def connect(
         print_warning("A token is required. Copy it from Filament's connect flow.")
         return 2
 
-    resolved = (
-        (
-            url
-            or get_env_value("FILAMENT_MCP_URL")
-            or "https://api.filament.dm/mcp/agents"
-        )
-        .strip()
-        .rstrip("/")
-    )
+    resolved = _resolve_mcp_url(url)
 
     print_header("Filament (FCM)")
 
@@ -644,31 +634,24 @@ def connect(
     return 0
 
 
+def _resolve_mcp_url(url: str | None) -> str:
+    """The given URL, else the saved FILAMENT_MCP_URL, else production."""
+    chosen = url or get_env_value("FILAMENT_MCP_URL") or PRODUCTION_MCP_URL
+    return chosen.strip().rstrip("/")
+
+
 def login(
     url: str | None = None,
     flow: str = "auto",
     open_browser: bool = True,
     restart: bool = True,
 ) -> int:
-    """Connect this agent by signing in to Filament. Returns an exit code.
-
-    The grant goes to the agent the owner pressed Connect on in the app (or
-    a new one), so nothing is copied or picked. Everything after the sign-in
-    is ``connect``'s: the same validation, saved configuration and restart.
-    """
+    """Sign in to Filament, then ``connect`` with the issued token. Returns an
+    exit code."""
     from .oauth_login import LoginError  # noqa: PLC0415
     from .oauth_login import login as oauth_login  # noqa: PLC0415
 
-    resolved = (
-        (
-            url
-            or get_env_value("FILAMENT_MCP_URL")
-            or "https://api.filament.dm/mcp/agents"
-        )
-        .strip()
-        .rstrip("/")
-    )
-    print_header("Filament (FCM)")
+    resolved = _resolve_mcp_url(url)
     try:
         token = oauth_login(
             resolved, flow=flow, out=print_info, open_browser=open_browser

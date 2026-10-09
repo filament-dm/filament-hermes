@@ -50,9 +50,8 @@ def _setup(parser: Any) -> None:
         "login",
         help="Connect this agent to Filament by signing in, with no token",
         description=(
-            "Sign in to Filament in a browser. The agent you pressed Connect on "
-            "in the app is connected; there is nothing to copy or pick. Then "
-            "save the configuration and restart the gateway, as connect does."
+            "Sign in to Filament in a browser, then save the configuration and "
+            "restart the gateway."
         ),
     )
     login.add_argument(
@@ -60,7 +59,8 @@ def _setup(parser: Any) -> None:
         default=None,
         help="MCP endpoint (default: the saved value, else production)",
     )
-    login.add_argument(
+    flow = login.add_mutually_exclusive_group()
+    flow.add_argument(
         "--device",
         action="store_const",
         const="device",
@@ -68,7 +68,7 @@ def _setup(parser: Any) -> None:
         default="auto",
         help="sign in from another device with a short link",
     )
-    login.add_argument(
+    flow.add_argument(
         "--browser",
         action="store_const",
         const="browser",

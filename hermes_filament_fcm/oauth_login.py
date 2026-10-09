@@ -1,22 +1,12 @@
-"""Sign this agent in to Filament with OAuth instead of a pasted token.
-
-Filament's agents MCP is a standard MCP OAuth server: protected-resource
-metadata, authorization-server metadata, dynamic client registration, and
-authorization code + PKCE. The owner signs in to Filament in a browser and the
-grant goes to the agent they just pressed Connect on in the app, so there is
-no agent to pick and no token to copy. The access token it returns is the same
-``fmcp_`` bearer a pasted connect token is, so everything after login is
-unchanged.
-
-When the server offers the device grant (RFC 8628), that is used instead: the
-owner opens a short link on any device, which suits a headless host.
-
-Stdlib-only so it is unit-testable without Hermes.
+"""Sign this agent in to Filament with MCP OAuth: the device grant (RFC 8628)
+when the server offers it, else authorization code + PKCE with a loopback
+callback. Stdlib-only, so it is unit-testable without Hermes.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.server
 import json
@@ -124,12 +114,15 @@ def register_client(meta: ServerMetadata, redirect_uri: str | None) -> str:
     body: dict[str, Any] = {
         "client_name": CLIENT_NAME,
         "token_endpoint_auth_method": "none",
-        "redirect_uris": [redirect_uri] if redirect_uri else [],
-        "grant_types": [DEVICE_GRANT]
-        if redirect_uri is None
-        else ["authorization_code"],
-        "response_types": [] if redirect_uri is None else ["code"],
     }
+    if redirect_uri is None:
+        body.update(grant_types=[DEVICE_GRANT], redirect_uris=[], response_types=[])
+    else:
+        body.update(
+            grant_types=["authorization_code"],
+            redirect_uris=[redirect_uri],
+            response_types=["code"],
+        )
     status, doc = _request(meta.registration_endpoint, body=body)
     if status not in (200, 201) or not isinstance(doc, dict) or "client_id" not in doc:
         raise LoginError(f"Filament refused to register this agent ({status}).")
@@ -256,15 +249,14 @@ def authorization_code_login(
             "the address it ends up on (it starts with http://127.0.0.1) here."
         )
         if open_browser:
-            try:
-                import webbrowser  # noqa: PLC0415 — only when a browser may exist
+            import webbrowser  # noqa: PLC0415 — only when a browser may exist
 
+            with contextlib.suppress(Exception):
                 webbrowser.open(url)
-            except Exception:
-                pass
         got = _wait_for_redirect(handler.done, lambda: handler.result, timeout_s)
     finally:
         server.shutdown()
+        server.server_close()
     if got.get("error"):
         raise LoginError(
             f"Sign-in was refused: {got.get('error_description') or got['error']}"
@@ -298,7 +290,11 @@ def device_login(
         meta.device_authorization_endpoint,
         form={"client_id": client_id, "scope": SCOPE, "resource": meta.resource},
     )
-    if status != 200 or not isinstance(doc, dict) or "device_code" not in doc:
+    if (
+        status != 200
+        or not isinstance(doc, dict)
+        or not {"device_code", "user_code", "verification_uri"} <= doc.keys()
+    ):
         raise LoginError(f"Filament refused device sign-in ({status}).")
     link = doc.get("verification_uri_complete") or doc["verification_uri"]
     out("To connect this agent, open this on any device signed in to Filament:")
