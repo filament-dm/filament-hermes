@@ -215,3 +215,9 @@ def test_a_reply_that_is_not_json_is_a_login_error(monkeypatch):
     monkeypatch.setattr(ol.urllib.request, "urlopen", lambda *a, **k: Resp())
     with pytest.raises(ol.LoginError, match="did not answer with JSON"):
         ol._request("https://api.example/x")
+
+
+def test_an_endpoint_query_is_kept():
+    url = ol._with_query("https://as.example/authorize?tenant=a", {"state": "s"})
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+    assert query == {"tenant": "a", "state": "s"}

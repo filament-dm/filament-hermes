@@ -129,6 +129,13 @@ def register_client(meta: ServerMetadata, redirect_uri: str | None) -> str:
     return str(doc["client_id"])
 
 
+def _with_query(url: str, params: dict[str, str]) -> str:
+    """*url* with *params* added to whatever query it already has."""
+    parts = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parts.query) + list(params.items())
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
 def pkce_pair() -> tuple[str, str]:
     verifier = secrets.token_urlsafe(48)
     digest = hashlib.sha256(verifier.encode()).digest()
@@ -197,7 +204,8 @@ def _wait_for_redirect(
 ) -> dict[str, str]:
     """The browser's redirect, or one pasted at the terminal, whichever comes."""
     deadline = time.monotonic() + timeout_s
-    interactive = sys.stdin.isatty()
+    # Paste-back reads stdin through select(), which Windows lacks for files.
+    interactive = sys.stdin.isatty() and sys.platform != "win32"
     while time.monotonic() < deadline:
         if done.wait(0.2):
             return get_result()
@@ -226,21 +234,18 @@ def authorization_code_login(
         verifier, challenge = pkce_pair()
         state = secrets.token_urlsafe(16)
         handler.state = state
-        url = (
-            meta.authorization_endpoint
-            + "?"
-            + urllib.parse.urlencode(
-                {
-                    "response_type": "code",
-                    "client_id": client_id,
-                    "redirect_uri": redirect_uri,
-                    "scope": SCOPE,
-                    "state": state,
-                    "code_challenge": challenge,
-                    "code_challenge_method": "S256",
-                    "resource": meta.resource,
-                }
-            )
+        url = _with_query(
+            meta.authorization_endpoint,
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "scope": SCOPE,
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": meta.resource,
+            },
         )
         out("Sign in to Filament to connect this agent:")
         out(f"  {url}")
@@ -263,6 +268,8 @@ def authorization_code_login(
         )
     if got.get("state") != state:
         raise LoginError("Sign-in answered a different request. Run the login again.")
+    if not got.get("code"):
+        raise LoginError("Sign-in returned no authorization code. Run the login again.")
     return _token_from(
         *_exchange(
             meta,
