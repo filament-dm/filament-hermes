@@ -23,8 +23,10 @@ Each item is turned into the dataclass the FCM path already produces
 (``PushMessage``, ``ReactionMessage``, ``InviteMessage``, ``VouchMessage``),
 so the wake gate, trust zones, slash commands and the hello run unchanged. A
 poll row lacks some of what a push carried — the room's name, the sender's
-display name, whether the room is a DM — so the adapter fills those from
-``get_channel_details`` (``RoomInfo`` here), cached per room.
+display name, whether the room is a DM — unless the server puts them on
+the item (filament-dm/synapse#1156; ``room_info``). For an older server the
+adapter fills them from ``get_channel_details`` (``RoomInfo`` here), cached
+per room.
 
 Stdlib-only; the tool call, the dispatcher and the sleep are injected, so the
 whole loop is unit-tested standalone in ``tests/test_poll_transport.py``.
@@ -81,13 +83,33 @@ class PollItem:
     channel_id: str = ""
     thread_id: str | None = None
     is_backchannel: bool = False
-    # Absent from today's server; read when a server starts sending it.
+    # What a push said about the room and senders, from servers that send
+    # it (filament-dm/synapse#1156); None from older ones. See room_info.
     is_direct: bool | None = None
+    channel_name: str | None = None
+    loop_name: str | None = None
+    sender_names: dict[str, str] | None = None
     messages: list[dict] = field(default_factory=list)
     reactions: list[dict] = field(default_factory=list)
     loop_id: str = ""
     name: str | None = None
     sender: str = ""  # who invited or vouched
+
+
+def room_info(item: PollItem) -> RoomInfo | None:
+    """The item's own account of its room, when the server gave one.
+
+    A server that sends ``is_direct`` and ``sender_names`` sends the room's
+    name and loop with them, so the adapter needs no get_channel_details
+    call; an older server's item returns None and the adapter looks."""
+    if item.is_direct is None or item.sender_names is None:
+        return None
+    return RoomInfo(
+        name=item.channel_name or "",
+        loop_name=item.loop_name,
+        is_direct=item.is_direct,
+        members=dict(item.sender_names),
+    )
 
 
 @dataclass
@@ -122,6 +144,7 @@ def parse_item(raw: Any) -> PollItem | None:
         if not rows:
             return None
         is_direct = raw.get("is_direct")
+        names = raw.get("sender_names")
         return PollItem(
             kind=kind,
             raw=raw,
@@ -129,6 +152,13 @@ def parse_item(raw: Any) -> PollItem | None:
             thread_id=_str(raw.get("thread_id")) or None,
             is_backchannel=raw.get("is_backchannel") is True,
             is_direct=is_direct if isinstance(is_direct, bool) else None,
+            channel_name=_str(raw.get("channel_name")) or None,
+            loop_name=_str(raw.get("loop_name")) or None,
+            sender_names=(
+                {k: _str(v) for k, v in names.items() if isinstance(k, str)}
+                if isinstance(names, dict)
+                else None
+            ),
             messages=rows if kind == "message" else [],
             reactions=rows if kind == "reaction" else [],
         )

@@ -1542,14 +1542,17 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
     async def _run_poll_item(self, item: poll_transport.PollItem) -> None:
         rows = item.messages or item.reactions
-        info = await self._room_info_for(item.channel_id)
-        unknown = [
-            sender
-            for sender in (_str_field(row, "sender") for row in rows)
-            if sender and sender not in info.members
-        ]
-        if unknown:
-            info = await self._room_info_for(item.channel_id, unknown[0])
+        info = poll_transport.room_info(item)
+        if info is None:
+            # A server from before poll_work items described their room.
+            info = await self._room_info_for(item.channel_id)
+            unknown = [
+                sender
+                for sender in (_str_field(row, "sender") for row in rows)
+                if sender and sender not in info.members
+            ]
+            if unknown:
+                info = await self._room_info_for(item.channel_id, unknown[0])
         is_direct = info.is_direct if item.is_direct is None else item.is_direct
         for row in item.messages:
             body = _str_field(row, "body")

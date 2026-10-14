@@ -344,3 +344,30 @@ def test_a_run_of_failures_is_a_warning(caplog):
     _run(_loop(server, slept=[]), 3)
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1 and "failure 3" in warnings[0].getMessage()
+
+
+def test_a_server_that_describes_the_room_needs_no_lookup():
+    (item,) = pt.parse_response(
+        {
+            "work": [
+                _message_item(
+                    is_direct=False,
+                    channel_name="general",
+                    loop_name="Acme",
+                    sender_names={"@bob:s": "Bob", "@x:s": None},
+                )
+            ]
+        }
+    ).work
+    info = pt.room_info(item)
+    assert info == pt.RoomInfo(
+        name="general",
+        loop_name="Acme",
+        is_direct=False,
+        members={"@bob:s": "Bob", "@x:s": ""},
+    )
+
+
+def test_an_older_server_item_needs_the_lookup():
+    (item,) = pt.parse_response({"work": [_message_item()]}).work
+    assert pt.room_info(item) is None

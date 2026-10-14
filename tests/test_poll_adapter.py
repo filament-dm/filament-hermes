@@ -337,3 +337,23 @@ def test_poll_mode_connect_skips_fcm():
     adapter._seed_display_defaults = lambda: None
     assert asyncio.run(a._connect_attempt(False, "conn")) is True
     assert steps == ["poll", "connected"]
+
+
+def test_server_described_items_skip_the_room_lookup():
+    a = _make()
+    item = _item(
+        {
+            "kind": "message",
+            "channel_id": _ROOM,
+            "is_direct": True,
+            "channel_name": None,
+            "loop_name": None,
+            "sender_names": {"@bob:s": "Bobby"},
+            "messages": [_message()],
+        }
+    )
+    asyncio.run(a._run_poll_item(item))
+    (msg,) = a.pushed
+    assert msg.is_direct is True
+    assert msg.sender_display_name == "Bobby"
+    assert a._filament_api.calls == []
