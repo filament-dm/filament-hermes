@@ -868,7 +868,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         try:
             source = self.build_source(
                 chat_id=self._cc_room_id,
-                chat_name="backchannel",
+                chat_name=framing.session_label("first hello"),
                 chat_type="dm",
                 user_id=self._owner_id,
                 user_name=self._owner_name or self._owner_id,
@@ -2807,7 +2807,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         source = self.build_source(
             chat_id=msg.room_id,
-            chat_name=msg.room_name,
+            # A shared room keeps its own name: the model reads it there.
+            chat_name=msg.room_name
+            if is_shared
+            else framing.session_label(
+                self._owner_name
+                if is_backchannel
+                else msg.room_name or msg.sender_display_name
+            ),
             chat_type="group" if is_shared else "dm",
             user_id=msg.sender,
             user_name=msg.sender_display_name or msg.sender,

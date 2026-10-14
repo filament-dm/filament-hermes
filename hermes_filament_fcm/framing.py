@@ -345,6 +345,16 @@ def command_summary(slash_enabled: bool) -> str:
     )
 
 
+def session_label(name: str | None) -> str:
+    """The Hermes session name for a Filament DM or the backchannel.
+
+    Hermes lists sessions by their source's ``chat_name``; a Filament DM has
+    no room name, so the dashboard showed a raw room id. A DM's chat_name
+    never reaches the model (Hermes describes a DM by its user), so the label
+    is free to say where the session lives and with whom."""
+    return f"Filament \u00b7 {sanitize_meta(name)}" if name else "Filament"
+
+
 # The side session the first-contact hello turn runs in: a thread id no
 # Filament event has, so the gateway keys the hello apart from the
 # backchannel's own conversation. send() routes its reply to the backchannel's
