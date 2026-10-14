@@ -24,6 +24,7 @@ import os
 import re
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from agent.async_utils import safe_schedule_threadsafe
@@ -36,7 +37,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, slash, timeline, turn_context
+from . import framing, profile_seed, slash, timeline, turn_context
 from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -162,6 +163,49 @@ _VOUCH_ACCEPT_BACKOFF_S = 2.0
 
 # "Not passed": lets _wake tell an absent breadcrumb from one read as None.
 _UNSET: object = object()
+
+
+def _hermes_identity_paths() -> tuple[Path, str | None, Path | None]:
+    """(HERMES_HOME, active profile id, hermes-agent checkout) for seeding the
+    Filament profile. Only the home is required; the rest is best-effort."""
+    try:
+        from hermes_constants import get_hermes_home  # noqa: PLC0415
+
+        home = Path(get_hermes_home())
+    except ImportError:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    profile_name: str | None = None
+    with contextlib.suppress(Exception):
+        from hermes_cli.profiles import get_active_profile_name  # noqa: PLC0415
+
+        profile_name = get_active_profile_name()
+    root: Path | None = None
+    with contextlib.suppress(Exception):
+        import hermes_cli  # noqa: PLC0415
+
+        root = Path(hermes_cli.__file__).resolve().parent.parent
+    return home, profile_name, root
+
+
+def _read_yaml_mapping(path: Path) -> dict | None:
+    """A YAML file as a mapping, or None when missing or not one."""
+    text = _read_text(path)
+    if text is None:
+        return None
+    try:
+        import yaml  # noqa: PLC0415
+
+        data = yaml.safe_load(text)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _is_not_finalized(result: dict | None) -> bool:
@@ -696,6 +740,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # blocks or fails the connect.
             self._start_update_check()
 
+            # Name and avatar from the Hermes agent's identity while the
+            # profile is still the server's default, before the hello so the
+            # hello carries the new name. Bounded: never stalls the connect.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._seed_profile(), timeout=30.0)
+
             # First-contact hello, once the listener is up so the agent's
             # reply path is fully live. Never block/fail the connect on it.
             await self._maybe_greet()
@@ -705,6 +755,44 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             slog.exception("filament_fcm.connect.failed")
             self._set_fatal_error("connect_failed", "Connection failed", retryable=True)
             return False
+
+    async def _seed_profile(self) -> None:
+        """Seed the Filament profile from the Hermes agent (profile_seed.py).
+
+        Every connect, not only the first: it does nothing once the owner (or
+        an earlier connect) has named the agent, and a connect that could not
+        seed gets another go. Never raises."""
+        if not profile_seed.is_default_agent_name(self._self_name, self._owner_name):
+            return
+        try:
+            hermes_home, profile_name, hermes_root = _hermes_identity_paths()
+            wanted = profile_seed.seed_name(
+                profile_meta=_read_yaml_mapping(hermes_home / "profile.yaml"),
+                soul_text=_read_text(hermes_home / "SOUL.md"),
+                profile_name=profile_name,
+            )
+            avatar = profile_seed.find_avatar(hermes_home, hermes_root)
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not read the Hermes identity", exc_info=True
+            )
+            return
+
+        async def call(name: str, args: dict) -> tuple[Any, str | None]:
+            with bound_context(call_origin="profile_seed"):
+                raw = await self._filament_api.call_tool(name, args)
+            error = FilamentAPI.result_error(raw)
+            return (None if error else FilamentAPI.parse_tool_result(raw)), error
+
+        result = await profile_seed.seed_profile(
+            call,
+            display_name=self._self_name,
+            owner_name=self._owner_name,
+            wanted_name=wanted,
+            avatar=avatar,
+        )
+        if result is not None and result.name:
+            self._self_name = result.name
 
     async def _maybe_greet(self) -> None:
         """Fire a one-shot first-contact hello into the backchannel.
