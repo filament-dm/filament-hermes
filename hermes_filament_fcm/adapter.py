@@ -146,7 +146,7 @@ _NOTICE_STATUS_TIMEOUT_MS = 30_000
 
 # How long the first-contact hello turn may take before the canned hello goes
 # out instead: the app's connect screen is waiting on it.
-_HELLO_TIMEOUT_S = 30.0
+_HELLO_TIMEOUT_S = 45.0
 
 # How long a room's details (name, loop, member names) serve poll_work rows.
 _ROOM_INFO_TTL_S = 300.0
@@ -938,7 +938,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             logger.exception("filament-fcm: canned hello post failed")
             slog.exception("filament_fcm.greet.failed")
 
-    async def _send_hello(self, content: str, reply_to: str | None) -> SendResult:
+    async def _send_hello(
+        self, content: str, reply_to: str | None, metadata: Any = None
+    ) -> SendResult:
         """``send`` for the hello's side session (see ``_maybe_greet``).
 
         Only the turn's final reply — the one anchored on the hello trigger —
@@ -946,12 +948,27 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         command list appended. Anything else the side session sends (an error
         notice, tool progress) and any reply after the canned fallback went
         out is dropped: the principal sees exactly one hello."""
-        if (
-            reply_to != getattr(self, "_hello_trigger_id", None)
-            or self._hello_delivered
-            or not (content or "").strip()
-        ):
-            logger.info("filament-fcm: dropping a side-session send from the hello")
+        # Hermes marks a turn's final reply notify=True on both its delivery
+        # lanes; error notices and progress lines carry neither mark.
+        is_final = reply_to == getattr(self, "_hello_trigger_id", None) or (
+            isinstance(metadata, dict) and metadata.get("notify") is True
+        )
+        why = (
+            "not the turn's final reply"
+            if not is_final
+            else "a hello already went out"
+            if self._hello_delivered
+            else "it is empty"
+            if not (content or "").strip()
+            else None
+        )
+        if why:
+            logger.info(
+                "filament-fcm: dropping a side-session send from the hello "
+                "(%s; %d chars)",
+                why,
+                len(content or ""),
+            )
             return SendResult(success=True)
         self._hello_delivered = True
         body = f"{content.strip()}\n\n" + framing.command_summary(
@@ -1905,7 +1922,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if not self._filament_api:
             return SendResult(success=False, error="Not connected")
         if _metadata_value(metadata, "thread_id") == framing.HELLO_THREAD:
-            return await self._send_hello(content, reply_to)
+            return await self._send_hello(content, reply_to, metadata)
 
         parent_context = current_context()
         send_id = new_id("send")
@@ -3437,11 +3454,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             target_event_id=target,
             outcome=str(outcome),
         )
-        if target == getattr(self, "_hello_trigger_id", None):
-            # The final reply, if any, was sent before this hook runs: a
-            # hello turn that ended without one gets the canned hello now
-            # rather than at the fallback deadline.
-            await self._post_canned_hello("the hello turn ended without a reply")
+        if target == getattr(self, "_hello_trigger_id", None) and (
+            str(getattr(outcome, "value", outcome)).lower() == "failure"
+        ):
+            # Only a turn that failed outright ends the wait early. One that
+            # "succeeds" with nothing may still answer: the gateway runner
+            # can hand the turn to its queued lane and return empty, and that
+            # lane sends the model's reply later, anchored on the same
+            # trigger (live run h9: the canned hello went out here and the
+            # real one, arriving after, was dropped). The deadline covers it.
+            await self._post_canned_hello("the hello turn failed")
         await status_publisher.end_turn(
             getattr(event, "filament_turn_key", None) or target
         )

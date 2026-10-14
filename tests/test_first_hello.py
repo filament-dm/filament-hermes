@@ -240,13 +240,36 @@ def test_other_side_session_sends_are_dropped():
     assert len(a._filament_api.posted) == 1
 
 
-def test_a_turn_without_a_reply_gets_the_canned_hello():
+_SUCCESS = types.SimpleNamespace(value="success")
+_FAILURE = types.SimpleNamespace(value="failure")
+
+
+def test_a_failed_turn_gets_the_canned_hello():
     a = _make()
     _greet(a)
-    asyncio.run(a.on_processing_complete(_MessageEvent(message_id=_TRIGGER), "ok"))
+    asyncio.run(a.on_processing_complete(_MessageEvent(message_id=_TRIGGER), _FAILURE))
     ((channel, body),) = a._filament_api.posted
     assert channel == _CC
     assert body == framing.first_contact_hello("Hermes", False)
+
+
+def test_an_empty_success_waits_for_the_queued_reply():
+    # Live run h9: the runner handed the turn to its queued lane and the
+    # hook fired with nothing sent; the model's hello came after.
+    a = _make()
+    _greet(a)
+    asyncio.run(a.on_processing_complete(_MessageEvent(message_id=_TRIGGER), _SUCCESS))
+    assert a._filament_api.posted == []
+    asyncio.run(
+        a.send(
+            _CC,
+            "Hi, I'm Hermes.",
+            reply_to=_TRIGGER,
+            metadata={"thread_id": framing.HELLO_THREAD, "notify": True},
+        )
+    )
+    ((_, body),) = a._filament_api.posted
+    assert body.startswith("Hi, I'm Hermes.")
 
 
 def test_a_delivered_hello_is_not_followed_by_the_canned_one():
@@ -257,7 +280,7 @@ def test_a_delivered_hello_is_not_followed_by_the_canned_one():
             _CC, "Hi!", reply_to=_TRIGGER, metadata={"thread_id": framing.HELLO_THREAD}
         )
     )
-    asyncio.run(a.on_processing_complete(_MessageEvent(message_id=_TRIGGER), "ok"))
+    asyncio.run(a.on_processing_complete(_MessageEvent(message_id=_TRIGGER), _FAILURE))
     asyncio.run(a._hello_fallback(timeout=0.01))
     assert len(a._filament_api.posted) == 1
 
