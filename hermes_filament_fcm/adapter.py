@@ -578,6 +578,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
     async def _media_note(self, msg: PushMessage) -> str | None:
         """Describe *msg*'s attachments, or None if it has none (ENG-603).
+        See _media_lookup."""
+        note, _ = await self._media_lookup(msg)
+        return note
+
+    async def _media_lookup(self, msg: PushMessage) -> tuple[str | None, list]:
+        """*msg*'s attachment note (as ``_media_note``) and the media
+        descriptors it was built from (``[]`` when none were found).
 
         The push payload never carries media: an uncaptioned attachment
         arrives as content=null (has_content False), and a captioned one is
@@ -593,9 +600,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         attachment note.
         """
         note = None
+        media: list = []
         if msg.has_media is False:
             # The server said there is no attachment: nothing to fetch.
-            return None if msg.has_content else framing.NON_TEXT_NOTICE
+            return (None if msg.has_content else framing.NON_TEXT_NOTICE), media
         try:
             with bound_context(call_origin="media_lookup"):
                 result = await self._filament_api.get_thread(msg.event_id)
@@ -615,7 +623,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                             target = reply
                             break
             if isinstance(target, dict):
-                note = framing.summarize_media(target.get("media"), msg.event_id)
+                found = target.get("media")
+                media = found if isinstance(found, list) else []
+                note = framing.summarize_media(found, msg.event_id)
         except Exception:
             logger.warning(
                 "filament-fcm: could not fetch media details for %s",
@@ -623,8 +633,38 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
         if note is None and not msg.has_content:
-            return framing.NON_TEXT_NOTICE
-        return note
+            return framing.NON_TEXT_NOTICE, media
+        return note, media
+
+    async def _turn_images(
+        self, msg: PushMessage, media: list
+    ) -> tuple[list[str], list[str]]:
+        """Fetch a control turn's images for Hermes' own vision.
+
+        Control turns only: the principal (or the backchannel) sent them to
+        the agent. A data-plane image is never fetched unasked: its pixels
+        are untrusted content that would land in the model's context ahead
+        of any decision (text in an image is an injection surface the
+        framing can't wrap), and every participant in a shared channel
+        could make the agent spend a download and vision tokens. There the
+        note stands alone and the agent fetches with download_media if its
+        instructions call for it. Never raises (fetch_inbound_images).
+        """
+        if not media or not self._filament_api:
+            return [], []
+        try:
+            from gateway.platforms.base import get_image_cache_dir  # noqa: PLC0415
+
+            # Hermes' own inbound image cache: the directory it moves to the
+            # routed profile, and the one vision may read under a sandboxed
+            # terminal backend. The plugin's media dir is neither.
+            dest = Path(get_image_cache_dir())
+        except Exception:
+            dest = media_tool.media_dir()
+        with bound_context(call_origin="media_vision"):
+            return await media_tool.fetch_inbound_images(
+                self._filament_api, media, msg.event_id, dest
+            )
 
     # ── Control vs reactive plane ────────────────────────────────────
 
@@ -2906,6 +2946,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             and not slash.is_fil_command(slash_body)
             and is_owner
         )
+        image_paths: list[str] = []
+        image_types: list[str] = []
         if gateway_command:
             body = slash_body
             breadcrumb = None
@@ -2929,9 +2971,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 context_read = self._context_breadcrumb(
                     msg.room_id, msg.event_id, inline=True
                 )
-            media_note, breadcrumb = await asyncio.gather(
-                self._media_note(msg), context_read
+            (media_note, media), breadcrumb = await asyncio.gather(
+                self._media_lookup(msg), context_read
             )
+            image_paths, image_types = await self._turn_images(msg, media)
             body = framing.append_note(body, media_note)
             # Name the speaker in the turn's framing (see framing.control_body:
             # the principal is recognized by server-attributed id, never by
@@ -2998,6 +3041,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             channel_context=breadcrumb,
             channel_prompt=channel_prompt,
         )
+        if image_paths:
+            # Local files Hermes reads itself: attached to the model as
+            # images when it has vision, else described into the text. The
+            # attachment note stays in the body either way.
+            event.media_urls = image_paths
+            event.media_types = image_types
         logger.info(
             "Dispatching control message from %s (event=%s, room=%s)",
             msg.sender_display_name or msg.sender,
