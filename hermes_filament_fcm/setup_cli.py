@@ -16,6 +16,7 @@ Usage:
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -697,77 +698,135 @@ def _hermes_argv() -> list[str]:
 
 
 def _running_gateway_pid() -> int | None:
-    """The PID of this profile's running gateway, or None (or unknown)."""
+    """The PID of this profile's running gateway, or None.
+
+    Hermes's own check (lock + PID file verified against the live process),
+    else the PID `hermes gateway status` reports ("✓ Gateway is supervised
+    by launchd (PID 68581)") for an install whose modules aren't on this
+    process's path."""
     try:
         from gateway.status import get_running_pid  # noqa: PLC0415
-
-        return get_running_pid()
-    except Exception:
+    except ImportError:
+        pass
+    else:
+        try:
+            return get_running_pid()
+        except Exception:
+            return None
+    try:
+        result = subprocess.run(
+            [*_hermes_argv(), "gateway", "status"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError):
         return None
+    return _pid_from_status(result.stdout or "")
 
 
-# How long to wait for `hermes gateway install` / `restart` to finish. Both
-# return in seconds under a service manager; without one, `restart` runs the
-# gateway in the foreground and never returns, which is fine: it is detached.
+def _pid_from_status(out: str) -> int | None:
+    """The running gateway's PID in `hermes gateway status` output."""
+    for line in out.splitlines():
+        low = line.lower()
+        if "not running" in low or "stopped" in low or "\u2717" in line:
+            continue
+        match = re.search(r"\bpid:?\s*(\d+)", line, re.I)
+        if match and ("running" in low or "supervised" in low or "\u2713" in line):
+            return int(match.group(1))
+    return None
+
+
+# How long to wait for `hermes gateway install` / `start` / `restart` to
+# finish. Each returns in seconds under a service manager; without one,
+# `restart` runs the gateway in the foreground and never returns, which is
+# fine: it is detached.
 _GATEWAY_INSTALL_TIMEOUT_S = 120
 _GATEWAY_RESTART_WAIT_S = 45
+# How long a started gateway may take to hold its lock and write its PID.
+_GATEWAY_UP_WAIT_S = 30
 
 _ALREADY_INSTALLED = "already installed"
 
 
 def _ensure_gateway(*, hermes, run, popen, running_pid, sleep=time.sleep) -> str:
-    """Start the gateway on the new configuration, however it is set up.
+    """Leave a gateway running on the configuration just saved.
 
-    - A gateway already running (as a service, or by hand) is restarted.
-    - Otherwise the gateway is installed as a service (launchd/systemd/
-      Windows task) and started: a fresh Hermes has no gateway at all, and
-      `hermes filament login` is often the last thing anyone runs — the agent
-      that started it in the background has finished its turn by the time the
-      sign-in completes, so nothing else would start one.
-    - Where no service manager exists (containers, WSL, Termux), the gateway
-      is started in the background instead, as before.
+    - running (as a service, or by hand): restart it;
+    - installed as a service but not running: start it;
+    - not installed: install it as a service (launchd/systemd/Windows task)
+      and start it — a fresh Hermes has no gateway at all, and the agent that
+      ran the login in the background has ended its turn by the time the
+      sign-in completes, so nothing else would start one;
+    - no service manager (containers, WSL, Termux): start it in the
+      background, as before.
 
-    Every child runs in its own session with stdin closed, so it survives
-    this process: the login usually runs as a background child of an agent's
-    terminal tool, which may be torn down the moment the login exits. Returns
-    what happened (``installed``/``restarted``/``background``/``failed``)
-    after printing it."""
-    detached = {
-        "stdin": subprocess.DEVNULL,
-        "start_new_session": True,
-    }
+    Then it checks: a gateway is up only once it holds its lock under a new
+    PID (``gateway.status.get_running_pid``). One that isn't gets a single
+    restart and a second check (live run h9: launchd had the service loaded
+    with no process). Prints ``Gateway running (pid N).`` or says it isn't.
 
-    def install() -> str:
+    These are Hermes CLI subprocesses started directly, never through a
+    shell or an agent's terminal tool, so Hermes's approval gate for shell
+    commands that restart the gateway does not apply. Every child runs in its
+    own session with stdin closed, so it survives this process: the login
+    usually runs as a background child of an agent's terminal tool, which may
+    be torn down the moment the login exits. Returns ``running`` or
+    ``failed``."""
+    detached = {"stdin": subprocess.DEVNULL, "start_new_session": True}
+
+    def cli(*args: str, timeout: float) -> tuple[int | None, str]:
+        """Run ``hermes <args>``; (exit code or None on error, output)."""
         try:
             result = run(
-                [
-                    *hermes,
-                    "gateway",
-                    "install",
-                    "--if-missing",
-                    "--start-now",
-                    "--start-on-login",
-                ],
+                [*hermes, *args],
                 capture_output=True,
                 text=True,
-                timeout=_GATEWAY_INSTALL_TIMEOUT_S,
+                timeout=timeout,
                 check=False,
                 **detached,
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
-            return f"error: {exc}"
-        out = f"{result.stdout or ''}\n{result.stderr or ''}"
+            return None, str(exc)
+        return result.returncode, f"{result.stdout or ''}\n{result.stderr or ''}"
+
+    def last_line(out: str) -> str:
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    def install() -> str:
+        """``installed``, ``already``, or ``error: <why>``."""
+        code, out = cli(
+            "gateway",
+            "install",
+            "--if-missing",
+            "--start-now",
+            "--start-on-login",
+            timeout=_GATEWAY_INSTALL_TIMEOUT_S,
+        )
         if _ALREADY_INSTALLED in out.lower():
             return "already"
-        if result.returncode != 0:
-            tail = [line.strip() for line in out.splitlines() if line.strip()]
-            return f"error: {tail[-1] if tail else f'exit {result.returncode}'}"
-        return "ok"
+        if code != 0:
+            return f"error: {last_line(out) or f'exit {code}'}"
+        # `install` exits 0 on hosts it can't serve too (a container says so
+        # and returns): ask again, which only an install answers with
+        # "already installed".
+        _code, again = cli(
+            "gateway",
+            "install",
+            "--if-missing",
+            "--no-start-now",
+            timeout=_GATEWAY_INSTALL_TIMEOUT_S,
+        )
+        if _ALREADY_INSTALLED in again.lower():
+            return "installed"
+        return f"error: {last_line(out) or 'no service manager'}"
 
-    def restart() -> str:
-        """``restarted`` when the command finished cleanly, ``background``
-        when it is still running (a foreground gateway, by design),
-        ``failed`` otherwise."""
+    def restart() -> bool:
+        """Start ``hermes gateway restart`` detached; False if it failed.
+        Still running at the deadline is a foreground gateway: left be."""
         try:
             child = popen(
                 [*hermes, "gateway", "restart"],
@@ -776,57 +835,65 @@ def _ensure_gateway(*, hermes, run, popen, running_pid, sleep=time.sleep) -> str
                 **detached,
             )
         except OSError as exc:
-            print_warning(
-                f"Could not restart the gateway ({exc}). Run: hermes gateway restart"
-            )
-            return "failed"
+            print_warning(f"Could not restart the gateway ({exc}).")
+            return False
         deadline = time.monotonic() + _GATEWAY_RESTART_WAIT_S
         while time.monotonic() < deadline:
             code = child.poll()
             if code is not None:
-                if code == 0:
-                    return "restarted"
-                print_warning(
-                    f"`hermes gateway restart` exited {code}. "
-                    "Check: hermes gateway status"
-                )
-                return "failed"
+                if code != 0:
+                    print_warning(f"`hermes gateway restart` exited {code}.")
+                return code == 0
             sleep(0.5)
-        return "background"
+        return True
 
-    if running_pid() is not None:
-        print_info("Restarting the gateway...")
-        outcome = restart()
+    def start() -> bool:
+        code, out = cli("gateway", "start", timeout=_GATEWAY_INSTALL_TIMEOUT_S)
+        if code != 0:
+            print_warning(f"`hermes gateway start` failed: {last_line(out)}")
+        return code == 0
+
+    def came_up(previous: int | None) -> int | None:
+        deadline = time.monotonic() + _GATEWAY_UP_WAIT_S
+        while True:
+            pid = running_pid()
+            if pid is not None and pid != previous:
+                return pid
+            if time.monotonic() >= deadline:
+                return None
+            sleep(1.0)
+
+    previous = running_pid()
+    if previous is not None:
+        print_info(f"Restarting the gateway (pid {previous})...")
+        restart()
     else:
         print_info("Starting the gateway...")
         installed = install()
-        if installed == "ok":
-            # `install` exits 0 on hosts it can't serve too (a container says
-            # so and returns): ask again, which only an install answers with
-            # "already installed".
-            installed = "installed" if install() == "already" else "no-service"
         if installed == "installed":
-            print_success("Gateway installed and started.")
-            return "installed"
-        if installed == "already":
-            # A service that is installed but stopped: restart starts it.
-            outcome = restart()
+            print_info("Installed the gateway as a service.")
+        elif installed == "already":
+            start()
         else:
-            reason = (
-                installed[len("error: ") :] if installed.startswith("error") else ""
-            )
             print_info(
-                "Could not install the gateway as a service"
-                + (f" ({reason})" if reason else "")
-                + "; starting it in the background instead."
+                f"Could not install the gateway as a service ({installed[7:]}); "
+                "starting it in the background instead."
             )
-            outcome = restart()
-    if outcome == "restarted":
-        print_success("Gateway restarted.")
-    elif outcome == "background":
-        print_success("Gateway started in the background.")
-        print_info("Logs: ~/.hermes/logs/gateway.log  Check: hermes gateway status")
-    return outcome
+            restart()
+    pid = came_up(previous)
+    if pid is None:
+        # One more go: a service can be loaded with no process behind it.
+        print_info("The gateway is not up yet; restarting it once more...")
+        restart()
+        pid = came_up(previous)
+    if pid is not None:
+        print_success(f"Gateway running (pid {pid}).")
+        return "running"
+    print_warning(
+        "The gateway did not come up. Check: hermes gateway status "
+        "(log: ~/.hermes/logs/gateway.log)"
+    )
+    return "failed"
 
 
 def main() -> None:
