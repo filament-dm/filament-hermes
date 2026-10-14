@@ -105,7 +105,7 @@ def append_note(body: str | None, note: str | None) -> str:
     return f"{body}\n{note}"
 
 
-def summarize_media(media: Any) -> str | None:
+def summarize_media(media: Any, message_id: str | None = None) -> str | None:
     """Renders a message's attachment metadata as a bracketed note.
 
     Push payloads never include media (ENG-603): an uncaptioned image arrives
@@ -114,9 +114,17 @@ def summarize_media(media: Any) -> str | None:
     metadata comes from the get_thread tool. Filenames are sender-controlled,
     so they are sanitized before they enter the note.
 
+    Each descriptor's ``duration`` and ``thumbnail_url`` are left out (a
+    thumbnail is only a smaller copy), and so is the server's ``download``
+    hint: it names get_media_download_url and a curl, a shell path a gated
+    data turn may not have. The note points at download_media instead, one
+    call that takes whichever route the server offers.
+
     Args:
         media: The media list from a get_thread event. Any value that is not a
             list of dicts yields None.
+        message_id: The id of the message carrying the media. Named in the
+            note because the signed-URL route needs it.
 
     Returns:
         One bracketed note describing every attachment found, or None when
@@ -144,11 +152,13 @@ def summarize_media(media: Any) -> str | None:
         items.append(f"{name} ({', '.join(details)})" if details else name)
     if not items:
         return None
+    message = sanitize_meta(message_id or "", limit=200)
+    source = f" and message_id {message}" if message else ""
     return (
         "[attachment: "
         + "; ".join(items)
-        + " — use the download_media tool with the mxc:// url to save the "
-        "file to local disk]"
+        + f" — use the download_media tool with the mxc:// url{source} to "
+        "save the file to local disk]"
     )
 
 

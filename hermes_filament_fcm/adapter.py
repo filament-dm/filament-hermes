@@ -607,7 +607,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                             target = reply
                             break
             if isinstance(target, dict):
-                note = framing.summarize_media(target.get("media"))
+                note = framing.summarize_media(target.get("media"), msg.event_id)
         except Exception:
             logger.warning(
                 "filament-fcm: could not fetch media details for %s",

@@ -2,10 +2,11 @@
 
 The agents MCP surface deliberately never streams media bytes through
 ``tools/call`` (results are JSON): read tools surface an ``mxc_url``
-reference in their ``media`` blocks, and the bytes come from the
-``/mcp/agents/media`` side-channel. This module wraps that side-channel as a
-local gateway tool so the agent can save an attachment to disk and work on
-it with its other tools.
+reference in their ``media`` blocks, and the bytes come from a signed URL
+(``get_media_download_url``) or the ``/mcp/agents/media`` side-channel. This
+module wraps both (``FilamentAPI.fetch_media`` picks) as one local gateway
+tool, so the agent can save an attachment to disk in one call — no shell,
+which a gated data turn may not have — and work on it with its other tools.
 
 Lives in its own module (not ``__init__``) so it can be unit-tested without
 pulling in the Hermes CLI/gateway packages.
@@ -33,8 +34,9 @@ DOWNLOAD_MEDIA_SCHEMA: dict[str, Any] = {
         "Download a message attachment (image, file, video, audio) to local "
         "disk and return the saved file path. Get the mxc_url from the "
         "'media' block of get_thread / get_recent_messages results, or from "
-        "an '[attachment: ...]' note in a message. Pass the attachment's "
-        "filename too so the saved file keeps its extension."
+        "an '[attachment: ...]' note in a message. Pass the message_id of "
+        "the message it came from, and the attachment's filename so the "
+        "saved file keeps its extension."
     ),
     "parameters": {
         "type": "object",
@@ -42,6 +44,11 @@ DOWNLOAD_MEDIA_SCHEMA: dict[str, Any] = {
             "mxc_url": {
                 "type": "string",
                 "description": "The attachment's mxc:// URL",
+            },
+            "message_id": {
+                "type": "string",
+                "description": "The message_id of the message the attachment "
+                "came from",
             },
             "filename": {
                 "type": "string",
@@ -81,6 +88,7 @@ def make_download_media_handler(api: FilamentAPI):
                     "results"
                 }
             )
+        message_id = str(args.get("message_id") or "").strip() or None
         # Name the file by media id (unguessable, collision-free) plus the
         # sanitized original filename so the extension survives.
         media_id = _safe_filename(mxc_url.rstrip("/").rsplit("/", 1)[-1]) or "media"
@@ -91,7 +99,7 @@ def make_download_media_handler(api: FilamentAPI):
         path = dest / name
         try:
             # Streamed straight to disk — media can be large (video/document).
-            nbytes = await api.download_media(mxc_url, str(path))
+            nbytes = await api.fetch_media(mxc_url, str(path), message_id=message_id)
         except Exception as exc:
             logger.exception("filament-fcm: download_media failed for %s", mxc_url)
             return json.dumps({"error": f"download failed: {exc}"})
