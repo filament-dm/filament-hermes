@@ -363,6 +363,12 @@ def register(ctx: Any) -> None:
     # share the same instance.  No network calls here — the session is
     # established later in adapter.connect().
     api = FilamentAPI(mcp_url, mcp_token)
+    # The server's tool list, live or the bundled manifest (see
+    # _resolve_tools). Fetched here, before the platform is registered, so the
+    # client knows which media routes the server offers (FilamentAPI
+    # .offers_tool) without a network call per message.
+    server_tools = _resolve_tools(mcp_url, mcp_token)
+    api.server_tools = frozenset(str(t.get("name", "")) for t in server_tools)
 
     # Descriptions of every tool this plugin registers, collected as they are
     # registered below. Feeds the tool-inventory report to the server (taking
@@ -484,9 +490,7 @@ def register(ctx: Any) -> None:
     # ``$MCP_BASE/mcp/agents/upload`` with ``Bearer $TOKEN`` — placeholders no
     # Hermes host defines. Rewrite them to this deployment's upload URL and
     # ``$FILAMENT_MCP_TOKEN`` before the model ever sees them (upload_hint.py).
-    all_tools = [
-        _rewrite_upload_hint(t, mcp_url) for t in _resolve_tools(mcp_url, mcp_token)
-    ]
+    all_tools = [_rewrite_upload_hint(t, mcp_url) for t in server_tools]
     # Session-economy hooks for the message-read proxies: the read
     # cursor (always on) and the compact_timeline flag (read fresh per
     # call). Fresh store instances — like every store, state lives in the
