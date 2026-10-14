@@ -162,6 +162,32 @@ def summarize_media(media: Any, message_id: str | None = None) -> str | None:
     )
 
 
+def sending_files_hint(signed_upload: bool) -> str:
+    """The platform hint's paragraph on sending a local file.
+
+    ``MEDIA:/path`` (Hermes' own phrasing) is the first way everywhere: the
+    adapter uploads the file itself (FCMFilamentAdapter._send_local_file), so
+    it needs no tool and no token. The tool route is named only where the
+    server offers ``create_media_upload``, the upload a model's shell can
+    complete: the shell never has the agent token the older bearer route
+    needs.
+    """
+    hint = (
+        "SENDING FILES:\n"
+        "You can send files natively: write MEDIA:/absolute/path/to/file in "
+        "your reply and the file is posted as an attachment (the rest of the "
+        "reply is sent as usual)."
+    )
+    if signed_upload:
+        hint += (
+            " To attach a file to a post_message or reply_in_thread call "
+            "instead, call create_media_upload, upload the file from your "
+            "shell with curl -T to the upload_url it returns (no token "
+            "needed), and pass the returned mxc_url in attachments."
+        )
+    return hint + "\n"
+
+
 def wake_signal(
     *,
     channel: str,

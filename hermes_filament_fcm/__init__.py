@@ -29,8 +29,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from . import framing, timeline, turn_context
 from . import reactive as reactive_mod
-from . import timeline, turn_context
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
 from .cli import register_cli
 from .deps import (
@@ -39,7 +39,7 @@ from .deps import (
     optional_dep_warnings,
     vendor_shadow_warnings,
 )
-from .filament_api import FilamentAPI
+from .filament_api import MEDIA_UPLOAD_TOOL, FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .observability import bound_context
 from .reactive import (
@@ -369,6 +369,7 @@ def register(ctx: Any) -> None:
     # .offers_tool) without a network call per message.
     server_tools = _resolve_tools(mcp_url, mcp_token)
     api.server_tools = frozenset(str(t.get("name", "")) for t in server_tools)
+    signed_upload = api.offers_tool(MEDIA_UPLOAD_TOOL)
 
     # Descriptions of every tool this plugin registers, collected as they are
     # registered below. Feeds the tool-inventory report to the server (taking
@@ -455,7 +456,8 @@ def register(ctx: Any) -> None:
             "get_recent_messages or get_thread. Do NOT use the "
             "send_message tool for Filament channels -- it cannot "
             "resolve Filament room IDs.\n"
-            "READING MESSAGES:\n"
+            + framing.sending_files_hint(signed_upload)
+            + "READING MESSAGES:\n"
             "You may not see every message in a channel. To see "
             "recent channel messages (others' chatter, rechats, or "
             "your own earlier posts) call the get_recent_messages "
@@ -487,11 +489,12 @@ def register(ctx: Any) -> None:
     # server when possible, with the static manifest as a fallback. Each
     # handler closes over ``api`` — the same instance the adapter will
     # use — so tool calls proxy through the live MCP session.
-    # The server's attachment hint tells the model to curl
-    # ``$MCP_BASE/mcp/agents/upload`` with ``Bearer $TOKEN`` — placeholders no
-    # Hermes host defines. Rewrite them to this deployment's upload URL and
-    # ``$FILAMENT_MCP_TOKEN`` before the model ever sees them (upload_hint.py).
-    all_tools = [_rewrite_upload_hint(t, mcp_url) for t in server_tools]
+    # The server's attachment hint offers a bearer curl against
+    # ``$MCP_BASE`` / ``$TOKEN``, placeholders no Hermes host defines, and a
+    # token the model's shell never has. Cut it where the server offers the
+    # signed-URL upload, else fill in this deployment's values, before the
+    # model ever sees them (upload_hint.py).
+    all_tools = [_rewrite_upload_hint(t, mcp_url, signed_upload) for t in server_tools]
     # Session-economy hooks for the message-read proxies: the read
     # cursor (always on) and the compact_timeline flag (read fresh per
     # call). Fresh store instances — like every store, state lives in the
@@ -562,6 +565,12 @@ def register(ctx: Any) -> None:
 # reactive turn spent two model rounds rediscovering message_principal's
 # schema before it could follow its own instructions. Core tools are never
 # deferred; these join that set.
+#
+# create_media_upload is deliberately not one of them. A reply sends a local
+# file with MEDIA:/path and no tool at all, so the upload tool serves only an
+# explicit post_message/reply_in_thread attachment — rare, and named by
+# post_message's own attachments description, so a tool_search finds it. Kept
+# visible it would cost its schema on every turn for that.
 ALWAYS_VISIBLE_TOOLS = (
     "message_principal",
     "get_recent_messages",
