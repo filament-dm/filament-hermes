@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,25 @@ def media_dir() -> Path:
     """Directory downloaded attachments are saved to."""
     home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
     return Path(home) / "filament_media"
+
+
+def local_file_problem(path: str) -> str | None:
+    """Why the local file at *path* can't be sent as an attachment, or None.
+
+    Hermes has already checked a ``MEDIA:`` path against its own delivery
+    policy (credential and system paths); this only makes sure it is a
+    regular file this process can read, so the upload never streams a
+    directory, a device or a FIFO.
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        return f"cannot read {os.path.basename(path)}: {exc.strerror}"
+    if not stat.S_ISREG(st.st_mode):
+        return f"{os.path.basename(path)} is not a regular file"
+    if not os.access(path, os.R_OK):
+        return f"cannot read {os.path.basename(path)}"
+    return None
 
 
 def make_download_media_handler(api: FilamentAPI):

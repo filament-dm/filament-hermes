@@ -37,7 +37,15 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, poll_transport, profile_seed, slash, timeline, turn_context
+from . import (
+    framing,
+    media_tool,
+    poll_transport,
+    profile_seed,
+    slash,
+    timeline,
+    turn_context,
+)
 from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -1947,11 +1955,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             call_origin="adapter_send",
         ):
             try:
-                thread_id = reply_thread_for_send(
-                    (metadata or {}).get("thread_id") if metadata else None,
-                    turn_context.current().reply_anchor,
-                    chat_id,
-                )
+                thread_id = self._send_thread(chat_id, metadata)
 
                 # Mid-work system notices become a transient status line in
                 # shared channels (never a posted message); the backchannel
@@ -2056,6 +2060,128 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                 )
                 return SendResult(success=False, error=str(e), retryable=True)
+
+    @staticmethod
+    def _send_thread(chat_id: str, metadata: Any) -> str | None:
+        """The thread a send to *chat_id* lands in (None = top level): the
+        metadata's thread, else the turn's reply anchor in this room."""
+        return reply_thread_for_send(
+            (metadata or {}).get("thread_id") if metadata else None,
+            turn_context.current().reply_anchor,
+            chat_id,
+        )
+
+    # ── Native media sends ──────────────────────────────────────────
+    # A reply carrying ``MEDIA:/absolute/path`` reaches these instead of
+    # send(): Hermes strips the tag and hands over the local file (images
+    # via send_image_file, audio via send_voice, video, anything else as a
+    # document). The file is uploaded by this process (FilamentAPI
+    # .upload_media) and posted as an attachment where send() would have
+    # put the reply, the caption as its body. The model only ever named a
+    # path. A failure returns success=False, and Hermes tells the chat the
+    # file didn't arrive.
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(chat_id, image_path, caption, metadata)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(
+            chat_id, file_path, caption, metadata, file_name=file_name
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(chat_id, video_path, caption, metadata)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        # Every audio file comes here (and auto-TTS, via play_tts). Filament
+        # has no voice bubble: it is posted as an m.audio attachment.
+        return await self._send_local_file(chat_id, audio_path, caption, metadata)
+
+    async def _send_local_file(
+        self,
+        chat_id: str,
+        path: str,
+        caption: str | None,
+        metadata: Any,
+        file_name: str | None = None,
+    ) -> SendResult:
+        """Upload the file at *path* and post it to *chat_id* (see above)."""
+        if not self._filament_api:
+            return SendResult(success=False, error="Not connected")
+        problem = media_tool.local_file_problem(path)
+        if problem:
+            logger.warning("filament-fcm: not sending media: %s", problem)
+            return SendResult(success=False, error=problem)
+        filename = file_name or os.path.basename(path)
+        thread_id = self._send_thread(chat_id, metadata)
+        with bound_context(
+            installation_id=self._installation_id, call_origin="adapter_send_media"
+        ):
+            try:
+                mxc = await self._filament_api.upload_media(path, filename=filename)
+                attachments = [{"mxc_url": mxc, "filename": filename}]
+                if thread_id:
+                    result = await self._filament_api.reply_in_thread(
+                        message_id=thread_id,
+                        markdown_body=caption or "",
+                        attachments=attachments,
+                    )
+                else:
+                    result = await self._filament_api.post_message(
+                        channel=chat_id,
+                        markdown_body=caption or "",
+                        attachments=attachments,
+                    )
+            except Exception as e:
+                logger.warning("filament-fcm: media send failed: %s", e)
+                return SendResult(success=False, error=str(e))
+        error = FilamentAPI.result_error(result)
+        if error is None and isinstance(result, dict) and result.get("error"):
+            error = str(result["error"])
+        if error is not None:
+            logger.warning("filament-fcm: media post failed: %s", error)
+            return SendResult(success=False, raw_response=result, error=error)
+        slog.info(
+            "filament_fcm.send.media",
+            installation_id=self._installation_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            event_id=_result_event_id(result),
+        )
+        return SendResult(success=True, raw_response=result)
 
     async def get_chat_info(self, chat_id: str) -> dict:
         """Return metadata about a chat/room."""
