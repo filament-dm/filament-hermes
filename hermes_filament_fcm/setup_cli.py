@@ -61,6 +61,10 @@ _FIREBASE_ENV_KEYS = (
     "FILAMENT_FIREBASE_SENDER_ID",
 )
 
+# Carried through to .env the same way, so `FILAMENT_TRANSPORT=poll hermes
+# filament login ...` leaves a gateway that polls (see poll_transport.py).
+_CARRIED_ENV_KEYS = (*_FIREBASE_ENV_KEYS, "FILAMENT_TRANSPORT")
+
 
 def _find_hermes_home() -> Path:
     """Resolve the Hermes home directory."""
@@ -468,8 +472,9 @@ def _run_interactive_setup() -> bool | None:
     # re-derives and persists the right backchannel at the next connect.
     save_env_value("FILAMENT_HOME_ROOM", "")
 
-    # Carry the Firebase project through to the gateway (see _FIREBASE_ENV_KEYS).
-    for key in _FIREBASE_ENV_KEYS:
+    # Carry the Firebase project through to the gateway (see _FIREBASE_ENV_KEYS),
+    # and the transport choice with it.
+    for key in _CARRIED_ENV_KEYS:
         value = (get_env_value(key) or "").strip()
         if value:
             save_env_value(key, value)
@@ -547,7 +552,8 @@ def _persist(token: str, url: str, principal_id: str | None) -> None:
     # _FIREBASE_ENV_KEYS). Against a non-production homeserver these come from
     # the invoking environment, and a gateway that starts without them registers
     # with the wrong project: it connects, looks healthy, and is never woken.
-    for key in _FIREBASE_ENV_KEYS:
+    # FILAMENT_TRANSPORT rides along the same way.
+    for key in _CARRIED_ENV_KEYS:
         value = (get_env_value(key) or "").strip()
         if value:
             save_env_value(key, value)

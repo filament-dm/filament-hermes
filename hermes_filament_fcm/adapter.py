@@ -37,7 +37,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, profile_seed, slash, timeline, turn_context
+from . import framing, poll_transport, profile_seed, slash, timeline, turn_context
 from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -147,6 +147,9 @@ _NOTICE_STATUS_TIMEOUT_MS = 30_000
 # How long the first-contact hello turn may take before the canned hello goes
 # out instead: the app's connect screen is waiting on it.
 _HELLO_TIMEOUT_S = 30.0
+
+# How long a room's details (name, loop, member names) serve poll_work rows.
+_ROOM_INFO_TTL_S = 300.0
 
 # How often the gateway asks to be probed. Long relative to the 20s heartbeat:
 # this is a reachability check, not a presence one, and each probe costs a push
@@ -292,6 +295,11 @@ def _metadata_keys(metadata: Any) -> list[str]:
     return sorted(str(key) for key in metadata)
 
 
+def _str_field(row: dict, key: str) -> str:
+    value = row.get(key)
+    return value if isinstance(value, str) else ""
+
+
 def _metadata_value(metadata: Any, key: str) -> str | None:
     if not isinstance(metadata, dict):
         return None
@@ -386,6 +394,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # Shared credential store (for FCM credentials only).
         self._credentials = CredentialStore()
+
+        # How inbound work arrives: FCM push (the default) or the poll_work
+        # long poll (FILAMENT_TRANSPORT=poll; see poll_transport.py). Read
+        # once: switching transports takes a gateway restart.
+        self._polling = (
+            poll_transport.transport_from_env(os.environ)
+            == poll_transport.TRANSPORT_POLL
+        )
+        self._poll_task: asyncio.Task | None = None
+        # room id → (RoomInfo, monotonic fetch time): what a push said about
+        # its room and sender, for poll rows that don't say it.
+        self._room_info: dict[str, tuple[poll_transport.RoomInfo, float]] = {}
 
         # Runtime state (populated during connect stages).
         self._fcm_client: FilamentFCMClient | None = None
@@ -691,11 +711,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         stage="initialize_api",
                     )
                 return False
-            if not await self._register_fcm():
+            if self._polling:
+                logger.info(
+                    "filament-fcm: transport is poll_work; skipping FCM "
+                    "registration (Stages 2-3)"
+                )
+            elif not await self._register_fcm():
                 logger.error("filament-fcm: Stage 2 (FCM registration) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="register_fcm")
                 return False
-            if not await self._register_pusher():
+            elif not await self._register_pusher():
                 logger.error("filament-fcm: Stage 3 (push token registration) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="register_pusher")
                 return False
@@ -718,7 +743,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         "continuing on local files"
                     )
 
-            if not await self._start_listener():
+            if self._polling:
+                self._start_polling()
+            elif not await self._start_listener():
                 logger.error("filament-fcm: Stage 4 (FCM listener) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="start_listener")
                 return False
@@ -1396,6 +1423,158 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             slog.exception("filament_fcm.stage.failed", stage="start_listener")
             return False
 
+    # ── poll_work transport ─────────────────────────────────────────
+
+    def _start_polling(self) -> None:
+        """Stage 4, poll flavor: the poll_work loop plus the presence
+        heartbeat the FCM listener would have started."""
+        logger.info("filament-fcm: [Stage 4] starting the poll_work loop")
+        slog.info("filament_fcm.stage.start", stage="start_polling")
+        self._poll_task = asyncio.create_task(self._run_poll_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        slog.info("filament_fcm.stage.complete", stage="start_polling")
+
+    async def _run_poll_loop(self) -> None:
+        loop = poll_transport.PollLoop(self._poll_call, self._dispatch_poll_item)
+        try:
+            await loop.run()
+        except poll_transport.PollFatal as e:
+            logger.error("filament-fcm: polling stopped: %s", e)
+            slog.error("filament_fcm.poll.fatal", error=str(e))
+            self._set_fatal_error("poll_failed", str(e), retryable=e.retryable)
+            await self._notify_fatal_error()
+
+    async def _poll_call(self, args: dict) -> tuple[Any, str | None]:
+        with bound_context(call_origin="poll_work"):
+            raw = await self._filament_api.call_tool("poll_work", args)
+        error = FilamentAPI.result_error(raw)
+        if error:
+            return None, error
+        result = raw.get("result") if isinstance(raw, dict) else None
+        if isinstance(result, dict) and result.get("isError"):
+            content = result.get("content") or [{}]
+            text = content[0].get("text") if isinstance(content[0], dict) else None
+            return None, str(text or "poll_work failed")
+        return FilamentAPI.parse_tool_result(raw), None
+
+    async def _room_info_for(
+        self, room_id: str, sender: str | None = None
+    ) -> poll_transport.RoomInfo:
+        """The room's name, loop, DM-ness and member names; cached for five
+        minutes, and fetched again early for a sender it doesn't know yet (a
+        new member). An unreadable room reads as nameless, never fails."""
+        cached = self._room_info.get(room_id)
+        now = time.monotonic()
+        if cached is not None:
+            info, fetched = cached
+            age = now - fetched
+            if age < _ROOM_INFO_TTL_S and (
+                sender is None or sender in info.members or age < 10
+            ):
+                return info
+        try:
+            with bound_context(call_origin="poll_room_info"):
+                raw = await self._filament_api.call_tool(
+                    "get_channel_details", {"channel_id": room_id}
+                )
+            if FilamentAPI.result_error(raw):
+                raise RuntimeError(FilamentAPI.result_error(raw))
+            info = poll_transport.room_info_from_details(
+                FilamentAPI.parse_tool_result(raw)
+            )
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not read room details for %s",
+                room_id,
+                exc_info=True,
+            )
+            return cached[0] if cached else poll_transport.RoomInfo()
+        self._room_info[room_id] = (info, now)
+        return info
+
+    async def _dispatch_poll_item(self, item: poll_transport.PollItem) -> None:
+        """Hand one poll_work item to the handler its FCM push would reach.
+
+        Message and reaction turns are scheduled, not awaited, as pushes are:
+        the next poll goes out while they run. An item's messages keep their
+        order."""
+        if item.kind == "invite":
+            self._on_invite(
+                InviteMessage(
+                    room_id=item.loop_id,
+                    branch_type="add_to_space",
+                    inviter=item.sender,
+                    inviter_id=item.sender,
+                    room_name=item.name or "",
+                    raw=item.raw,
+                )
+            )
+            return
+        if item.kind == "vouch":
+            self._on_vouch(
+                VouchMessage(
+                    loop_id=item.loop_id,
+                    inviter=item.sender,
+                    inviter_id=item.sender,
+                    loop_name=item.name,
+                    raw=item.raw,
+                )
+            )
+            return
+        self._schedule_async(self._run_poll_item(item), f"poll {item.kind}")
+
+    async def _run_poll_item(self, item: poll_transport.PollItem) -> None:
+        rows = item.messages or item.reactions
+        info = await self._room_info_for(item.channel_id)
+        unknown = [
+            sender
+            for sender in (_str_field(row, "sender") for row in rows)
+            if sender and sender not in info.members
+        ]
+        if unknown:
+            info = await self._room_info_for(item.channel_id, unknown[0])
+        is_direct = info.is_direct if item.is_direct is None else item.is_direct
+        for row in item.messages:
+            body = _str_field(row, "body")
+            await self._handle_push_message(
+                PushMessage(
+                    event_id=row["event_id"],
+                    room_id=item.channel_id,
+                    room_name=info.name,
+                    sender=_str_field(row, "sender"),
+                    sender_display_name=info.members.get(_str_field(row, "sender"), ""),
+                    body=body,
+                    is_direct=is_direct,
+                    branch_type="direct_message" if is_direct else "channel_message",
+                    thread_id=item.thread_id,
+                    is_mention=row.get("is_mention") is True,
+                    is_everyone_mention=poll_transport.everyone_mentioned(body),
+                    raw={"poll_work": row},
+                    has_content=bool(body.strip()) or not row.get("media"),
+                    loop_name=info.loop_name,
+                    has_media=bool(row.get("media")),
+                    sender_is_agent=row.get("is_from_agent")
+                    if isinstance(row.get("is_from_agent"), bool)
+                    else None,
+                )
+            )
+        for row in item.reactions:
+            await self._handle_reaction(
+                ReactionMessage(
+                    event_id=row["event_id"],
+                    room_id=item.channel_id,
+                    room_name=info.name,
+                    sender=_str_field(row, "sender"),
+                    sender_display_name=info.members.get(_str_field(row, "sender"), ""),
+                    key=_str_field(row, "key"),
+                    target_event_id=_str_field(row, "target_event_id"),
+                    removed=False,
+                    is_direct=is_direct,
+                    thread_id=item.thread_id,
+                    raw={"poll_work": row},
+                )
+            )
+
     async def _heartbeat_loop(self, interval_seconds: int = 20) -> None:
         """Keep the agent's Filament presence alive while the gateway runs.
 
@@ -1446,7 +1625,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         raises: a failed probe request is itself a symptom, not a reason to
         disturb the heartbeat.
         """
-        if not self._filament_api:
+        if not self._filament_api or getattr(self, "_polling", False):
+            # The probe tests the FCM path; a polling agent has none.
             return
         now = time.monotonic()
         if (
@@ -1685,6 +1865,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         if self._fcm_client:
             await self._fcm_client.stop()
+
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
 
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
