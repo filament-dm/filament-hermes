@@ -345,11 +345,42 @@ def command_summary(slash_enabled: bool) -> str:
     )
 
 
-def first_contact_hello(agent_name: str | None, slash_enabled: bool) -> str:
-    """The canned first-contact hello — the connect flow's finish line.
+# The side session the first-contact hello turn runs in: a thread id no
+# Filament event has, so the gateway keys the hello apart from the
+# backchannel's own conversation. send() routes its reply to the backchannel's
+# main timeline (adapter._send_hello).
+HELLO_THREAD = "filament-first-hello"
 
-    Deterministic, not a model turn: the app waits for this message, so it
-    must land the moment the gateway is up and say exactly what it says.
+
+def first_contact_prompt(agent_name: str | None, owner_name: str | None) -> str:
+    """The one-time turn that writes the first-contact hello.
+
+    Read by the model as its principal's message, so it says it is the
+    gateway speaking. The facts the canned hello carries are asked for here;
+    the command list is not, because send() appends it verbatim."""
+    named = (
+        f' Your name on Filament is "{sanitize_meta(agent_name)}".'
+        if agent_name
+        else ""
+    )
+    owner = f", {sanitize_meta(owner_name)}" if owner_name else ""
+    return (
+        "[system: You just joined Filament, a group chat app, for your "
+        f"principal{owner}. This is your private chat with them, and they are "
+        f"waiting to see you arrive.{named} Reply with one short message of two "
+        "to four sentences, in your own voice: say hello and introduce "
+        "yourself by name; say that here they can ask you questions, give you "
+        "tasks, or tell you how to behave; name one or two concrete things you "
+        "can do for them; and say they can add you to other chats, where you "
+        "hold back until they tell you here what they want. No heading, no "
+        "list of commands (one is added after your message), and use no tools.]"
+    )
+
+
+def first_contact_hello(agent_name: str | None, slash_enabled: bool) -> str:
+    """The canned first-contact hello — the connect flow's finish line when
+    the hello turn (first_contact_prompt) fails or is too slow.
+
     The agent's name comes from get_self; when it is unknown the hello
     simply drops the name clause. The command list
     rides along because commands are handled before any turn — the one

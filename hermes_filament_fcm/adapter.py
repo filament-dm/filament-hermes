@@ -144,6 +144,10 @@ _MAX_MESSAGE_LENGTH = 16000
 # tested there). _NOTICE_STATUS_TIMEOUT_MS is how long one stays visible.
 _NOTICE_STATUS_TIMEOUT_MS = 30_000
 
+# How long the first-contact hello turn may take before the canned hello goes
+# out instead: the app's connect screen is waiting on it.
+_HELLO_TIMEOUT_S = 30.0
+
 # How often the gateway asks to be probed. Long relative to the 20s heartbeat:
 # this is a reachability check, not a presence one, and each probe costs a push
 # to the machine hosting the agent.
@@ -402,6 +406,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # Agent identity (populated during Stage 1 via get_self MCP tool).
         self._user_id: str | None = None
+
+        # The first-contact hello turn in flight, and whether a hello (its
+        # reply or the canned fallback) has gone out. See _maybe_greet.
+        self._hello_trigger_id: str | None = None
+        self._hello_delivered: bool = False
 
         # Loops whose vouch is mid-accept. The startup sweep and a live
         # knock_invite_received push can name the same loop at once (the sweep
@@ -795,18 +804,24 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             self._self_name = result.name
 
     async def _maybe_greet(self) -> None:
-        """Fire a one-shot first-contact hello into the backchannel.
+        """Say a one-shot first-contact hello in the backchannel.
 
         The server is the authority on whether a greeting is due (it appends
         the directive to the initialize instructions only while
-        has_messaged_backchannel is false). We act on that by running a single
-        synthetic agent turn addressed to the principal; the gateway routes the
-        agent's reply to the backchannel like any other turn. Because the gate
-        clears as soon as the agent posts there, this never double-greets, and
-        a hello that fails to land simply re-prompts on the next connect.
+        has_messaged_backchannel is false). Because the gate clears as soon as
+        the agent posts there, this never double-greets, and a hello that
+        fails to land simply re-prompts on the next connect.
 
-        The CC harness gets the same nudge for free by reading the directive in
-        the instructions it already receives — this is the Hermes equivalent.
+        The hello is one model turn, so it is in the agent's own voice and
+        name; the command list is appended in code (``send``), since commands
+        run before any turn and a model can't be trusted to state them. It
+        runs in a side session of the backchannel's (``framing.HELLO_THREAD``)
+        so its gateway-written prompt never shows up as the principal's
+        message in the backchannel conversation, in the model's history or in
+        the Hermes dashboard. The app's connect screen waits for this message,
+        so a turn that says nothing, fails, or takes longer than
+        ``_HELLO_TIMEOUT_S`` falls back to the canned hello. Never blocks or
+        fails the connect.
         """
         if not self._greet_pending:
             return
@@ -818,94 +833,116 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # One-shot within this process; the server's gate covers reconnects.
         self._greet_pending = False
-
+        self._hello_trigger_id = f"first-hello:{self._cc_room_id}"
+        self._hello_delivered = False
+        logger.info(
+            "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
+        )
         try:
-            # Deterministic, not a model turn: the hello is the connect flow's
-            # finish line (the app literally waits for it), so it should land
-            # the moment the gateway is up — an LLM round added ~6 seconds of
-            # pure wait and could say anything. Personality gets its chance on
-            # the first real exchange.
-            logger.info(
-                "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
-            )
-            with bound_context(
-                installation_id=self._installation_id,
-                gateway_instance_id=self._gateway_instance_id,
-                call_origin="first_contact_greet",
-            ):
-                slog.info(
-                    "filament_fcm.greet.dispatch",
-                    channel_id=self._cc_room_id,
-                    principal_id=self._owner_id,
-                )
-                await self._filament_api.post_message(
-                    channel=self._cc_room_id,
-                    markdown_body=framing.first_contact_hello(
-                        self._self_name,
-                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS),
-                    ),
-                )
-                slog.info(
-                    "filament_fcm.greet.dispatched",
-                    channel_id=self._cc_room_id,
-                    principal_id=self._owner_id,
-                )
-            # Fire-and-forget capabilities intro: a short model turn in the
-            # backchannel session. Two jobs — a genuinely useful second
-            # message, and priming the session + provider prompt cache so the
-            # principal's FIRST real message answers warm (~3s faster,
-            # measured). Never awaited and never gates readiness.
-            with contextlib.suppress(RuntimeError):
-                task = asyncio.get_running_loop().create_task(self._greet_intro_turn())
-                self._background_greet_task = task
-        except Exception:
-            logger.exception("filament-fcm: greet post failed")
-            slog.exception("filament_fcm.greet.failed")
-
-    async def _greet_intro_turn(self) -> None:
-        """Background capabilities intro (see _maybe_greet). Best-effort."""
-        try:
-            trigger_id = f"greet-intro:{self._cc_room_id}"
             source = self.build_source(
                 chat_id=self._cc_room_id,
                 chat_name="backchannel",
                 chat_type="dm",
                 user_id=self._owner_id,
                 user_name=self._owner_name or self._owner_id,
-                message_id=trigger_id,
+                thread_id=framing.HELLO_THREAD,
+                message_id=self._hello_trigger_id,
             )
             policy, policy_set_keys = self._wake_policy.read_with_provenance()
-            channel_prompt = (
-                f"{framing.TOOL_MAP_PROMPT}\n\n"
-                + framing.wake_policy_prompt(policy, policy_set_keys)
-            )
             event = MessageEvent(
-                text=(
-                    "[system: You just connected and posted a canned hello in "
-                    "your backchannel. Follow it with ONE short message (no "
-                    "greeting, no tools): a line with two or three concrete "
-                    "things you can do for your principal; then, from the "
-                    "wake policy in your system prompt, one plain sentence on "
-                    "when you wake in shared channels; then one offer — they "
-                    "can have emoji reactions wake you, or set any of it per "
-                    "channel, just by asking here (e.g. 'wake on 🐞 reactions "
-                    "in the bug channel').]"
-                ),
+                text=framing.first_contact_prompt(self._self_name, self._owner_name),
                 message_type=MessageType.TEXT,
                 source=source,
-                message_id=trigger_id,
+                message_id=self._hello_trigger_id,
                 raw_message=None,
-                channel_prompt=channel_prompt,
+                channel_prompt=(
+                    f"{framing.TOOL_MAP_PROMPT}\n\n"
+                    + framing.wake_policy_prompt(policy, policy_set_keys)
+                ),
             )
             with bound_context(
                 installation_id=self._installation_id,
                 gateway_instance_id=self._gateway_instance_id,
                 call_origin="first_contact_greet",
-                trigger_event_id=trigger_id,
+                trigger_event_id=self._hello_trigger_id,
             ):
+                slog.info(
+                    "filament_fcm.greet.dispatch",
+                    channel_id=self._cc_room_id,
+                    principal_id=self._owner_id,
+                )
                 await self.handle_message(event)
         except Exception:
-            logger.debug("filament-fcm: greet intro turn failed", exc_info=True)
+            logger.exception("filament-fcm: greet turn dispatch failed")
+            slog.exception("filament_fcm.greet.failed")
+        with contextlib.suppress(RuntimeError):
+            task = asyncio.get_running_loop().create_task(self._hello_fallback())
+            self._background_greet_task = task
+
+    async def _hello_fallback(self, timeout: float | None = None) -> None:
+        """Post the canned hello unless the hello turn's reply lands first."""
+        deadline = time.monotonic() + (timeout or _HELLO_TIMEOUT_S)
+        while time.monotonic() < deadline:
+            if self._hello_delivered:
+                return
+            await asyncio.sleep(0.5)
+        await self._post_canned_hello("the hello turn took too long")
+
+    async def _post_canned_hello(self, why: str) -> None:
+        if self._hello_delivered or not self._cc_room_id:
+            return
+        self._hello_delivered = True
+        logger.info("filament-fcm: %s; posting the canned hello", why)
+        try:
+            with bound_context(call_origin="first_contact_greet"):
+                result = await self._filament_api.post_message(
+                    channel=self._cc_room_id,
+                    markdown_body=framing.first_contact_hello(
+                        self._self_name,
+                        self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS),
+                    ),
+                )
+            if FilamentAPI.result_error(result):
+                raise RuntimeError(FilamentAPI.result_error(result))
+            slog.info("filament_fcm.greet.dispatched", fallback=True)
+        except Exception:
+            # The server's gate re-prompts on the next connect.
+            self._hello_delivered = False
+            logger.exception("filament-fcm: canned hello post failed")
+            slog.exception("filament_fcm.greet.failed")
+
+    async def _send_hello(self, content: str, reply_to: str | None) -> SendResult:
+        """``send`` for the hello's side session (see ``_maybe_greet``).
+
+        Only the turn's final reply — the one anchored on the hello trigger —
+        is the hello; it goes to the backchannel's main timeline with the
+        command list appended. Anything else the side session sends (an error
+        notice, tool progress) and any reply after the canned fallback went
+        out is dropped: the principal sees exactly one hello."""
+        if (
+            reply_to != getattr(self, "_hello_trigger_id", None)
+            or self._hello_delivered
+            or not (content or "").strip()
+        ):
+            logger.info("filament-fcm: dropping a side-session send from the hello")
+            return SendResult(success=True)
+        self._hello_delivered = True
+        body = f"{content.strip()}\n\n" + framing.command_summary(
+            self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+        )
+        try:
+            result = await self._filament_api.post_message(
+                channel=self._cc_room_id, markdown_body=body
+            )
+        except Exception as e:
+            self._hello_delivered = False
+            return SendResult(success=False, error=str(e), retryable=True)
+        error = FilamentAPI.result_error(result)
+        if error:
+            self._hello_delivered = False
+            return SendResult(success=False, error=error, retryable=True)
+        slog.info("filament_fcm.greet.dispatched", fallback=False)
+        return SendResult(success=True, raw_response=result)
 
     def _note_reserved(self) -> None:
         """Mark this connect attempt blocked on an unfinalized agent, and tell
@@ -1682,6 +1719,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """Send a message via the Filament MCP API."""
         if not self._filament_api:
             return SendResult(success=False, error="Not connected")
+        if _metadata_value(metadata, "thread_id") == framing.HELLO_THREAD:
+            return await self._send_hello(content, reply_to)
 
         parent_context = current_context()
         send_id = new_id("send")
@@ -3206,6 +3245,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             target_event_id=target,
             outcome=str(outcome),
         )
+        if target == getattr(self, "_hello_trigger_id", None):
+            # The final reply, if any, was sent before this hook runs: a
+            # hello turn that ended without one gets the canned hello now
+            # rather than at the fallback deadline.
+            await self._post_canned_hello("the hello turn ended without a reply")
         await status_publisher.end_turn(
             getattr(event, "filament_turn_key", None) or target
         )
