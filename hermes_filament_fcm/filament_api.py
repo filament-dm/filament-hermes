@@ -50,6 +50,10 @@ class FilamentAPI:
         # event loop". See _client_for_loop.
         self._client: httpx.AsyncClient | None = None
         self._client_loop: asyncio.AbstractEventLoop | None = None
+        # poll_work's own client (see poll_work): the long poll never shares
+        # a connection, or a client, with anything else.
+        self._poll_client: httpx.AsyncClient | None = None
+        self._poll_client_loop: asyncio.AbstractEventLoop | None = None
 
     def _client_for_loop(self) -> httpx.AsyncClient:
         """Return an httpx client bound to the current running loop, recreating
@@ -85,6 +89,50 @@ class FilamentAPI:
                 with contextlib.suppress(RuntimeError):
                     asyncio.run_coroutine_threadsafe(old.aclose(), old_loop)
         return self._client
+
+    def _poll_client_for_loop(self) -> httpx.AsyncClient:
+        """The client poll_work uses: its own, bound to the polling loop, with
+        no idle connections kept.
+
+        The shared client is replaced whenever a call arrives from another
+        loop, and closing the old one cuts any request still in flight on it.
+        A 30-second long poll is almost always in flight, so it is the call
+        that loses. Without keep-alive every poll also opens a fresh
+        connection, so it is never sent on one a proxy has already closed for
+        idling. Live run h9 logged ``ReadError`` about every 50 s while idle;
+        those are the two ways a pooled long poll gets one. That costs
+        one TCP connect per poll, once every 30 seconds."""
+        loop = asyncio.get_running_loop()
+        if (
+            self._poll_client is None
+            or self._poll_client.is_closed
+            or self._poll_client_loop is not loop
+        ):
+            old, old_loop = self._poll_client, self._poll_client_loop
+            self._poll_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, read=70.0),
+                headers=version_headers(),
+                limits=httpx.Limits(max_keepalive_connections=0),
+            )
+            self._poll_client_loop = loop
+            if old is not None and old_loop is not None and old_loop.is_running():
+                with contextlib.suppress(RuntimeError):
+                    asyncio.run_coroutine_threadsafe(old.aclose(), old_loop)
+        return self._poll_client
+
+    async def poll_work(self, arguments: dict) -> dict[str, Any] | None:
+        """Call poll_work on its own client (see _poll_client_for_loop)."""
+        if not self.is_connected:
+            await self.initialize()
+        return await self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": self._next_rpc_id(),
+                "method": "tools/call",
+                "params": {"name": "poll_work", "arguments": arguments},
+            },
+            client=self._poll_client_for_loop(),
+        )
 
     async def initialize(self) -> dict[str, Any]:
         """Perform the MCP initialize handshake."""
@@ -651,8 +699,12 @@ class FilamentAPI:
         gateway reconnecting with this same instance) builds a fresh client
         instead of reusing a closed one.
         """
-        client, self._client, self._client_loop = self._client, None, None
-        if client is not None:
+        clients = (self._client, self._poll_client)
+        self._client = self._client_loop = None
+        self._poll_client = self._poll_client_loop = None
+        for client in clients:
+            if client is None:
+                continue
             try:
                 await client.aclose()
             except Exception:
@@ -663,8 +715,11 @@ class FilamentAPI:
         self._next_id += 1
         return rid
 
-    async def _post(self, body: dict) -> dict[str, Any] | None:
-        """Send a JSON-RPC POST to the MCP endpoint."""
+    async def _post(
+        self, body: dict, client: httpx.AsyncClient | None = None
+    ) -> dict[str, Any] | None:
+        """Send a JSON-RPC POST to the MCP endpoint (on ``client``, else the
+        shared one)."""
         method = body.get("method")
         params = body.get("params") if isinstance(body.get("params"), dict) else {}
         tool_name = params.get("name") if method == "tools/call" else None
@@ -685,7 +740,7 @@ class FilamentAPI:
             tool_name=tool_name,
             has_session_id=bool(self._session_id),
         )
-        resp = await self._client_for_loop().post(
+        resp = await (client or self._client_for_loop()).post(
             self._mcp_url,
             content=json.dumps(body),
             headers=headers,

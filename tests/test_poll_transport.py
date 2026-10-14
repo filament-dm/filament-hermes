@@ -321,3 +321,26 @@ def test_classify_error():
     assert pt.classify_error("Method not found: tools/call") == "unsupported"
     assert pt.classify_error("HTTP 429") == "retry"
     assert pt.classify_error("invalid response") == "retry"
+
+
+def test_a_dropped_connection_now_and_then_is_not_a_warning(caplog):
+    caplog.set_level("DEBUG", logger="gateway.filament_fcm")
+    server = _Server(
+        ({"work": [], "cursor": "c:1"}, None),
+        ConnectionError(),
+        ({"work": [], "cursor": "c:2"}, None),
+    )
+    loop = _loop(server, slept=[])
+    _run(loop, 3)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    # Same cursor on the retry: the server hands the same work again.
+    assert server.calls[2]["cursor"] == "c:1"
+    assert any("connection closed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_run_of_failures_is_a_warning(caplog):
+    caplog.set_level("DEBUG", logger="gateway.filament_fcm")
+    server = _Server(*[(None, "HTTP 502")] * 3)
+    _run(_loop(server, slept=[]), 3)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "failure 3" in warnings[0].getMessage()

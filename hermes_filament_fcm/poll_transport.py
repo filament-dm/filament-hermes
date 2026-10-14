@@ -52,6 +52,8 @@ DEFAULT_MAX_ITEMS = 10
 
 _BACKOFF_FIRST_S = 1.0
 _BACKOFF_MAX_S = 60.0
+# Consecutive failures before one is logged as a warning (then every tenth).
+_WARN_AFTER_FAILURES = 3
 
 _EVERYONE = re.compile(r"(?<![\w@])@(room|everyone|here)\b", re.I)
 
@@ -268,7 +270,7 @@ class PollLoop:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            error, data = f"{type(e).__name__}: {e}", None
+            error, data = f"{type(e).__name__}: {str(e) or 'connection closed'}", None
         self.polls += 1
         response = None if error else parse_response(data)
         if response is None:
@@ -286,7 +288,7 @@ class PollLoop:
                 )
             await self._back_off(reason)
             return
-        if self.failures:
+        if self.failures >= _WARN_AFTER_FAILURES:
             logger.info(
                 "filament-fcm: poll_work recovered after %d failure(s)", self.failures
             )
@@ -310,7 +312,16 @@ class PollLoop:
     async def _back_off(self, reason: str) -> None:
         self.failures += 1
         delay = min(_BACKOFF_FIRST_S * 2 ** (self.failures - 1), _BACKOFF_MAX_S)
-        log = logger.warning if self.failures in (1, 5) else logger.debug
+        # A dropped connection now and then is the network, not a fault: the
+        # retry passes the same cursor, so the server hands the same work
+        # again and nothing is lost or doubled. Only a run of failures is
+        # worth a warning.
+        log = (
+            logger.warning
+            if self.failures >= _WARN_AFTER_FAILURES
+            and (self.failures - _WARN_AFTER_FAILURES) % 10 == 0
+            else logger.debug
+        )
         log(
             "filament-fcm: poll_work failed (%s); retrying in %.0fs (failure %d)",
             reason,

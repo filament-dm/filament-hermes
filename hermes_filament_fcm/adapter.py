@@ -1463,7 +1463,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
     async def _poll_call(self, args: dict) -> tuple[Any, str | None]:
         with bound_context(call_origin="poll_work"):
-            raw = await self._filament_api.call_tool("poll_work", args)
+            raw = await self._filament_api.poll_work(args)
         error = FilamentAPI.result_error(raw)
         if error:
             return None, error
