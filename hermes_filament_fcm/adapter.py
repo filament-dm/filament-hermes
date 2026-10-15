@@ -1527,7 +1527,26 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         slog.info("filament_fcm.stage.complete", stage="start_polling")
 
     async def _run_poll_loop(self) -> None:
-        loop = poll_transport.PollLoop(self._poll_call, self._dispatch_poll_item)
+        cursor = self._credentials.load_poll_cursor(self._user_id)
+        if cursor:
+            logger.info(
+                "filament-fcm: polling from the cursor a draining gateway left, "
+                "so the work it could not run comes back"
+            )
+
+        def keep_cursor(value: str | None) -> None:
+            if value:
+                self._credentials.save_poll_cursor(value, self._user_id)
+            else:
+                self._credentials.clear_poll_cursor()
+
+        loop = poll_transport.PollLoop(
+            self._poll_call,
+            self._dispatch_poll_item,
+            cursor=cursor,
+            admitting=self._gateway_admitting,
+            keep_cursor=keep_cursor,
+        )
         try:
             await loop.run()
         except poll_transport.PollFatal as e:
@@ -1535,6 +1554,23 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             slog.error("filament_fcm.poll.fatal", error=str(e))
             self._set_fatal_error("poll_failed", str(e), retryable=e.retryable)
             await self._notify_fatal_error()
+
+    def _gateway_admitting(self) -> bool:
+        """Whether the gateway still starts turns.
+
+        A stopping or restarting gateway sets ``_draining`` first and keeps
+        the adapter connected until its active turns finish; its session
+        store refuses every new turn meanwhile (``runtime_draining``, which
+        it also raises while ``retiring``). Hermes builds without a
+        ``gateway_runner`` give no such signal: those read as admitting.
+        ``is True`` so a test double's attribute never reads as draining."""
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return True
+        if getattr(runner, "_draining", False) is True:
+            return False
+        authority = getattr(runner, "session_authority", None)
+        return getattr(authority, "retiring", False) is not True
 
     async def _poll_call(self, args: dict) -> tuple[Any, str | None]:
         with bound_context(call_origin="poll_work"):

@@ -12,9 +12,13 @@ The server's contract (synapse ``agents_mcp/tools_poll.py``):
 - ``work`` items are grouped by the place a reply goes and have a ``kind``:
   ``message`` (``messages``: the same rows ``get_recent_messages`` returns),
   ``reaction`` (``reactions``), ``invite`` and ``vouch`` (a loop to accept).
-- ``cursor`` acknowledges: passing it on the next poll marks everything up to
-  it read. Omitting it does the same from the server's saved position, so the
-  cursor kept here in memory only narrows the scan.
+- ``cursor`` acknowledges: passing a delivery's cursor on the next poll
+  finishes that delivery's work, and omitting it does the same from the
+  server's saved position. Work a poll hands over stays unfinished until a
+  reply, an ``ack``, or a poll passing its cursor (or none) finishes it, so a
+  poll passing the cursor from *before* a delivery gets that delivery's
+  unfinished work back. That is how work a draining gateway could not run
+  reaches the next one (see ``PollLoop``).
 - ``reply_with`` names the tool and target a reply must use, or is null where
   the agent may not answer. The adapter keeps routing replies the way it does
   for pushes; the server enforces the same rules on the tools it calls.
@@ -56,6 +60,11 @@ _BACKOFF_FIRST_S = 1.0
 _BACKOFF_MAX_S = 60.0
 # Consecutive failures before one is logged as a warning (then every tenth).
 _WARN_AFTER_FAILURES = 3
+
+# How often a loop held by a draining gateway looks again. The gateway's
+# disconnect() cancels it; this only bounds how long a drain that ends
+# without a disconnect leaves it idle.
+_HOLD_S = 1.0
 
 _EVERYONE = re.compile(r"(?<![\w@])@(room|everyone|here)\b", re.I)
 
@@ -271,7 +280,22 @@ class PollLoop:
     it): the next poll goes out as soon as the items are handed over. Errors
     back off exponentially (1 s doubling to 60 s) and recover on the next
     good answer; only an auth failure or a server without poll_work ends the
-    loop, by raising ``PollFatal``."""
+    loop, by raising ``PollFatal``.
+
+    ``admitting`` says whether the gateway still starts turns. A gateway
+    stopping or restarting drains first: it refuses every new turn
+    (``runtime_draining``) but keeps the adapter connected, so a poll
+    answered then hands over work nobody runs, and the next poll's cursor
+    would finish it on the server (live run h30-r2-reconnect-3: the owner's
+    DM was lost). While the gateway is not admitting, the loop sends no poll.
+    A poll that was already held when the drain began and comes back with
+    work hands none of it over: the loop keeps the cursor it sent and gives
+    it to ``keep_cursor``, which saves it for the next gateway. That gateway
+    starts from it (``cursor``), and the server hands the same work back.
+    ``keep_cursor(None)`` drops a saved cursor once a poll has used it.
+
+    Not covered: a turn dispatched just before the drain began and refused
+    by it. The next poll has gone out by then and finished its work."""
 
     def __init__(
         self,
@@ -281,24 +305,47 @@ class PollLoop:
         wait_seconds: int = DEFAULT_WAIT_SECONDS,
         max_items: int = DEFAULT_MAX_ITEMS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        cursor: str | None = None,
+        admitting: Callable[[], bool] = lambda: True,
+        keep_cursor: Callable[[str | None], None] | None = None,
     ) -> None:
         self._call = call
         self._dispatch = dispatch
         self._wait_seconds = wait_seconds
         self._max_items = max_items
         self._sleep = sleep
-        self.cursor: str | None = None
+        self._admitting = admitting
+        self._keep_cursor = keep_cursor
+        self.cursor: str | None = cursor
+        # The cursor saved for a next gateway, until a poll has used it.
+        self._saved_cursor = cursor
+        self.holding = False
         self.failures = 0
         self.polls = 0
 
     async def poll_once(self) -> None:
         """One poll and its dispatch. Raises PollFatal; backs off on errors."""
+        if not self._admitting():
+            if not self.holding:
+                logger.info(
+                    "filament-fcm: the gateway is draining; poll_work paused "
+                    "so the next gateway gets the work"
+                )
+            self.holding = True
+            await self._sleep(_HOLD_S)
+            return
+        self.holding = False
         args: dict[str, Any] = {
             "wait_seconds": self._wait_seconds,
             "max_items": self._max_items,
         }
         if self.cursor:
             args["cursor"] = self.cursor
+        elif self.polls == 0:
+            # Without a cursor the loop has none to leave the next gateway if
+            # a drain catches this poll, so the first poll doesn't wait: its
+            # answer brings one at once.
+            args["wait_seconds"] = 0
         try:
             data, error = await self._call(args)
         except asyncio.CancelledError:
@@ -329,7 +376,13 @@ class PollLoop:
                 "filament-fcm: poll_work recovered after %d failure(s)", self.failures
             )
         self.failures = 0
+        if response.work and not self._admitting():
+            self._leave(len(response.work))
+            return
         self.cursor = response.cursor or self.cursor
+        if self._saved_cursor is not None:
+            self._saved_cursor = None
+            self._keep(None)
         for item in response.work:
             try:
                 await self._dispatch(item)
@@ -344,6 +397,38 @@ class PollLoop:
             # nothing: a server that stops honoring wait_seconds must not turn
             # this into a busy loop.
             await self._sleep(max(min(response.next_poll_ms, 5_000), 200) / 1000)
+
+    def _leave(self, count: int) -> None:
+        """Hand over none of a poll's work: the gateway began draining while
+        the poll was held. The cursor stays the one the poll sent, so no
+        later poll finishes this work, and is saved for the next gateway."""
+        self.holding = True
+        # Dropped again by the first poll that uses it, should this gateway
+        # take turns again after all.
+        self._saved_cursor = self.cursor
+        if self.cursor is None:
+            logger.warning(
+                "filament-fcm: the gateway is draining; %d poll_work item(s) "
+                "arrived before the loop had a cursor and may not come back",
+                count,
+            )
+            return
+        logger.info(
+            "filament-fcm: the gateway is draining; left %d poll_work item(s) "
+            "for the next gateway",
+            count,
+        )
+        self._keep(self.cursor)
+
+    def _keep(self, cursor: str | None) -> None:
+        if self._keep_cursor is None:
+            return
+        try:
+            self._keep_cursor(cursor)
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not save the poll_work cursor", exc_info=True
+            )
 
     async def _back_off(self, reason: str) -> None:
         self.failures += 1
