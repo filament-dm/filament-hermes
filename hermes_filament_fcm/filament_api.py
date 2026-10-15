@@ -9,7 +9,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import mimetypes
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -28,6 +30,15 @@ _INITIALIZE_PARAMS: dict[str, Any] = {
     "capabilities": {},
     "clientInfo": {"name": DIST_NAME, "version": PLUGIN_VERSION},
 }
+
+# The signed-URL media tools (filament-dm/synapse#1157). A server that offers
+# them gets media moved through them; one that doesn't gets the bearer
+# side-channels (/media, /upload), which every server has. See fetch_media and
+# upload_media.
+MEDIA_DOWNLOAD_URL_TOOL = "get_media_download_url"
+MEDIA_UPLOAD_TOOL = "create_media_upload"
+
+_UPLOAD_CHUNK_BYTES = 64 * 1024
 
 
 class FilamentAPI:
@@ -54,6 +65,15 @@ class FilamentAPI:
         # a connection, or a client, with anything else.
         self._poll_client: httpx.AsyncClient | None = None
         self._poll_client_loop: asyncio.AbstractEventLoop | None = None
+        # Names of the tools the server offers, set once by register() from
+        # the tool list it already fetched (empty until then, and when it fell
+        # back to the bundled manifest, which predates the media tools). Read
+        # by offers_tool so a per-message choice costs no network call.
+        self.server_tools: frozenset[str] = frozenset()
+
+    def offers_tool(self, name: str) -> bool:
+        """Whether the server's tool list, as registered, includes *name*."""
+        return name in self.server_tools
 
     def _client_for_loop(self) -> httpx.AsyncClient:
         """Return an httpx client bound to the current running loop, recreating
@@ -341,27 +361,39 @@ class FilamentAPI:
             arguments["timeout_ms"] = timeout_ms
         return await self.call_tool("set_status", arguments)
 
-    async def post_message(self, channel: str, markdown_body: str) -> dict[str, Any]:
-        """Send a message to a room. The server renders markdown to HTML."""
-        return await self.call_tool(
-            "post_message",
-            {
-                "channel": channel,
-                "markdown_body": markdown_body,
-            },
-        )
+    async def post_message(
+        self,
+        channel: str,
+        markdown_body: str,
+        attachments: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Send a message to a room. The server renders markdown to HTML.
+
+        ``attachments`` is ``[{"mxc_url", "filename"?}]`` of already-uploaded
+        media (see upload_media); ``markdown_body`` becomes its caption."""
+        arguments: dict[str, Any] = {
+            "channel": channel,
+            "markdown_body": markdown_body,
+        }
+        if attachments:
+            arguments["attachments"] = attachments
+        return await self.call_tool("post_message", arguments)
 
     async def reply_in_thread(
-        self, message_id: str, markdown_body: str
+        self,
+        message_id: str,
+        markdown_body: str,
+        attachments: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
-        """Reply in a thread. The server renders markdown to HTML."""
-        return await self.call_tool(
-            "reply_in_thread",
-            {
-                "message_id": message_id,
-                "markdown_body": markdown_body,
-            },
-        )
+        """Reply in a thread. The server renders markdown to HTML.
+        ``attachments`` as for post_message."""
+        arguments: dict[str, Any] = {
+            "message_id": message_id,
+            "markdown_body": markdown_body,
+        }
+        if attachments:
+            arguments["attachments"] = attachments
+        return await self.call_tool("reply_in_thread", arguments)
 
     async def get_thread(self, message_id: str) -> dict[str, Any]:
         """Fetch a thread (root + replies) by message id.
@@ -470,7 +502,11 @@ class FilamentAPI:
     # exposed in the LLM's tool list.
 
     async def download_media(
-        self, mxc_url: str, dest: str, timeout_ms: int | None = None
+        self,
+        mxc_url: str,
+        dest: str,
+        timeout_ms: int | None = None,
+        max_bytes: int | None = None,
     ) -> int:
         """GET /mcp/agents/media — stream an attachment's raw bytes to *dest*.
 
@@ -481,39 +517,229 @@ class FilamentAPI:
         param on current servers; older deployments only understand ``mxc``,
         so both are sent.
 
-        The response is streamed to disk chunk by chunk (media can be a large
-        video/document — buffering it whole could spike the gateway's
-        memory), first into ``<dest>.part`` and renamed into place only on
-        success, so a failed download never leaves a truncated file at
-        *dest*. Returns the number of bytes written. Raises on any non-200
-        response.
+        Streamed to disk as ``_stream_to_file`` describes. Returns the number
+        of bytes written. Raises on any non-200 response, or once the body
+        passes *max_bytes*.
         """
-        url = self._mcp_url.rstrip("/") + "/media"
         params: dict[str, Any] = {"mxc_url": mxc_url, "mxc": mxc_url}
         if timeout_ms is not None:
             params["timeout_ms"] = timeout_ms
+        return await self._stream_to_file(
+            self._mcp_url.rstrip("/") + "/media",
+            dest,
+            path="/media",
+            params=params,
+            headers={"Authorization": f"Bearer {self._mcp_token}"},
+            max_bytes=max_bytes,
+        )
+
+    async def fetch_media(
+        self,
+        mxc_url: str,
+        dest: str,
+        message_id: str | None = None,
+        max_bytes: int | None = None,
+    ) -> int:
+        """Save the attachment *mxc_url* to *dest*, by whichever route the
+        server offers. Returns the number of bytes written; raises on failure.
+
+        With ``get_media_download_url`` on the server and the *message_id*
+        the media came from, the tool mints a short-lived URL after
+        authorizing this read of that message, and the URL is fetched with no
+        bearer. The call is then audited and capability-checked against the
+        message's room like any other tool call, which the bearer GET is not
+        (it knows only the mxc). Without the tool, or without a message id
+        (the tool serves only the agent's own uploads without one), the
+        bearer side-channel serves it as before. A refusal from the tool is
+        raised, never retried on the bearer route: that would route around
+        the decision.
+        """
+        if message_id is None or not self.offers_tool(MEDIA_DOWNLOAD_URL_TOOL):
+            return await self.download_media(mxc_url, dest, max_bytes=max_bytes)
+        info = await self._media_tool(
+            MEDIA_DOWNLOAD_URL_TOOL, {"mxc_url": mxc_url, "message_id": message_id}
+        )
+        # Of the result, download_url is fetched and bytes checked against
+        # the cap before the transfer starts. filename/content_type describe
+        # the file the caller already chose a name for (from the same media
+        # descriptor); expires_at/expires_in_seconds don't matter to a fetch
+        # made immediately; `how` is curl advice for a model's shell.
+        url = info.get("download_url")
+        if not isinstance(url, str) or not url:
+            raise RuntimeError(f"{MEDIA_DOWNLOAD_URL_TOOL} returned no download_url")
+        size = info.get("bytes")
+        if max_bytes is not None and isinstance(size, int) and size > max_bytes:
+            raise RuntimeError(f"media is {size} bytes, over the {max_bytes} cap")
+        # No Authorization header: the URL is the credential. It is not
+        # logged either, for the same reason.
+        return await self._stream_to_file(
+            url, dest, path="/media/signed", max_bytes=max_bytes
+        )
+
+    async def upload_media(
+        self,
+        path: str,
+        filename: str | None = None,
+        content_type: str | None = None,
+    ) -> str:
+        """Upload the local file *path* as Filament media and return its
+        ``mxc_url``, for a message's ``attachments``. Raises on failure.
+
+        The bytes go from this process to the server: never through the
+        model, and never with the token in anything the model sees. With
+        ``create_media_upload`` on the server, the tool reserves the media
+        and returns a single-use URL taking the bytes with no bearer;
+        otherwise they are POSTed to the bearer side-channel /upload.
+        """
+        name = filename or os.path.basename(path)
+        ctype = content_type or mimetypes.guess_type(name)[0]
+        size = os.path.getsize(path)
+        if not self.offers_tool(MEDIA_UPLOAD_TOOL):
+            headers = {
+                "Authorization": f"Bearer {self._mcp_token}",
+                "Content-Type": ctype or "application/octet-stream",
+            }
+            body = await self._send_file(
+                "POST",
+                self._mcp_url.rstrip("/") + "/upload",
+                path,
+                size,
+                label="/upload",
+                params={"filename": name},
+                headers=headers,
+            )
+            mxc = body.get("mxc_url")
+        else:
+            arguments: dict[str, Any] = {"filename": name, "bytes": size}
+            if ctype:
+                arguments["content_type"] = ctype
+            info = await self._media_tool(MEDIA_UPLOAD_TOOL, arguments)
+            # Of the result, upload_url/method/upload_headers say how to send
+            # the bytes and max_bytes is checked first (the server refuses
+            # a declared oversize file itself, but says so here too).
+            # expires_* don't matter to an upload made immediately; `how` is
+            # curl advice for a model's shell. The result's mxc_url is the
+            # reserved id, used only if the upload response omits its own.
+            url = info.get("upload_url")
+            if not isinstance(url, str) or not url:
+                raise RuntimeError(f"{MEDIA_UPLOAD_TOOL} returned no upload_url")
+            limit = info.get("max_bytes")
+            if isinstance(limit, int) and size > limit:
+                raise RuntimeError(f"file is {size} bytes, over the {limit} limit")
+            extra = info.get("upload_headers")
+            headers = (
+                {str(k): str(v) for k, v in extra.items()}
+                if isinstance(extra, dict)
+                else {}
+            )
+            method = str(info.get("method") or "PUT").upper()
+            body = await self._send_file(
+                method, url, path, size, label="/upload/signed", headers=headers
+            )
+            mxc = body.get("mxc_url") or info.get("mxc_url")
+        if not isinstance(mxc, str) or not mxc.startswith("mxc://"):
+            raise RuntimeError("media upload returned no mxc_url")
+        return mxc
+
+    async def _media_tool(self, name: str, arguments: dict) -> dict[str, Any]:
+        """Call a media tool and return its result object, raising on a
+        JSON-RPC error or an ``{"error": ...}`` result."""
+        raw = await self.call_tool(name, arguments)
+        err = self.result_error(raw)
+        info = self.parse_tool_result(raw) if err is None else None
+        if err is None and isinstance(info, dict) and info.get("error"):
+            err = str(info["error"])
+        if err is not None:
+            raise RuntimeError(f"{name} failed: {err}")
+        if not isinstance(info, dict):
+            raise RuntimeError(f"{name} returned an unexpected result")
+        return info
+
+    async def _send_file(
+        self,
+        method: str,
+        url: str,
+        path: str,
+        size: int,
+        *,
+        label: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Stream the file at *path* as a request body and return the parsed
+        JSON response; raises on any non-200. Read in chunks, not whole, with
+        an explicit Content-Length so the body is not sent chunked."""
+
+        async def chunks() -> AsyncIterator[bytes]:
+            with open(path, "rb") as f:
+                while chunk := f.read(_UPLOAD_CHUNK_BYTES):
+                    yield chunk
+
+        timer = Stopwatch.start()
+        resp = await self._client_for_loop().request(
+            method,
+            url,
+            params=params,
+            content=chunks(),
+            headers={**(headers or {}), "Content-Length": str(size)},
+        )
+        slog.debug(
+            "filament_fcm.http.side_channel.complete",
+            path=label,
+            method=method,
+            http_status=resp.status_code,
+            duration_ms=timer.elapsed_ms(),
+            bytes_sent=size,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"media upload failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        parsed: Any = {}
+        with contextlib.suppress(Exception):
+            parsed = resp.json()
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def _stream_to_file(
+        self,
+        url: str,
+        dest: str,
+        *,
+        path: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        max_bytes: int | None = None,
+    ) -> int:
+        """GET *url* and stream the body to *dest*; *path* labels the logs.
+
+        Written chunk by chunk (media can be a large video/document —
+        buffering it whole could spike the gateway's memory), first into
+        ``<dest>.part`` and renamed into place only on success, so a failed
+        or oversize download never leaves a truncated file at *dest*.
+        Returns the number of bytes written.
+        """
         tmp = f"{dest}.part"
         written = 0
         timer = Stopwatch.start()
         slog.debug(
             "filament_fcm.http.side_channel.start",
-            path="/media",
+            path=path,
             method="GET",
-            timeout_ms=timeout_ms,
+            timeout_ms=(params or {}).get("timeout_ms"),
         )
         try:
             async with self._client_for_loop().stream(
                 "GET",
                 url,
                 params=params,
-                headers={"Authorization": f"Bearer {self._mcp_token}"},
+                headers=headers,
                 follow_redirects=True,
             ) as resp:
                 if resp.status_code != 200:
                     detail = (await resp.aread())[:200]
                     slog.warning(
                         "filament_fcm.http.side_channel.complete",
-                        path="/media",
+                        path=path,
                         method="GET",
                         http_status=resp.status_code,
                         duration_ms=timer.elapsed_ms(),
@@ -525,12 +751,16 @@ class FilamentAPI:
                     )
                 with open(tmp, "wb") as f:
                     async for chunk in resp.aiter_bytes():
-                        f.write(chunk)
                         written += len(chunk)
+                        if max_bytes is not None and written > max_bytes:
+                            raise RuntimeError(
+                                f"media is over the {max_bytes}-byte cap"
+                            )
+                        f.write(chunk)
             os.replace(tmp, dest)
             slog.debug(
                 "filament_fcm.http.side_channel.complete",
-                path="/media",
+                path=path,
                 method="GET",
                 http_status=200,
                 duration_ms=timer.elapsed_ms(),

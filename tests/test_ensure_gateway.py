@@ -55,6 +55,8 @@ class _Host:
         self.pid = 100 if running else None
         self.supported = supported
         self.loaded_dead = loaded_dead
+        # A gateway `hermes gateway stop` does not stop.
+        self.stuck = False
         self.calls = []
 
     def _spawn(self):
@@ -76,6 +78,8 @@ class _Host:
                     self._spawn()
         elif args[:2] == ["gateway", "start"] and not self.loaded_dead:
             self._spawn()
+        elif args[:2] == ["gateway", "stop"] and not self.stuck:
+            self.pid = None
         return types.SimpleNamespace(returncode=code, stdout=out, stderr="")
 
     def popen(self, argv, **kwargs):
@@ -85,12 +89,13 @@ class _Host:
         return types.SimpleNamespace(poll=lambda: 0)
 
 
-def _ensure(host, printed):
+def _ensure(host, printed, auto_started=None):
     return _load(printed)(
         hermes=["hermes"],
         run=host.run,
         popen=host.popen,
         running_pid=lambda: host.pid,
+        auto_started=auto_started,
         sleep=lambda _s: None,
     )
 
@@ -123,6 +128,54 @@ def test_a_running_gateway_is_restarted_and_must_come_back_new():
     assert (kind, args) == ("popen", ["gateway", "restart"])
     assert kwargs["start_new_session"] is True
     assert ("success", "Gateway running (pid 101).") in printed
+
+
+def test_an_auto_started_chat_gateway_is_replaced_by_the_service():
+    # Hermes' unified runtime: the dashboard chat auto-starts an unsupervised
+    # `gateway run --idle-exit`. Restarting it leaves no service behind.
+    printed = []
+    host = _Host(running=True)
+    assert _ensure(host, printed, auto_started=lambda pid: pid == 100) == "running"
+    assert _verbs(host) == ["gateway stop", "gateway install", "gateway install"]
+    assert "gateway restart" not in _verbs(host)
+    assert any("auto-started gateway (pid 100)" in t for _, t in printed)
+    assert ("success", "Gateway running (pid 101).") in printed
+
+
+def test_an_auto_started_gateway_with_a_service_installed_is_started_by_it():
+    printed = []
+    host = _Host(installed=True, running=True)
+    assert _ensure(host, printed, auto_started=lambda pid: True) == "running"
+    assert _verbs(host) == ["gateway stop", "gateway install", "gateway start"]
+
+
+def test_an_auto_started_gateway_that_will_not_stop_is_restarted():
+    printed = []
+    host = _Host(running=True)
+    host.stuck = True
+    assert _ensure(host, printed, auto_started=lambda pid: True) == "running"
+    assert _verbs(host) == ["gateway stop", "gateway restart"]
+    assert ("info", "It did not stop; restarting it instead.") in printed
+
+
+def test_a_gateway_started_by_hand_is_still_restarted():
+    printed = []
+    host = _Host(running=True)
+    assert _ensure(host, printed, auto_started=lambda pid: False) == "running"
+    assert _verbs(host) == ["gateway restart"]
+
+
+def test_ancestor_pids_walk_up_to_init():
+    ns = {"os": __import__("os")}
+    tree = ast.parse(_SETUP_CLI.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_ancestor_pids":
+            exec(compile(ast.Module([node], []), str(_SETUP_CLI), "exec"), ns)
+    parents = {50: 40, 40: 30, 30: 1}
+    assert ns["_ancestor_pids"](50, ppid_of=parents.get) == {40, 30}
+    # A cycle or an unreadable parent ends the walk.
+    assert ns["_ancestor_pids"](7, ppid_of={7: 8, 8: 7}.get) == {8, 7}
+    assert ns["_ancestor_pids"](9, ppid_of=lambda _pid: None) == set()
 
 
 def test_an_installed_but_stopped_service_is_started():
