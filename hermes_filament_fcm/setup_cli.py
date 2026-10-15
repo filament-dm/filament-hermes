@@ -768,16 +768,20 @@ def _schedule_gateway_handoff() -> bool:
         return False
     print_info(
         "This chat runs inside the Hermes gateway, which has to restart to "
-        "load Filament: the chat pauses for a few seconds and reconnects by itself."
+        "load Filament: in about 20 seconds the chat pauses briefly and "
+        "reconnects by itself."
     )
     print_success(f"Gateway restart scheduled (log: {log}).")
     return True
 
 
 # How long the handoff waits for the login that scheduled it to exit, and
-# then for its shell and Hermes to report it done before stopping anything.
+# then before stopping anything: Hermes tells the model the background login
+# finished, and a gateway stop does not drain (restart_drain_timeout 0), so a
+# stop inside that turn cuts it off ("Your request was not processed", live
+# run h20-baseline-2). Long enough for that one short turn.
 _HANDOFF_WAIT_S = 120
-_HANDOFF_SETTLE_S = 3
+_HANDOFF_SETTLE_S = 20
 
 
 def gateway_handoff(after_pid: int | None, *, sleep=time.sleep) -> int:
