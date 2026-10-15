@@ -120,6 +120,14 @@ _SESSION_KEYING_MANAGED_KEY = "_filament_fcm_managed_session_keying"
 
 logger = logging.getLogger("gateway.filament_fcm")
 
+# What the owner (and `hermes gateway status`, and the model reading the log)
+# should learn when Filament refuses the saved sign-in at connect.
+AUTH_REFUSED_MESSAGE = (
+    "Filament refused this agent's sign-in: the agent was deleted or signed "
+    "out in Filament. Not retrying. To connect again, press Connect for "
+    "Hermes in the Filament app and send this Hermes the setup message."
+)
+
 
 @functools.cache  # once per gateway process, not per reconnect
 def _seed_display_defaults() -> None:
@@ -469,6 +477,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # lands and connect() succeeds. See _initialize_api / connect.
         self._reserved: bool = False
         self._reserved_notified: bool = False
+        # Stage 1's auth refusal (the token is dead), or None.
+        self._auth_refused: str | None = None
         self._owner_id: str | None = None
         self._owner_name: str | None = None
         # The agent's own display name (from get_self), for the hello.
@@ -742,7 +752,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             _seed_display_defaults()
 
             if not await self._initialize_api():
-                if self._reserved:
+                if self._auth_refused:
+                    # Not retryable: the token is gone for good, and retrying
+                    # every 30-60 s only fills the log with get_self errors
+                    # (live run h20-r4-delete). A new sign-in writes a new
+                    # token and restarts the gateway, which clears this.
+                    logger.error("filament-fcm: %s", AUTH_REFUSED_MESSAGE)
+                    slog.error(
+                        "filament_fcm.connect.auth_refused", error=self._auth_refused
+                    )
+                    self._set_fatal_error(
+                        "auth_refused", AUTH_REFUSED_MESSAGE, retryable=False
+                    )
+                elif self._reserved:
                     # ENG-429: reserved, not finalized yet. Retry (not a hard
                     # failure) so we reconnect once the principal finishes setup
                     # in the app, then Stage 3 + the greet directive succeed.
@@ -1052,6 +1074,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def _initialize_api(self) -> bool:
         """Stage 1: Initialize the MCP session on the pre-created FilamentAPI."""
         self._reserved = False
+        self._auth_refused = None
         try:
             logger.info(
                 "filament-fcm: [Stage 1] initializing MCP session at %s",
@@ -1060,6 +1083,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             slog.info("filament_fcm.stage.start", stage="initialize_api")
             with bound_context(call_origin="startup"):
                 init = await self._filament_api.initialize()
+            refused = FilamentAPI.result_error(init)
+            if refused and poll_transport.classify_error(refused) == "auth":
+                self._auth_refused = refused
+                return False
             logger.info("filament-fcm: [Stage 1] MCP session established")
             slog.info("filament_fcm.stage.complete", stage="initialize_api")
 
