@@ -675,13 +675,139 @@ def login(
 def _restart_gateway() -> None:
     """Make sure the gateway runs with the configuration just saved.
 
-    See ``_ensure_gateway``; this binds it to the real Hermes CLI."""
+    See ``_ensure_gateway``; this binds it to the real Hermes CLI. When this
+    process runs inside that gateway (Hermes' chat runs in the gateway since
+    its unified runtime, so an agent's terminal tool is a child of it), a
+    restart from here would kill this process and the restart with it: the
+    stop sweeps its tool processes' groups and descendants (live run
+    h20-baseline: login killed, no gateway came back). The restart is then
+    handed to a helper outside the gateway's process tree, which waits for
+    this login to exit first."""
+    pid = _running_gateway_pid()
+    if pid is not None and pid in _ancestor_pids() and _schedule_gateway_handoff():
+        return
     _ensure_gateway(
         hermes=_hermes_argv(),
         run=subprocess.run,
         popen=subprocess.Popen,
         running_pid=_running_gateway_pid,
+        auto_started=_gateway_auto_started,
     )
+
+
+def _ancestor_pids(pid: int | None = None, *, ppid_of=None) -> set[int]:
+    """The PIDs above *pid* (default: this process), up to init."""
+    ppid_of = ppid_of or _ppid_of
+    seen: set[int] = set()
+    current = os.getpid() if pid is None else pid
+    for _ in range(64):
+        parent = ppid_of(current)
+        if parent is None or parent <= 1 or parent in seen:
+            break
+        seen.add(parent)
+        current = parent
+    return seen
+
+
+def _ppid_of(pid: int) -> int | None:
+    if pid == os.getpid():
+        return os.getppid()
+    out = _ps_field(pid, "ppid=")
+    return int(out) if out.isdigit() else None
+
+
+def _ps_field(pid: int, field: str) -> str:
+    """One ``ps -o`` field of *pid*, or "" (no ps, no such process)."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", field, "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _gateway_auto_started(pid: int) -> bool:
+    """Whether gateway *pid* is one a client auto-started (``--idle-exit``)."""
+    return "--idle-exit" in _ps_field(pid, "command=")
+
+
+_HANDOFF_LOG = "filament-gateway.log"
+
+
+def _schedule_gateway_handoff() -> bool:
+    """Start ``hermes filament gateway-handoff`` outside this process tree.
+
+    ``sh`` backgrounds it and exits at once, so the helper is reparented to
+    init/launchd, in a session of its own: neither the gateway's process-group
+    kill nor its descendant sweep reaches it. False if it could not start
+    (POSIX only); the caller then restarts in place as before."""
+    if os.name != "posix":
+        return False
+    log = _find_hermes_home() / "logs" / _HANDOFF_LOG
+    argv = [*_hermes_argv(), "filament", "gateway-handoff"]
+    argv += ["--after-pid", str(os.getpid())]
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["/bin/sh", "-c", 'nohup "$@" >> "$0" 2>&1 < /dev/null &', str(log), *argv],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            timeout=10,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print_warning(f"Could not hand the gateway restart off ({exc}).")
+        return False
+    print_info(
+        "This chat runs inside the Hermes gateway, which has to restart to "
+        "load Filament: the chat pauses for a few seconds and reconnects by itself."
+    )
+    print_success(f"Gateway restart scheduled (log: {log}).")
+    return True
+
+
+# How long the handoff waits for the login that scheduled it to exit, and
+# then for its shell and Hermes to report it done before stopping anything.
+_HANDOFF_WAIT_S = 120
+_HANDOFF_SETTLE_S = 3
+
+
+def gateway_handoff(after_pid: int | None, *, sleep=time.sleep) -> int:
+    """The scheduled half of ``_restart_gateway``: wait for *after_pid* to
+    exit, then leave a gateway running (``_ensure_gateway``). Returns an exit
+    code; its output goes to the handoff log."""
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} gateway handoff after pid {after_pid}")
+    deadline = time.monotonic() + _HANDOFF_WAIT_S
+    while after_pid and _pid_alive(after_pid) and time.monotonic() < deadline:
+        sleep(0.5)
+    sleep(_HANDOFF_SETTLE_S)
+    outcome = _ensure_gateway(
+        hermes=_hermes_argv(),
+        run=subprocess.run,
+        popen=subprocess.Popen,
+        running_pid=_running_gateway_pid,
+        auto_started=_gateway_auto_started,
+    )
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} gateway handoff: {outcome}")
+    return 0 if outcome == "running" else 1
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _hermes_argv() -> list[str]:
@@ -751,7 +877,9 @@ _GATEWAY_UP_WAIT_S = 30
 _ALREADY_INSTALLED = "already installed"
 
 
-def _ensure_gateway(*, hermes, run, popen, running_pid, sleep=time.sleep) -> str:
+def _ensure_gateway(
+    *, hermes, run, popen, running_pid, auto_started=None, sleep=time.sleep
+) -> str:
     """Leave a gateway running on the configuration just saved.
 
     - running (as a service, or by hand): restart it;
@@ -761,7 +889,11 @@ def _ensure_gateway(*, hermes, run, popen, running_pid, sleep=time.sleep) -> str
       ran the login in the background has ended its turn by the time the
       sign-in completes, so nothing else would start one;
     - no service manager (containers, WSL, Termux): start it in the
-      background, as before.
+      background, as before;
+    - running, but auto-started by a client (``auto_started(pid)``: the
+      dashboard chat's ``gateway run --idle-exit``, which has no service
+      behind it): stop it and put the service in its place, as for a gateway
+      that is not running.
 
     Then it checks: a gateway is up only once it holds its lock under a new
     PID (``gateway.status.get_running_pid``). One that isn't gets a single
@@ -863,8 +995,28 @@ def _ensure_gateway(*, hermes, run, popen, running_pid, sleep=time.sleep) -> str
                 return None
             sleep(1.0)
 
+    def stopped(pid: int) -> bool:
+        cli("gateway", "stop", timeout=_GATEWAY_INSTALL_TIMEOUT_S)
+        deadline = time.monotonic() + _GATEWAY_UP_WAIT_S
+        while running_pid() == pid:
+            if time.monotonic() >= deadline:
+                return False
+            sleep(1.0)
+        return True
+
     previous = running_pid()
-    if previous is not None:
+    replace = (
+        previous is not None and auto_started is not None and auto_started(previous)
+    )
+    if replace:
+        print_info(
+            f"Replacing the chat's auto-started gateway (pid {previous}) "
+            "with the gateway service..."
+        )
+        if not stopped(previous):
+            print_info("It did not stop; restarting it instead.")
+            replace = False
+    if previous is not None and not replace:
         print_info(f"Restarting the gateway (pid {previous})...")
         restart()
     else:
