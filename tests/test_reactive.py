@@ -306,8 +306,7 @@ def test_capability_denies_media_tools_as_the_server_does():
         reactive.capability_denies(frozenset({"get_thread"}), "get_media_download_url")
         is True
     )
-    for upload in ("create_media_upload", "upload_media_from_url"):
-        assert reactive.capability_denies(frozenset(), upload) is False
+    assert reactive.capability_denies(frozenset(), "create_media_upload") is False
     # The default rows grant the download wherever read_history is granted.
     store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
     granted = store.expand_capabilities(list(reactive.DEFAULT_CAPABILITIES))

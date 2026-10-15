@@ -159,9 +159,7 @@ CAPABILITY_ALIASES: dict[str, str] = {"get_media_download_url": "download_media"
 # Server tools no grant governs, mirroring the server's
 # ``ToolAuth(ungated_reason=...)``: an upload only stores media for a later
 # post, and the post is gated in the channel it lands in.
-UNGATED_TOOLS: frozenset[str] = frozenset(
-    {"create_media_upload", "upload_media_from_url"}
-)
+UNGATED_TOOLS: frozenset[str] = frozenset({"create_media_upload"})
 
 
 def capability_denies(allowed: "frozenset[str] | None", tool_name: str) -> bool:
