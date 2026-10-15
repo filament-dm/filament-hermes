@@ -120,12 +120,19 @@ def test_control_turn_carries_full_authority_at_its_origin():
 
 def test_data_turn_requires_every_decision():
     """Every field must be passed explicitly, so omitting one raises."""
-    for missing in ("capabilities", "cursor_channel", "reply_anchor", "history_key"):
+    for missing in (
+        "capabilities",
+        "cursor_channel",
+        "reply_anchor",
+        "history_key",
+        "reply_expected",
+    ):
         kwargs = {
             "capabilities": frozenset({"post"}),
             "cursor_channel": "!room:s",
             "reply_anchor": ("!room:s", "$e"),
             "history_key": "channel:!room:s",
+            "reply_expected": False,
         }
         del kwargs[missing]
         try:
@@ -137,7 +144,11 @@ def test_data_turn_requires_every_decision():
 
 def test_data_turn_never_yields_the_control_zone():
     ctx = turn_context.data_turn(
-        capabilities=None, cursor_channel=None, reply_anchor=None, history_key=None
+        capabilities=None,
+        cursor_channel=None,
+        reply_anchor=None,
+        history_key=None,
+        reply_expected=False,
     )
     assert ctx.zone is Zone.DATA
 
@@ -158,6 +169,7 @@ def test_a_turn_cannot_be_partly_configured():
                 cursor_channel="!a:s",
                 reply_anchor=("!a:s", "$1"),
                 history_key=None,
+                reply_expected=False,
             )
         )
         turn_context.activate(turn_context.CONTROL)
@@ -179,6 +191,7 @@ def test_context_is_frozen_so_downstream_cannot_widen_authority():
         cursor_channel=None,
         reply_anchor=None,
         history_key=None,
+        reply_expected=False,
     )
     for field, value in (
         ("zone", Zone.CONTROL),
@@ -198,6 +211,7 @@ def test_with_capabilities_copies_rather_than_mutating():
         cursor_channel="!a:s",
         reply_anchor=None,
         history_key=None,
+        reply_expected=False,
     )
     narrowed = ctx.with_capabilities(frozenset())
     assert ctx.capabilities == frozenset({"post"})  # original untouched
@@ -218,6 +232,7 @@ def test_concurrent_turns_do_not_race():
                 cursor_channel=name,
                 reply_anchor=None,
                 history_key=None,
+                reply_expected=False,
             )
         )
         await asyncio.sleep(0)  # yield: the other turn activates here
