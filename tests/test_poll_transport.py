@@ -236,8 +236,10 @@ def test_dispatches_work_and_carries_the_cursor():
     _run(loop, 2)
     assert [i.kind for i in dispatched] == ["message"]
     assert "cursor" not in server.calls[0]
-    assert server.calls[0]["wait_seconds"] == pt.DEFAULT_WAIT_SECONDS
+    # Without a cursor the first poll doesn't wait; with one, polls do.
+    assert server.calls[0]["wait_seconds"] == 0
     assert server.calls[1]["cursor"] == "c:1"
+    assert server.calls[1]["wait_seconds"] == pt.DEFAULT_WAIT_SECONDS
     assert loop.cursor == "c:2"
     # Work goes straight to the next poll; an empty answer takes the hint.
     assert slept == [1.0]
@@ -313,6 +315,186 @@ def test_a_dispatch_failure_does_not_stop_the_batch():
 
     asyncio.run(pt.PollLoop(server, dispatch, sleep=sleep).poll_once())
     assert seen == ["!a:s", "!b:s"]
+
+
+# ── a draining gateway ──────────────────────────────────────────────
+
+
+class _WorkServer:
+    """poll_work's cursor rules (synapse agents_mcp/tools_poll.py and
+    work_done.py), for one room: a poll passing cursor C, or none (the saved
+    position), finishes everything up to C and every delivery whose cursor
+    is at or before C, then hands over what is after C and unfinished. A
+    reply finishes its message."""
+
+    def __init__(self):
+        # A live server's stream is never empty; a cursor at 0 reads as none.
+        self.head = 100
+        self.calls = []
+        self.events = []  # (stream ordering, event id)
+        self.saved = 0
+        self.done = 0
+        self.deliveries = []  # (newest stream ordering handed over, cursor)
+        self.before_answer = None
+
+    def post(self, event_id):
+        self.head += 1
+        self.events.append((self.head, event_id))
+
+    def reply(self, event_id):
+        so = next(so for so, eid in self.events if eid == event_id)
+        self.done = max(self.done, so)
+
+    async def __call__(self, args):
+        self.calls.append(dict(args))
+        given = int(args["cursor"][2:]) if args.get("cursor") else 0
+        start = given or self.saved
+        self.done = max(self.done, start)
+        for so, cursor in [d for d in self.deliveries if d[1] <= start]:
+            self.done = max(self.done, so)
+            self.deliveries.remove((so, cursor))
+        if self.before_answer:
+            # Whatever happens while the poll is held: a drain, a message.
+            self.before_answer()
+            self.before_answer = None
+        work = [(so, eid) for so, eid in self.events if so > start and so > self.done]
+        if work:
+            self.deliveries.append((work[-1][0], self.head))
+            self.saved = self.head
+        items = [_message_item(messages=[{"event_id": eid}]) for _, eid in work]
+        return {"work": items, "cursor": f"c:{self.head}", "next_poll_ms": 1000}, None
+
+
+def _gateway(server, *, cursor=None, admitting=lambda: True, kept=None):
+    """A PollLoop whose dispatched event ids land in ``loop.ran``."""
+
+    async def dispatch(item):
+        loop.ran.extend(m["event_id"] for m in item.messages)
+
+    async def sleep(_):
+        return None
+
+    loop = pt.PollLoop(
+        server,
+        dispatch,
+        sleep=sleep,
+        cursor=cursor,
+        admitting=admitting,
+        keep_cursor=None if kept is None else kept.append,
+    )
+    loop.ran = []
+    return loop
+
+
+def test_work_that_arrives_during_a_drain_reaches_the_next_gateway():
+    server = _WorkServer()
+    server.post("$handled")
+    draining = []
+    kept = []
+    old = _gateway(server, admitting=lambda: not draining, kept=kept)
+    _run(old, 1)
+    assert old.ran == ["$handled"]
+    server.reply("$handled")
+
+    # The drain begins while the next poll is held, and the owner's DM lands
+    # in it (live run h30-r2-reconnect-3).
+    server.before_answer = lambda: (draining.append(True), server.post("$dm"))
+    _run(old, 3)
+    assert old.ran == ["$handled"], "a draining gateway runs no new turn"
+    assert len(server.calls) == 2, "and polls no more"
+    assert kept == ["c:101"], "the cursor from before the delivery is saved"
+    assert old.cursor == "c:101"
+
+    new = _gateway(server, cursor=kept[-1], kept=kept)
+    _run(new, 1)
+    assert new.ran == ["$dm"], "the server hands the DM over again, only it"
+    assert kept == ["c:101", None], "the saved cursor is dropped once used"
+    _run(new, 1)
+    assert new.ran == ["$dm"]
+
+
+def test_without_the_hold_a_drain_loses_the_work():
+    """What the loop did before it asked whether the gateway admits turns:
+    it handed the DM to a gateway that refused it, and the next gateway's
+    cursorless poll finished it."""
+    server = _WorkServer()
+    server.post("$handled")
+    old = _gateway(server)
+    _run(old, 1)
+    server.reply("$handled")
+    server.before_answer = lambda: server.post("$dm")
+    _run(old, 1)
+    assert old.ran == ["$handled", "$dm"]  # refused by the draining gateway
+    new = _gateway(server)
+    _run(new, 2)
+    assert new.ran == []
+
+
+def test_a_draining_gateway_sends_no_poll():
+    server = _Server()
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    async def dispatch(_):
+        raise AssertionError("dispatched while draining")
+
+    loop = pt.PollLoop(server, dispatch, sleep=sleep, admitting=lambda: False)
+    _run(loop, 3)
+    assert server.calls == []
+    assert slept == [1.0, 1.0, 1.0]
+    assert loop.holding is True
+
+
+def test_work_left_before_any_cursor_is_not_saved(caplog):
+    draining = []
+    server = _WorkServer()
+    server.before_answer = lambda: (draining.append(True), server.post("$dm"))
+    kept = []
+    loop = _gateway(server, admitting=lambda: not draining, kept=kept)
+    with caplog.at_level("WARNING", logger="gateway.filament_fcm"):
+        _run(loop, 1)
+    assert loop.ran == [] and kept == []
+    assert "may not come back" in caplog.text
+
+
+def test_a_gateway_that_admits_again_drops_the_saved_cursor():
+    admitting = [True]
+    server = _WorkServer()
+    kept = []
+    loop = _gateway(server, admitting=lambda: admitting[0], kept=kept)
+    _run(loop, 1)
+    server.before_answer = lambda: (admitting.__setitem__(0, False), server.post("$a"))
+    _run(loop, 1)
+    assert kept == ["c:100"] and loop.ran == []
+    admitting[0] = True
+    _run(loop, 1)
+    assert loop.ran == ["$a"]
+    assert kept == ["c:100", None]
+
+
+def test_a_failure_to_save_the_cursor_is_only_a_warning(caplog):
+    draining = []
+    server = _WorkServer()
+
+    def keep(_):
+        raise OSError("read-only")
+
+    async def dispatch(_):
+        return None
+
+    async def sleep(_):
+        return None
+
+    loop = pt.PollLoop(
+        server, dispatch, sleep=sleep, admitting=lambda: not draining, keep_cursor=keep
+    )
+    _run(loop, 1)
+    server.before_answer = lambda: (draining.append(True), server.post("$dm"))
+    with caplog.at_level("WARNING", logger="gateway.filament_fcm"):
+        _run(loop, 2)
+    assert "could not save the poll_work cursor" in caplog.text
 
 
 def test_classify_error():

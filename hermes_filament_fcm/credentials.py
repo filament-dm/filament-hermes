@@ -168,6 +168,39 @@ class CredentialStore:
         except Exception:
             logger.warning("Failed to remove %s", path, exc_info=True)
 
+    def load_poll_cursor(self, agent_user_id: str | None) -> str | None:
+        """The poll_work cursor a draining gateway left for this agent.
+
+        A cursor saved for another agent (the plugin was signed in again as a
+        new one) is not this agent's position and is dropped."""
+        data = self._read_json("poll_cursor.json")
+        if not isinstance(data, dict):
+            return None
+        cursor = data.get("cursor")
+        saved_for = data.get("agent_user_id")
+        if not isinstance(cursor, str) or not cursor:
+            return None
+        if saved_for and agent_user_id and saved_for != agent_user_id:
+            self.clear_poll_cursor()
+            return None
+        return cursor
+
+    def save_poll_cursor(self, cursor: str, agent_user_id: str | None) -> None:
+        """Persist the cursor from before work a draining gateway could not
+        run — see poll_transport.PollLoop. The next gateway polls from it."""
+        self._write_json(
+            "poll_cursor.json", {"cursor": cursor, "agent_user_id": agent_user_id}
+        )
+
+    def clear_poll_cursor(self) -> None:
+        """Drop the saved cursor once a poll has used it. Missing file is
+        success: an old cursor would hand back work long since run."""
+        path = self._dir / "poll_cursor.json"
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to remove %s", path, exc_info=True)
+
     def load_or_create_installation_id(self) -> str:
         """Return a stable, report-safe id for this Hermes plugin install."""
         data = self._read_json("installation.json")

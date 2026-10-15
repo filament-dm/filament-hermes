@@ -357,3 +357,59 @@ def test_server_described_items_skip_the_room_lookup():
     assert msg.is_direct is True
     assert msg.sender_display_name == "Bobby"
     assert a._filament_api.calls == []
+
+
+# ── a draining gateway ──────────────────────────────────────────────
+
+
+def test_admitting_follows_the_gateway_drain():
+    a = _make()
+    assert a._gateway_admitting() is True, "no runner: an older Hermes"
+    a.gateway_runner = types.SimpleNamespace()
+    assert a._gateway_admitting() is True
+    a.gateway_runner = types.SimpleNamespace(
+        _draining=False, session_authority=types.SimpleNamespace(retiring=False)
+    )
+    assert a._gateway_admitting() is True
+    a.gateway_runner._draining = True
+    assert a._gateway_admitting() is False
+    a.gateway_runner._draining = False
+    a.gateway_runner.session_authority.retiring = True
+    assert a._gateway_admitting() is False
+
+
+def test_the_poll_loop_starts_from_the_cursor_a_draining_gateway_left(
+    tmp_path, monkeypatch
+):
+    credentials = sys.modules["hermes_filament_fcm.credentials"]
+    a = _make()
+    a._credentials = credentials.CredentialStore(str(tmp_path))
+    a._user_id = "@agent:s"
+    a._credentials.save_poll_cursor("c:abc", "@agent:s")
+    made = {}
+
+    class _Loop:
+        def __init__(self, call, dispatch, **kwargs):
+            made.update(kwargs)
+
+        async def run(self):
+            return None
+
+    monkeypatch.setattr(poll_transport, "PollLoop", _Loop)
+    asyncio.run(a._run_poll_loop())
+    assert made["cursor"] == "c:abc"
+    assert made["admitting"] == a._gateway_admitting
+    made["keep_cursor"](None)
+    assert not (tmp_path / "poll_cursor.json").exists()
+    made["keep_cursor"]("c:def")
+    assert a._credentials.load_poll_cursor("@agent:s") == "c:def"
+
+
+def test_a_cursor_left_for_another_agent_is_dropped(tmp_path):
+    credentials = sys.modules["hermes_filament_fcm.credentials"]
+    store = credentials.CredentialStore(str(tmp_path))
+    assert store.load_poll_cursor("@agent:s") is None
+    store.save_poll_cursor("c:abc", "@old-agent:s")
+    assert store.load_poll_cursor("@agent:s") is None
+    assert not (tmp_path / "poll_cursor.json").exists()
+    store.clear_poll_cursor()  # missing is fine
