@@ -138,12 +138,12 @@ def _greet_stub(guide_ready: bool):
     async def handle_message(event):
         sent.append(event)
 
-    async def _greet_intro_turn():
-        """Dispatched as its own task now; not what this test is about."""
+    async def _hello_fallback():
+        """The canned-hello deadline runs as its own task; not this test."""
         return None
 
     stub.handle_message = handle_message
-    stub._greet_intro_turn = _greet_intro_turn
+    stub._hello_fallback = _hello_fallback
     return stub, sent, posted
 
 
@@ -151,10 +151,10 @@ def test_greeting_does_not_disable_the_link_pointer():
     stub, _sent, posted = _greet_stub(guide_ready=True)
     asyncio.run(_Adapter._maybe_greet(stub))
 
-    # The greeting still happens, exactly once - the canned hello goes out
-    # through the API; the capabilities intro is its own task and not the
-    # subject here.
-    assert len(posted) == 1
+    # The greeting still happens, exactly once - one hello turn; the canned
+    # fallback is its own task and not the subject here.
+    assert len(_sent) == 1
+    assert posted == []
     assert stub._greet_pending is False
     # ...and the guidance written moments earlier is still on offer. Newly
     # connected agents are the one population that always greets, so clearing

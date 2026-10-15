@@ -59,6 +59,15 @@ Hermes ever ships one of them, drop it from `vendor/` and widen its range in
 `pyproject.toml`. The plugin warns at startup if it finds a *different* version
 outside `vendor/`, which is what that day would look like.
 
+### Polling instead of push (opt-in)
+
+Set `FILAMENT_TRANSPORT=poll` and the gateway long-polls Filament's `poll_work`
+tool for new messages instead of registering for FCM pushes. No Firebase
+project is involved, so a local or staging server needs no
+`FILAMENT_FIREBASE_*` settings. Set it in the environment of
+`hermes filament login` or `connect` and it is saved to `.env` with the token;
+it needs a server that has `poll_work`.
+
 To update:
 
 ```

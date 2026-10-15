@@ -414,10 +414,13 @@ class TestWhereTheCommandsAreNamed:
         assert "/fil-config" not in framing.command_summary(False)
 
     def test_the_hello_asks_the_flag(self):
-        # The hello text lives in framing.first_contact_hello, which ends
-        # with command_summary; the adapter's job is to ask the flag and
-        # pass it through.
-        body = _adapter_body("_maybe_greet")
+        # The model writes the hello and the adapter appends command_summary;
+        # the canned fallback is framing.first_contact_hello, which ends with
+        # it. Either way the adapter's job is to ask the flag and pass it on.
+        body = _adapter_body("_send_hello")
+        assert "command_summary" in body
+        assert "FEATURE_SLASH_COMMANDS" in body
+        body = _adapter_body("_post_canned_hello")
         assert "first_contact_hello" in body
         assert "FEATURE_SLASH_COMMANDS" in body
         framing = _load("framing")

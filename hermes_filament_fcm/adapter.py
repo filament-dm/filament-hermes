@@ -24,6 +24,7 @@ import os
 import re
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from agent.async_utils import safe_schedule_threadsafe
@@ -36,7 +37,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, slash, timeline, turn_context
+from . import framing, poll_transport, profile_seed, slash, timeline, turn_context
 from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -143,6 +144,13 @@ _MAX_MESSAGE_LENGTH = 16000
 # tested there). _NOTICE_STATUS_TIMEOUT_MS is how long one stays visible.
 _NOTICE_STATUS_TIMEOUT_MS = 30_000
 
+# How long the first-contact hello turn may take before the canned hello goes
+# out instead: the app's connect screen is waiting on it.
+_HELLO_TIMEOUT_S = 45.0
+
+# How long a room's details (name, loop, member names) serve poll_work rows.
+_ROOM_INFO_TTL_S = 300.0
+
 # How often the gateway asks to be probed. Long relative to the 20s heartbeat:
 # this is a reachability check, not a presence one, and each probe costs a push
 # to the machine hosting the agent.
@@ -162,6 +170,49 @@ _VOUCH_ACCEPT_BACKOFF_S = 2.0
 
 # "Not passed": lets _wake tell an absent breadcrumb from one read as None.
 _UNSET: object = object()
+
+
+def _hermes_identity_paths() -> tuple[Path, str | None, Path | None]:
+    """(HERMES_HOME, active profile id, hermes-agent checkout) for seeding the
+    Filament profile. Only the home is required; the rest is best-effort."""
+    try:
+        from hermes_constants import get_hermes_home  # noqa: PLC0415
+
+        home = Path(get_hermes_home())
+    except ImportError:
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    profile_name: str | None = None
+    with contextlib.suppress(Exception):
+        from hermes_cli.profiles import get_active_profile_name  # noqa: PLC0415
+
+        profile_name = get_active_profile_name()
+    root: Path | None = None
+    with contextlib.suppress(Exception):
+        import hermes_cli  # noqa: PLC0415
+
+        root = Path(hermes_cli.__file__).resolve().parent.parent
+    return home, profile_name, root
+
+
+def _read_yaml_mapping(path: Path) -> dict | None:
+    """A YAML file as a mapping, or None when missing or not one."""
+    text = _read_text(path)
+    if text is None:
+        return None
+    try:
+        import yaml  # noqa: PLC0415
+
+        data = yaml.safe_load(text)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _is_not_finalized(result: dict | None) -> bool:
@@ -242,6 +293,11 @@ def _metadata_keys(metadata: Any) -> list[str]:
     if not isinstance(metadata, dict):
         return []
     return sorted(str(key) for key in metadata)
+
+
+def _str_field(row: dict, key: str) -> str:
+    value = row.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def _metadata_value(metadata: Any, key: str) -> str | None:
@@ -339,6 +395,18 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # Shared credential store (for FCM credentials only).
         self._credentials = CredentialStore()
 
+        # How inbound work arrives: FCM push (the default) or the poll_work
+        # long poll (FILAMENT_TRANSPORT=poll; see poll_transport.py). Read
+        # once: switching transports takes a gateway restart.
+        self._polling = (
+            poll_transport.transport_from_env(os.environ)
+            == poll_transport.TRANSPORT_POLL
+        )
+        self._poll_task: asyncio.Task | None = None
+        # room id → (RoomInfo, monotonic fetch time): what a push said about
+        # its room and sender, for poll rows that don't say it.
+        self._room_info: dict[str, tuple[poll_transport.RoomInfo, float]] = {}
+
         # Runtime state (populated during connect stages).
         self._fcm_client: FilamentFCMClient | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -358,6 +426,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # Agent identity (populated during Stage 1 via get_self MCP tool).
         self._user_id: str | None = None
+
+        # The first-contact hello turn in flight, and whether a hello (its
+        # reply or the canned fallback) has gone out. See _maybe_greet.
+        self._hello_trigger_id: str | None = None
+        self._hello_delivered: bool = False
 
         # Loops whose vouch is mid-accept. The startup sweep and a live
         # knock_invite_received push can name the same loop at once (the sweep
@@ -638,11 +711,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         stage="initialize_api",
                     )
                 return False
-            if not await self._register_fcm():
+            if self._polling:
+                logger.info(
+                    "filament-fcm: transport is poll_work; skipping FCM "
+                    "registration (Stages 2-3)"
+                )
+            elif not await self._register_fcm():
                 logger.error("filament-fcm: Stage 2 (FCM registration) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="register_fcm")
                 return False
-            if not await self._register_pusher():
+            elif not await self._register_pusher():
                 logger.error("filament-fcm: Stage 3 (push token registration) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="register_pusher")
                 return False
@@ -665,7 +743,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                         "continuing on local files"
                     )
 
-            if not await self._start_listener():
+            if self._polling:
+                self._start_polling()
+            elif not await self._start_listener():
                 logger.error("filament-fcm: Stage 4 (FCM listener) failed")
                 slog.error("filament_fcm.connect.stage_failed", stage="start_listener")
                 return False
@@ -696,6 +776,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             # blocks or fails the connect.
             self._start_update_check()
 
+            # Name and avatar from the Hermes agent's identity while the
+            # profile is still the server's default, before the hello so the
+            # hello carries the new name. Bounded: never stalls the connect.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._seed_profile(), timeout=30.0)
+
             # First-contact hello, once the listener is up so the agent's
             # reply path is fully live. Never block/fail the connect on it.
             await self._maybe_greet()
@@ -706,19 +792,63 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             self._set_fatal_error("connect_failed", "Connection failed", retryable=True)
             return False
 
+    async def _seed_profile(self) -> None:
+        """Seed the Filament profile from the Hermes agent (profile_seed.py).
+
+        Every connect, not only the first: it does nothing once the owner (or
+        an earlier connect) has named the agent, and a connect that could not
+        seed gets another go. Never raises."""
+        if not profile_seed.is_default_agent_name(self._self_name, self._owner_name):
+            return
+        try:
+            hermes_home, profile_name, hermes_root = _hermes_identity_paths()
+            wanted = profile_seed.seed_name(
+                profile_meta=_read_yaml_mapping(hermes_home / "profile.yaml"),
+                soul_text=_read_text(hermes_home / "SOUL.md"),
+                profile_name=profile_name,
+            )
+            avatar = profile_seed.find_avatar(hermes_home, hermes_root)
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not read the Hermes identity", exc_info=True
+            )
+            return
+
+        async def call(name: str, args: dict) -> tuple[Any, str | None]:
+            with bound_context(call_origin="profile_seed"):
+                raw = await self._filament_api.call_tool(name, args)
+            error = FilamentAPI.result_error(raw)
+            return (None if error else FilamentAPI.parse_tool_result(raw)), error
+
+        result = await profile_seed.seed_profile(
+            call,
+            display_name=self._self_name,
+            owner_name=self._owner_name,
+            wanted_name=wanted,
+            avatar=avatar,
+        )
+        if result is not None and result.name:
+            self._self_name = result.name
+
     async def _maybe_greet(self) -> None:
-        """Fire a one-shot first-contact hello into the backchannel.
+        """Say a one-shot first-contact hello in the backchannel.
 
         The server is the authority on whether a greeting is due (it appends
         the directive to the initialize instructions only while
-        has_messaged_backchannel is false). We act on that by running a single
-        synthetic agent turn addressed to the principal; the gateway routes the
-        agent's reply to the backchannel like any other turn. Because the gate
-        clears as soon as the agent posts there, this never double-greets, and
-        a hello that fails to land simply re-prompts on the next connect.
+        has_messaged_backchannel is false). Because the gate clears as soon as
+        the agent posts there, this never double-greets, and a hello that
+        fails to land simply re-prompts on the next connect.
 
-        The CC harness gets the same nudge for free by reading the directive in
-        the instructions it already receives — this is the Hermes equivalent.
+        The hello is one model turn, so it is in the agent's own voice and
+        name; the command list is appended in code (``send``), since commands
+        run before any turn and a model can't be trusted to state them. It
+        runs in a side session of the backchannel's (``framing.HELLO_THREAD``)
+        so its gateway-written prompt never shows up as the principal's
+        message in the backchannel conversation, in the model's history or in
+        the Hermes dashboard. The app's connect screen waits for this message,
+        so a turn that says nothing, fails, or takes longer than
+        ``_HELLO_TIMEOUT_S`` falls back to the canned hello. Never blocks or
+        fails the connect.
         """
         if not self._greet_pending:
             return
@@ -730,94 +860,133 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
         # One-shot within this process; the server's gate covers reconnects.
         self._greet_pending = False
-
+        self._hello_trigger_id = f"first-hello:{self._cc_room_id}"
+        self._hello_delivered = False
+        logger.info(
+            "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
+        )
         try:
-            # Deterministic, not a model turn: the hello is the connect flow's
-            # finish line (the app literally waits for it), so it should land
-            # the moment the gateway is up — an LLM round added ~6 seconds of
-            # pure wait and could say anything. Personality gets its chance on
-            # the first real exchange.
-            logger.info(
-                "filament-fcm: first-contact greet → backchannel %s", self._cc_room_id
+            source = self.build_source(
+                chat_id=self._cc_room_id,
+                chat_name=framing.session_label("first hello"),
+                chat_type="dm",
+                user_id=self._owner_id,
+                user_name=self._owner_name or self._owner_id,
+                thread_id=framing.HELLO_THREAD,
+                message_id=self._hello_trigger_id,
+            )
+            policy, policy_set_keys = self._wake_policy.read_with_provenance()
+            event = MessageEvent(
+                text=framing.first_contact_prompt(self._self_name, self._owner_name),
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=self._hello_trigger_id,
+                raw_message=None,
+                channel_prompt=(
+                    f"{framing.TOOL_MAP_PROMPT}\n\n"
+                    + framing.wake_policy_prompt(policy, policy_set_keys)
+                ),
             )
             with bound_context(
                 installation_id=self._installation_id,
                 gateway_instance_id=self._gateway_instance_id,
                 call_origin="first_contact_greet",
+                trigger_event_id=self._hello_trigger_id,
             ):
                 slog.info(
                     "filament_fcm.greet.dispatch",
                     channel_id=self._cc_room_id,
                     principal_id=self._owner_id,
                 )
-                await self._filament_api.post_message(
+                await self.handle_message(event)
+        except Exception:
+            logger.exception("filament-fcm: greet turn dispatch failed")
+            slog.exception("filament_fcm.greet.failed")
+        with contextlib.suppress(RuntimeError):
+            task = asyncio.get_running_loop().create_task(self._hello_fallback())
+            self._background_greet_task = task
+
+    async def _hello_fallback(self, timeout: float | None = None) -> None:
+        """Post the canned hello unless the hello turn's reply lands first."""
+        deadline = time.monotonic() + (timeout or _HELLO_TIMEOUT_S)
+        while time.monotonic() < deadline:
+            if self._hello_delivered:
+                return
+            await asyncio.sleep(0.5)
+        await self._post_canned_hello("the hello turn took too long")
+
+    async def _post_canned_hello(self, why: str) -> None:
+        if self._hello_delivered or not self._cc_room_id:
+            return
+        self._hello_delivered = True
+        logger.info("filament-fcm: %s; posting the canned hello", why)
+        try:
+            with bound_context(call_origin="first_contact_greet"):
+                result = await self._filament_api.post_message(
                     channel=self._cc_room_id,
                     markdown_body=framing.first_contact_hello(
                         self._self_name,
                         self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS),
                     ),
                 )
-                slog.info(
-                    "filament_fcm.greet.dispatched",
-                    channel_id=self._cc_room_id,
-                    principal_id=self._owner_id,
-                )
-            # Fire-and-forget capabilities intro: a short model turn in the
-            # backchannel session. Two jobs — a genuinely useful second
-            # message, and priming the session + provider prompt cache so the
-            # principal's FIRST real message answers warm (~3s faster,
-            # measured). Never awaited and never gates readiness.
-            with contextlib.suppress(RuntimeError):
-                task = asyncio.get_running_loop().create_task(self._greet_intro_turn())
-                self._background_greet_task = task
+            if FilamentAPI.result_error(result):
+                raise RuntimeError(FilamentAPI.result_error(result))
+            slog.info("filament_fcm.greet.dispatched", fallback=True)
         except Exception:
-            logger.exception("filament-fcm: greet post failed")
+            # The server's gate re-prompts on the next connect.
+            self._hello_delivered = False
+            logger.exception("filament-fcm: canned hello post failed")
             slog.exception("filament_fcm.greet.failed")
 
-    async def _greet_intro_turn(self) -> None:
-        """Background capabilities intro (see _maybe_greet). Best-effort."""
+    async def _send_hello(
+        self, content: str, reply_to: str | None, metadata: Any = None
+    ) -> SendResult:
+        """``send`` for the hello's side session (see ``_maybe_greet``).
+
+        Only the turn's final reply — the one anchored on the hello trigger —
+        is the hello; it goes to the backchannel's main timeline with the
+        command list appended. Anything else the side session sends (an error
+        notice, tool progress) and any reply after the canned fallback went
+        out is dropped: the principal sees exactly one hello."""
+        # Hermes marks a turn's final reply notify=True on both its delivery
+        # lanes; error notices and progress lines carry neither mark.
+        is_final = reply_to == getattr(self, "_hello_trigger_id", None) or (
+            isinstance(metadata, dict) and metadata.get("notify") is True
+        )
+        why = (
+            "not the turn's final reply"
+            if not is_final
+            else "a hello already went out"
+            if self._hello_delivered
+            else "it is empty"
+            if not (content or "").strip()
+            else None
+        )
+        if why:
+            logger.info(
+                "filament-fcm: dropping a side-session send from the hello "
+                "(%s; %d chars)",
+                why,
+                len(content or ""),
+            )
+            return SendResult(success=True)
+        self._hello_delivered = True
+        body = f"{content.strip()}\n\n" + framing.command_summary(
+            self._feature_flags.is_enabled(FEATURE_SLASH_COMMANDS)
+        )
         try:
-            trigger_id = f"greet-intro:{self._cc_room_id}"
-            source = self.build_source(
-                chat_id=self._cc_room_id,
-                chat_name="backchannel",
-                chat_type="dm",
-                user_id=self._owner_id,
-                user_name=self._owner_name or self._owner_id,
-                message_id=trigger_id,
+            result = await self._filament_api.post_message(
+                channel=self._cc_room_id, markdown_body=body
             )
-            policy, policy_set_keys = self._wake_policy.read_with_provenance()
-            channel_prompt = (
-                f"{framing.TOOL_MAP_PROMPT}\n\n"
-                + framing.wake_policy_prompt(policy, policy_set_keys)
-            )
-            event = MessageEvent(
-                text=(
-                    "[system: You just connected and posted a canned hello in "
-                    "your backchannel. Follow it with ONE short message (no "
-                    "greeting, no tools): a line with two or three concrete "
-                    "things you can do for your principal; then, from the "
-                    "wake policy in your system prompt, one plain sentence on "
-                    "when you wake in shared channels; then one offer — they "
-                    "can have emoji reactions wake you, or set any of it per "
-                    "channel, just by asking here (e.g. 'wake on 🐞 reactions "
-                    "in the bug channel').]"
-                ),
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=trigger_id,
-                raw_message=None,
-                channel_prompt=channel_prompt,
-            )
-            with bound_context(
-                installation_id=self._installation_id,
-                gateway_instance_id=self._gateway_instance_id,
-                call_origin="first_contact_greet",
-                trigger_event_id=trigger_id,
-            ):
-                await self.handle_message(event)
-        except Exception:
-            logger.debug("filament-fcm: greet intro turn failed", exc_info=True)
+        except Exception as e:
+            self._hello_delivered = False
+            return SendResult(success=False, error=str(e), retryable=True)
+        error = FilamentAPI.result_error(result)
+        if error:
+            self._hello_delivered = False
+            return SendResult(success=False, error=error, retryable=True)
+        slog.info("filament_fcm.greet.dispatched", fallback=False)
+        return SendResult(success=True, raw_response=result)
 
     def _note_reserved(self) -> None:
         """Mark this connect attempt blocked on an unfinalized agent, and tell
@@ -1271,6 +1440,161 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             slog.exception("filament_fcm.stage.failed", stage="start_listener")
             return False
 
+    # ── poll_work transport ─────────────────────────────────────────
+
+    def _start_polling(self) -> None:
+        """Stage 4, poll flavor: the poll_work loop plus the presence
+        heartbeat the FCM listener would have started."""
+        logger.info("filament-fcm: [Stage 4] starting the poll_work loop")
+        slog.info("filament_fcm.stage.start", stage="start_polling")
+        self._poll_task = asyncio.create_task(self._run_poll_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        slog.info("filament_fcm.stage.complete", stage="start_polling")
+
+    async def _run_poll_loop(self) -> None:
+        loop = poll_transport.PollLoop(self._poll_call, self._dispatch_poll_item)
+        try:
+            await loop.run()
+        except poll_transport.PollFatal as e:
+            logger.error("filament-fcm: polling stopped: %s", e)
+            slog.error("filament_fcm.poll.fatal", error=str(e))
+            self._set_fatal_error("poll_failed", str(e), retryable=e.retryable)
+            await self._notify_fatal_error()
+
+    async def _poll_call(self, args: dict) -> tuple[Any, str | None]:
+        with bound_context(call_origin="poll_work"):
+            raw = await self._filament_api.poll_work(args)
+        error = FilamentAPI.result_error(raw)
+        if error:
+            return None, error
+        result = raw.get("result") if isinstance(raw, dict) else None
+        if isinstance(result, dict) and result.get("isError"):
+            content = result.get("content") or [{}]
+            text = content[0].get("text") if isinstance(content[0], dict) else None
+            return None, str(text or "poll_work failed")
+        return FilamentAPI.parse_tool_result(raw), None
+
+    async def _room_info_for(
+        self, room_id: str, sender: str | None = None
+    ) -> poll_transport.RoomInfo:
+        """The room's name, loop, DM-ness and member names; cached for five
+        minutes, and fetched again early for a sender it doesn't know yet (a
+        new member). An unreadable room reads as nameless, never fails."""
+        cached = self._room_info.get(room_id)
+        now = time.monotonic()
+        if cached is not None:
+            info, fetched = cached
+            age = now - fetched
+            if age < _ROOM_INFO_TTL_S and (
+                sender is None or sender in info.members or age < 10
+            ):
+                return info
+        try:
+            with bound_context(call_origin="poll_room_info"):
+                raw = await self._filament_api.call_tool(
+                    "get_channel_details", {"channel_id": room_id}
+                )
+            if FilamentAPI.result_error(raw):
+                raise RuntimeError(FilamentAPI.result_error(raw))
+            info = poll_transport.room_info_from_details(
+                FilamentAPI.parse_tool_result(raw)
+            )
+        except Exception:
+            logger.warning(
+                "filament-fcm: could not read room details for %s",
+                room_id,
+                exc_info=True,
+            )
+            return cached[0] if cached else poll_transport.RoomInfo()
+        self._room_info[room_id] = (info, now)
+        return info
+
+    async def _dispatch_poll_item(self, item: poll_transport.PollItem) -> None:
+        """Hand one poll_work item to the handler its FCM push would reach.
+
+        Message and reaction turns are scheduled, not awaited, as pushes are:
+        the next poll goes out while they run. An item's messages keep their
+        order."""
+        if item.kind == "invite":
+            self._on_invite(
+                InviteMessage(
+                    room_id=item.loop_id,
+                    branch_type="add_to_space",
+                    inviter=item.sender,
+                    inviter_id=item.sender,
+                    room_name=item.name or "",
+                    raw=item.raw,
+                )
+            )
+            return
+        if item.kind == "vouch":
+            self._on_vouch(
+                VouchMessage(
+                    loop_id=item.loop_id,
+                    inviter=item.sender,
+                    inviter_id=item.sender,
+                    loop_name=item.name,
+                    raw=item.raw,
+                )
+            )
+            return
+        self._schedule_async(self._run_poll_item(item), f"poll {item.kind}")
+
+    async def _run_poll_item(self, item: poll_transport.PollItem) -> None:
+        rows = item.messages or item.reactions
+        info = poll_transport.room_info(item)
+        if info is None:
+            # A server from before poll_work items described their room.
+            info = await self._room_info_for(item.channel_id)
+            unknown = [
+                sender
+                for sender in (_str_field(row, "sender") for row in rows)
+                if sender and sender not in info.members
+            ]
+            if unknown:
+                info = await self._room_info_for(item.channel_id, unknown[0])
+        is_direct = info.is_direct if item.is_direct is None else item.is_direct
+        for row in item.messages:
+            body = _str_field(row, "body")
+            await self._handle_push_message(
+                PushMessage(
+                    event_id=row["event_id"],
+                    room_id=item.channel_id,
+                    room_name=info.name,
+                    sender=_str_field(row, "sender"),
+                    sender_display_name=info.members.get(_str_field(row, "sender"), ""),
+                    body=body,
+                    is_direct=is_direct,
+                    branch_type="direct_message" if is_direct else "channel_message",
+                    thread_id=item.thread_id,
+                    is_mention=row.get("is_mention") is True,
+                    is_everyone_mention=poll_transport.everyone_mentioned(body),
+                    raw={"poll_work": row},
+                    has_content=bool(body.strip()) or not row.get("media"),
+                    loop_name=info.loop_name,
+                    has_media=bool(row.get("media")),
+                    sender_is_agent=row.get("is_from_agent")
+                    if isinstance(row.get("is_from_agent"), bool)
+                    else None,
+                )
+            )
+        for row in item.reactions:
+            await self._handle_reaction(
+                ReactionMessage(
+                    event_id=row["event_id"],
+                    room_id=item.channel_id,
+                    room_name=info.name,
+                    sender=_str_field(row, "sender"),
+                    sender_display_name=info.members.get(_str_field(row, "sender"), ""),
+                    key=_str_field(row, "key"),
+                    target_event_id=_str_field(row, "target_event_id"),
+                    removed=False,
+                    is_direct=is_direct,
+                    thread_id=item.thread_id,
+                    raw={"poll_work": row},
+                )
+            )
+
     async def _heartbeat_loop(self, interval_seconds: int = 20) -> None:
         """Keep the agent's Filament presence alive while the gateway runs.
 
@@ -1321,7 +1645,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         raises: a failed probe request is itself a symptom, not a reason to
         disturb the heartbeat.
         """
-        if not self._filament_api:
+        if not self._filament_api or getattr(self, "_polling", False):
+            # The probe tests the FCM path; a polling agent has none.
             return
         now = time.monotonic()
         if (
@@ -1561,6 +1886,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         if self._fcm_client:
             await self._fcm_client.stop()
 
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
+
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1594,6 +1924,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         """Send a message via the Filament MCP API."""
         if not self._filament_api:
             return SendResult(success=False, error="Not connected")
+        if _metadata_value(metadata, "thread_id") == framing.HELLO_THREAD:
+            return await self._send_hello(content, reply_to, metadata)
 
         parent_context = current_context()
         send_id = new_id("send")
@@ -2495,7 +2827,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         )
         source = self.build_source(
             chat_id=msg.room_id,
-            chat_name=msg.room_name,
+            # A shared room keeps its own name: the model reads it there.
+            chat_name=msg.room_name
+            if is_shared
+            else framing.session_label(
+                self._owner_name
+                if is_backchannel
+                else msg.room_name or msg.sender_display_name
+            ),
             chat_type="group" if is_shared else "dm",
             user_id=msg.sender,
             user_name=msg.sender_display_name or msg.sender,
@@ -3118,6 +3457,16 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             target_event_id=target,
             outcome=str(outcome),
         )
+        if target == getattr(self, "_hello_trigger_id", None) and (
+            str(getattr(outcome, "value", outcome)).lower() == "failure"
+        ):
+            # Only a turn that failed outright ends the wait early. One that
+            # "succeeds" with nothing may still answer: the gateway runner
+            # can hand the turn to its queued lane and return empty, and that
+            # lane sends the model's reply later, anchored on the same
+            # trigger (live run h9: the canned hello went out here and the
+            # real one, arriving after, was dropped). The deadline covers it.
+            await self._post_canned_hello("the hello turn failed")
         await status_publisher.end_turn(
             getattr(event, "filament_turn_key", None) or target
         )

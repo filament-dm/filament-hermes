@@ -22,7 +22,8 @@ def _setup(parser: Any) -> None:
         help="Connect this agent to Filament using a token from the app",
         description=(
             "Validate the agent token from Filament's connect flow, save it, "
-            "and restart the gateway. Waits if the agent is still being named "
+            "and start the gateway (installing it as a service when there is "
+            "none) or restart it. Waits if the agent is still being named "
             "in the app. Run this again with a new token to reconnect."
         ),
     )
@@ -51,7 +52,8 @@ def _setup(parser: Any) -> None:
         help="Connect this agent to Filament by signing in, with no token",
         description=(
             "Sign in to Filament in a browser, then save the configuration and "
-            "restart the gateway."
+            "start the gateway (installing it as a service when there is none) "
+            "or restart it."
         ),
     )
     login.add_argument(
