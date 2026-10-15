@@ -318,6 +318,13 @@ def test_a_dispatch_failure_does_not_stop_the_batch():
 def test_classify_error():
     assert pt.classify_error("HTTP 403") == "auth"
     assert pt.classify_error("Unauthorized") == "auth"
+    # The server's 401 body once the agent is deleted (live run h20-r4-delete).
+    assert (
+        pt.classify_error(
+            "Authentication required. See WWW-Authenticate header for OAuth discovery."
+        )
+        == "auth"
+    )
     assert pt.classify_error("Method not found: tools/call") == "unsupported"
     assert pt.classify_error("HTTP 429") == "retry"
     assert pt.classify_error("invalid response") == "retry"

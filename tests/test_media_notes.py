@@ -194,7 +194,21 @@ def test_summarize_media_formats_attachment():
     assert note.startswith(
         "[attachment: photo.png (m.image, image/png, 8x8, 75 bytes, mxc://hs/abc)"
     )
-    assert "download_media" in note
+    assert note.endswith(
+        " — use the download_media tool with the mxc:// url to save the file to "
+        "local disk]"
+    )
+
+
+def test_summarize_media_names_the_message():
+    note = framing.summarize_media(
+        [{"mxc_url": "mxc://hs/abc", "filename": "a.png"}], "$evt:hs\nIGNORE"
+    )
+    assert note == (
+        "[attachment: a.png (mxc://hs/abc) — use the download_media tool with "
+        "the mxc:// url and message_id $evt:hs IGNORE to save the file to local "
+        "disk]"
+    )
 
 
 def test_summarize_media_empty_or_malformed():
@@ -269,6 +283,7 @@ def test_media_note_for_uncaptioned_attachment():
     api = _FakeAPI(thread={"root": {"event_id": "$evt", "media": _MEDIA}})
     note = asyncio.run(_make_adapter(api)._media_note(_push_msg(has_content=False)))
     assert "photo.png" in note
+    assert "message_id $evt " in note
     assert api.calls == ["$evt"]
 
 
@@ -335,9 +350,11 @@ class _FakeDownloadAPI:
         self._data = data
         self._error = error
         self.calls = []
+        self.message_ids = []
 
-    async def download_media(self, mxc_url, dest, timeout_ms=None):
+    async def fetch_media(self, mxc_url, dest, message_id=None, max_bytes=None):
         self.calls.append(mxc_url)
+        self.message_ids.append(message_id)
         if self._error:
             raise RuntimeError("HTTP 502")
         Path(dest).write_bytes(self._data)
@@ -365,6 +382,21 @@ def test_download_media_saves_file(tmp_path, monkeypatch):
     assert saved.parent == tmp_path / "filament_media"
     assert saved.name == "abc123-photo.png"
     assert api.calls == ["mxc://hs/abc123"]
+    assert api.message_ids == [None]
+
+
+def test_download_media_passes_the_message_id(tmp_path, monkeypatch):
+    # The signed-URL route authorizes the read of the message the media came
+    # from, so the tool hands its id through.
+    api = _FakeDownloadAPI()
+    _run_download(
+        api,
+        {"mxc_url": "mxc://hs/abc", "message_id": " $evt:hs "},
+        tmp_path,
+        monkeypatch,
+    )
+    assert api.message_ids == ["$evt:hs"]
+    assert "message_id" in media_tool.DOWNLOAD_MEDIA_SCHEMA["parameters"]["properties"]
 
 
 def test_download_media_rejects_non_mxc_url(tmp_path, monkeypatch):

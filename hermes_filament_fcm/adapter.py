@@ -37,7 +37,15 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import framing, poll_transport, profile_seed, slash, timeline, turn_context
+from . import (
+    framing,
+    media_tool,
+    poll_transport,
+    profile_seed,
+    slash,
+    timeline,
+    turn_context,
+)
 from ._version import PLUGIN_VERSION, is_newer
 from .credentials import CredentialStore
 from .fcm_client import (
@@ -111,6 +119,14 @@ _SESSION_KEYING_MANAGED_KEY = "_filament_fcm_managed_session_keying"
 
 
 logger = logging.getLogger("gateway.filament_fcm")
+
+# What the owner (and `hermes gateway status`, and the model reading the log)
+# should learn when Filament refuses the saved sign-in at connect.
+AUTH_REFUSED_MESSAGE = (
+    "Filament refused this agent's sign-in: the agent was deleted or signed "
+    "out in Filament. Not retrying. To connect again, press Connect for "
+    "Hermes in the Filament app and send this Hermes the setup message."
+)
 
 
 @functools.cache  # once per gateway process, not per reconnect
@@ -461,6 +477,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # lands and connect() succeeds. See _initialize_api / connect.
         self._reserved: bool = False
         self._reserved_notified: bool = False
+        # Stage 1's auth refusal (the token is dead), or None.
+        self._auth_refused: str | None = None
         self._owner_id: str | None = None
         self._owner_name: str | None = None
         # The agent's own display name (from get_self), for the hello.
@@ -570,6 +588,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
 
     async def _media_note(self, msg: PushMessage) -> str | None:
         """Describe *msg*'s attachments, or None if it has none (ENG-603).
+        See _media_lookup."""
+        note, _ = await self._media_lookup(msg)
+        return note
+
+    async def _media_lookup(self, msg: PushMessage) -> tuple[str | None, list]:
+        """*msg*'s attachment note (as ``_media_note``) and the media
+        descriptors it was built from (``[]`` when none were found).
 
         The push payload never carries media: an uncaptioned attachment
         arrives as content=null (has_content False), and a captioned one is
@@ -585,9 +610,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         attachment note.
         """
         note = None
+        media: list = []
         if msg.has_media is False:
             # The server said there is no attachment: nothing to fetch.
-            return None if msg.has_content else framing.NON_TEXT_NOTICE
+            return (None if msg.has_content else framing.NON_TEXT_NOTICE), media
         try:
             with bound_context(call_origin="media_lookup"):
                 result = await self._filament_api.get_thread(msg.event_id)
@@ -607,7 +633,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                             target = reply
                             break
             if isinstance(target, dict):
-                note = framing.summarize_media(target.get("media"))
+                found = target.get("media")
+                media = found if isinstance(found, list) else []
+                note = framing.summarize_media(found, msg.event_id)
         except Exception:
             logger.warning(
                 "filament-fcm: could not fetch media details for %s",
@@ -615,8 +643,38 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
         if note is None and not msg.has_content:
-            return framing.NON_TEXT_NOTICE
-        return note
+            return framing.NON_TEXT_NOTICE, media
+        return note, media
+
+    async def _turn_images(
+        self, msg: PushMessage, media: list
+    ) -> tuple[list[str], list[str]]:
+        """Fetch a control turn's images for Hermes' own vision.
+
+        Control turns only: the principal (or the backchannel) sent them to
+        the agent. A data-plane image is never fetched unasked: its pixels
+        are untrusted content that would land in the model's context ahead
+        of any decision (text in an image is an injection surface the
+        framing can't wrap), and every participant in a shared channel
+        could make the agent spend a download and vision tokens. There the
+        note stands alone and the agent fetches with download_media if its
+        instructions call for it. Never raises (fetch_inbound_images).
+        """
+        if not media or not self._filament_api:
+            return [], []
+        try:
+            from gateway.platforms.base import get_image_cache_dir  # noqa: PLC0415
+
+            # Hermes' own inbound image cache: the directory it moves to the
+            # routed profile, and the one vision may read under a sandboxed
+            # terminal backend. The plugin's media dir is neither.
+            dest = Path(get_image_cache_dir())
+        except Exception:
+            dest = media_tool.media_dir()
+        with bound_context(call_origin="media_vision"):
+            return await media_tool.fetch_inbound_images(
+                self._filament_api, media, msg.event_id, dest
+            )
 
     # ── Control vs reactive plane ────────────────────────────────────
 
@@ -694,7 +752,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             _seed_display_defaults()
 
             if not await self._initialize_api():
-                if self._reserved:
+                if self._auth_refused:
+                    # Not retryable: the token is gone for good, and retrying
+                    # every 30-60 s only fills the log with get_self errors
+                    # (live run h20-r4-delete). A new sign-in writes a new
+                    # token and restarts the gateway, which clears this.
+                    logger.error("filament-fcm: %s", AUTH_REFUSED_MESSAGE)
+                    slog.error(
+                        "filament_fcm.connect.auth_refused", error=self._auth_refused
+                    )
+                    self._set_fatal_error(
+                        "auth_refused", AUTH_REFUSED_MESSAGE, retryable=False
+                    )
+                elif self._reserved:
                     # ENG-429: reserved, not finalized yet. Retry (not a hard
                     # failure) so we reconnect once the principal finishes setup
                     # in the app, then Stage 3 + the greet directive succeed.
@@ -1004,6 +1074,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def _initialize_api(self) -> bool:
         """Stage 1: Initialize the MCP session on the pre-created FilamentAPI."""
         self._reserved = False
+        self._auth_refused = None
         try:
             logger.info(
                 "filament-fcm: [Stage 1] initializing MCP session at %s",
@@ -1012,6 +1083,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             slog.info("filament_fcm.stage.start", stage="initialize_api")
             with bound_context(call_origin="startup"):
                 init = await self._filament_api.initialize()
+            refused = FilamentAPI.result_error(init)
+            if refused and poll_transport.classify_error(refused) == "auth":
+                self._auth_refused = refused
+                return False
             logger.info("filament-fcm: [Stage 1] MCP session established")
             slog.info("filament_fcm.stage.complete", stage="initialize_api")
 
@@ -1947,11 +2022,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             call_origin="adapter_send",
         ):
             try:
-                thread_id = reply_thread_for_send(
-                    (metadata or {}).get("thread_id") if metadata else None,
-                    turn_context.current().reply_anchor,
-                    chat_id,
-                )
+                thread_id = self._send_thread(chat_id, metadata)
 
                 # Mid-work system notices become a transient status line in
                 # shared channels (never a posted message); the backchannel
@@ -2056,6 +2127,128 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                 )
                 return SendResult(success=False, error=str(e), retryable=True)
+
+    @staticmethod
+    def _send_thread(chat_id: str, metadata: Any) -> str | None:
+        """The thread a send to *chat_id* lands in (None = top level): the
+        metadata's thread, else the turn's reply anchor in this room."""
+        return reply_thread_for_send(
+            (metadata or {}).get("thread_id") if metadata else None,
+            turn_context.current().reply_anchor,
+            chat_id,
+        )
+
+    # ── Native media sends ──────────────────────────────────────────
+    # A reply carrying ``MEDIA:/absolute/path`` reaches these instead of
+    # send(): Hermes strips the tag and hands over the local file (images
+    # via send_image_file, audio via send_voice, video, anything else as a
+    # document). The file is uploaded by this process (FilamentAPI
+    # .upload_media) and posted as an attachment where send() would have
+    # put the reply, the caption as its body. The model only ever named a
+    # path. A failure returns success=False, and Hermes tells the chat the
+    # file didn't arrive.
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(chat_id, image_path, caption, metadata)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(
+            chat_id, file_path, caption, metadata, file_name=file_name
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        return await self._send_local_file(chat_id, video_path, caption, metadata)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: Any = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        # Every audio file comes here (and auto-TTS, via play_tts). Filament
+        # has no voice bubble: it is posted as an m.audio attachment.
+        return await self._send_local_file(chat_id, audio_path, caption, metadata)
+
+    async def _send_local_file(
+        self,
+        chat_id: str,
+        path: str,
+        caption: str | None,
+        metadata: Any,
+        file_name: str | None = None,
+    ) -> SendResult:
+        """Upload the file at *path* and post it to *chat_id* (see above)."""
+        if not self._filament_api:
+            return SendResult(success=False, error="Not connected")
+        problem = media_tool.local_file_problem(path)
+        if problem:
+            logger.warning("filament-fcm: not sending media: %s", problem)
+            return SendResult(success=False, error=problem)
+        filename = file_name or os.path.basename(path)
+        thread_id = self._send_thread(chat_id, metadata)
+        with bound_context(
+            installation_id=self._installation_id, call_origin="adapter_send_media"
+        ):
+            try:
+                mxc = await self._filament_api.upload_media(path, filename=filename)
+                attachments = [{"mxc_url": mxc, "filename": filename}]
+                if thread_id:
+                    result = await self._filament_api.reply_in_thread(
+                        message_id=thread_id,
+                        markdown_body=caption or "",
+                        attachments=attachments,
+                    )
+                else:
+                    result = await self._filament_api.post_message(
+                        channel=chat_id,
+                        markdown_body=caption or "",
+                        attachments=attachments,
+                    )
+            except Exception as e:
+                logger.warning("filament-fcm: media send failed: %s", e)
+                return SendResult(success=False, error=str(e))
+        error = FilamentAPI.result_error(result)
+        if error is None and isinstance(result, dict) and result.get("error"):
+            error = str(result["error"])
+        if error is not None:
+            logger.warning("filament-fcm: media post failed: %s", error)
+            return SendResult(success=False, raw_response=result, error=error)
+        slog.info(
+            "filament_fcm.send.media",
+            installation_id=self._installation_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            event_id=_result_event_id(result),
+        )
+        return SendResult(success=True, raw_response=result)
 
     async def get_chat_info(self, chat_id: str) -> dict:
         """Return metadata about a chat/room."""
@@ -2780,6 +2973,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             and not slash.is_fil_command(slash_body)
             and is_owner
         )
+        image_paths: list[str] = []
+        image_types: list[str] = []
         if gateway_command:
             body = slash_body
             breadcrumb = None
@@ -2803,9 +2998,10 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 context_read = self._context_breadcrumb(
                     msg.room_id, msg.event_id, inline=True
                 )
-            media_note, breadcrumb = await asyncio.gather(
-                self._media_note(msg), context_read
+            (media_note, media), breadcrumb = await asyncio.gather(
+                self._media_lookup(msg), context_read
             )
+            image_paths, image_types = await self._turn_images(msg, media)
             body = framing.append_note(body, media_note)
             # Name the speaker in the turn's framing (see framing.control_body:
             # the principal is recognized by server-attributed id, never by
@@ -2872,6 +3068,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             channel_context=breadcrumb,
             channel_prompt=channel_prompt,
         )
+        if image_paths:
+            # Local files Hermes reads itself: attached to the model as
+            # images when it has vision, else described into the text. The
+            # attachment note stays in the body either way.
+            event.media_urls = image_paths
+            event.media_types = image_types
         logger.info(
             "Dispatching control message from %s (event=%s, room=%s)",
             msg.sender_display_name or msg.sender,

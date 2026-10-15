@@ -251,7 +251,11 @@ class PollFatal(Exception):
 def classify_error(error: str) -> str:
     """``auth``, ``unsupported`` or ``retry`` for a poll_work error."""
     lowered = error.lower()
-    if error in ("HTTP 401", "HTTP 403") or "unauthorized" in lowered:
+    if (
+        error in ("HTTP 401", "HTTP 403")
+        or "unauthorized" in lowered
+        or "authentication required" in lowered
+    ):
         return "auth"
     if "unknown tool" in lowered or "method not found" in lowered:
         return "unsupported"
@@ -307,6 +311,8 @@ class PollLoop:
             reason = error or "an unreadable poll_work result"
             kind = classify_error(error) if error else "retry"
             if kind == "auth":
+                # Retryable: the reconnect's Stage 1 tells a dead sign-in (the
+                # agent deleted or signed out in Filament) from a blip.
                 raise PollFatal(
                     f"poll_work was refused ({reason}); sign in again", retryable=True
                 )

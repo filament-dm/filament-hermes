@@ -34,6 +34,28 @@ def test_sanitize_meta_drops_nonprintable_and_truncates():
     assert framing.sanitize_meta("") == ""
 
 
+# ── sending_files_hint ───────────────────────────────────────────────
+
+
+def test_sending_files_hint_names_media_tag_and_signed_upload_only():
+    native = (
+        "SENDING FILES:\n"
+        "You can send files natively: write MEDIA:/absolute/path/to/file in "
+        "your reply and the file is posted as an attachment (the rest of the "
+        "reply is sent as usual)."
+    )
+    assert framing.sending_files_hint(False) == native + "\n"
+    assert framing.sending_files_hint(True) == (
+        native + " To attach a file to a post_message or reply_in_thread call "
+        "instead, call create_media_upload, upload the file from your shell "
+        "with curl -T to the upload_url it returns (no token needed), and pass "
+        "the returned mxc_url in attachments.\n"
+    )
+    # Never the bearer route: the model's shell doesn't have the token.
+    for signed in (False, True):
+        assert "TOKEN" not in framing.sending_files_hint(signed)
+
+
 # ── append_note ──────────────────────────────────────────────────────
 
 

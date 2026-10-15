@@ -150,17 +150,38 @@ def sender_is_agent_in_thread(
     return by_sender
 
 
+# Server tools a grant names by another tool's capability, mirroring the
+# server's ``ToolAuth(capability_tool=...)``: the signed-URL download
+# (filament-dm/synapse#1157) is governed by the ``download_media`` grant the
+# bearer side-channel always used, so one grant covers both ways of fetching.
+CAPABILITY_ALIASES: dict[str, str] = {"get_media_download_url": "download_media"}
+
+# Server tools no grant governs, mirroring the server's
+# ``ToolAuth(ungated_reason=...)``: an upload only stores media for a later
+# post, and the post is gated in the channel it lands in.
+UNGATED_TOOLS: frozenset[str] = frozenset({"create_media_upload"})
+
+
 def capability_denies(allowed: "frozenset[str] | None", tool_name: str) -> bool:
     """Return True if a turn restricted to ``allowed`` may NOT call ``tool_name``.
 
     ``allowed is None`` means ungated (control / non-data / non-Filament turns)
-    and never denies. A frozenset gates: only its members are permitted. Pure
-    and stdlib-only so it is unit-testable without importing Hermes; the
-    ``pre_tool_call`` hook in ``__init__`` is a thin wrapper over this.
+    and never denies. A frozenset gates: only its members are permitted, a
+    member also permitting the tools ``CAPABILITY_ALIASES`` maps to it, and
+    ``UNGATED_TOOLS`` always pass, as on the server. Pure and stdlib-only so it
+    is unit-testable without importing Hermes; the ``pre_tool_call`` hook in
+    ``__init__`` is a thin wrapper over this.
     """
-    if allowed is None:
+    if allowed is None or tool_name in UNGATED_TOOLS:
         return False
-    return tool_name not in allowed
+    return CAPABILITY_ALIASES.get(tool_name, tool_name) not in allowed
+
+
+def permitted_tools(allowed: frozenset[str]) -> frozenset[str]:
+    """The tool names to show a turn restricted to ``allowed``: its members
+    plus the aliases they govern. ``UNGATED_TOOLS`` pass too but go unnamed:
+    an upload is only useful with a grant to post it somewhere."""
+    return allowed | {t for t, cap in CAPABILITY_ALIASES.items() if cap in allowed}
 
 
 def capability_hint(
@@ -180,7 +201,7 @@ def capability_hint(
     """
     if allowed is None:
         return ""
-    names = ", ".join(sorted(allowed)) if allowed else "(none)"
+    names = ", ".join(sorted(permitted_tools(allowed))) if allowed else "(none)"
     # Decline coaching: any frozenset means some tools are excluded here, so
     # tell the agent how to say no gracefully. Static policy-derived text only
     # — like the rest of the hint it must never interpolate event data, and it

@@ -295,6 +295,29 @@ def test_capability_denies_ungated_and_gated():
     assert reactive.capability_denies(frozenset(), "get_thread") is True
 
 
+def test_capability_denies_media_tools_as_the_server_does():
+    # The signed-URL media tools (synapse#1157) are not bundle members: the
+    # server governs get_media_download_url by the download_media grant and
+    # leaves the upload tools ungated. With advanced tool controls on, a gated
+    # data turn refused all three here while the server would have allowed them.
+    reader = frozenset({"get_thread", "download_media"})
+    assert reactive.capability_denies(reader, "get_media_download_url") is False
+    assert (
+        reactive.capability_denies(frozenset({"get_thread"}), "get_media_download_url")
+        is True
+    )
+    assert reactive.capability_denies(frozenset(), "create_media_upload") is False
+    # The default rows grant the download wherever read_history is granted.
+    store = reactive.CapabilityPolicyStore("/nonexistent/policy.json")
+    granted = store.expand_capabilities(list(reactive.DEFAULT_CAPABILITIES))
+    assert reactive.capability_denies(granted, "get_media_download_url") is False
+
+
+def test_capability_hint_names_aliased_media_tool():
+    h = reactive.capability_hint(frozenset({"download_media", "post_message"}))
+    assert "download_media, get_media_download_url, post_message" in h
+
+
 def test_capability_hint():
     # Ungated (control/other) → no hint at all.
     assert reactive.capability_hint(None) == ""

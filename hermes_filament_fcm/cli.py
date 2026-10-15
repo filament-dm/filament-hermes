@@ -87,6 +87,10 @@ def _setup(parser: Any) -> None:
         action="store_true",
         help="save the configuration but leave the gateway alone",
     )
+    # Internal: the second half of a login run from inside the gateway it
+    # has to restart (setup_cli._restart_gateway). Not for owners.
+    handoff = sub.add_parser("gateway-handoff")
+    handoff.add_argument("--after-pid", type=int, default=None)
 
 
 def _handler(args: Any) -> int:
@@ -101,6 +105,10 @@ def _handler(args: Any) -> int:
             open_browser=not args.no_open,
             restart=not args.no_restart,
         )
+    if command == "gateway-handoff":
+        from .setup_cli import gateway_handoff  # noqa: PLC0415
+
+        return gateway_handoff(args.after_pid)
     if command != "connect":
         print("usage: hermes filament connect <token> | hermes filament login")
         return 2
