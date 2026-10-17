@@ -105,6 +105,17 @@ def _load_modules():
 
 fcm_client, reactive, adapter = _load_modules()
 
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_addressing_wait(monkeypatch):
+    # These tests pin the thread-follow-up rule; the addressing wait is
+    # covered in test_addressing_grace. One read, no sleep.
+    monkeypatch.setattr(adapter, "_ADDRESSING_WAIT_S", 0.0)
+
+
 _HOST = "filament.example"
 _AGENT = f"@d_agent:{_HOST}"
 _HUMAN = f"@franni:{_HOST}"
@@ -156,6 +167,7 @@ def _make_adapter(tmp: Path, thread: dict | None):
     a._seen_history = reactive.SeenHistoryStore(tmp / "seen.json")
     a._engaged_threads = reactive.EngagedThreadStore(tmp / "threads.json")
     a._sender_is_agent_cache = {}
+    a._addressing_holds = {}
     a._filament_api = _FakeFilamentAPI(thread) if thread is not None else None
     a._is_new_event = lambda event_id: True
     a._is_control_channel = lambda room_id: False
@@ -240,13 +252,14 @@ def test_agent_explicit_mention_still_wakes():
 
 def test_unengaged_thread_stays_asleep():
     # Delivery is NOT engagement: a thread we were never mentioned in doesn't
-    # wake us, and the sender-classification API isn't even consulted.
+    # wake us. The thread is read once, for the server's addressing
+    # judgement, and the sender-classification lookup is never made.
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         a, woke = _make_adapter(tmp, _thread_with(_HUMAN, "$follow_up", False))
         _run(a, _push(_HUMAN))
         assert woke == []
-        assert a._filament_api.calls == 0
+        assert a._filament_api.calls == 1
 
 
 def test_unclassifiable_sender_fails_closed():
