@@ -247,7 +247,10 @@ def authorization_code_login(
                 "resource": meta.resource,
             },
         )
-        out("Sign in to Filament to connect this agent:")
+        out(
+            "Sign in to Filament to connect this agent (no account yet? "
+            "the same page creates one with your phone number):"
+        )
         out(f"  {url}")
         out(
             "If the browser is on another machine, sign in there, then paste "
@@ -304,7 +307,10 @@ def device_login(
     ):
         raise LoginError(f"Filament refused device sign-in ({status}).")
     link = doc.get("verification_uri_complete") or doc["verification_uri"]
-    out("To connect this agent, open this on any device signed in to Filament:")
+    out(
+        "To connect this agent, open this on any device and sign in to "
+        "Filament with your phone number (no account yet? it creates one):"
+    )
     out(f"  {link}")
     out(f"If it asks for a code, enter {doc['user_code']}.")
     interval = float(doc.get("interval", 5))
