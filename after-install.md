@@ -1,6 +1,13 @@
 # Filament (FCM) installed
 
-Connect it with the agent token from Filament's connect flow:
+Sign in to connect it. No Filament account yet? The sign-in page creates one
+with your phone number:
+
+```
+hermes filament login --device
+```
+
+Or, with an agent token from the Filament app's connect flow:
 
 ```
 hermes filament connect fmcp_YOURTOKEN
