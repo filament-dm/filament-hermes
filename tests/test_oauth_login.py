@@ -6,6 +6,7 @@ Loaded standalone: the module is stdlib-only. HTTP is stubbed at `_request`.
 import base64
 import hashlib
 import importlib.util
+import socket
 import sys
 import threading
 import urllib.error
@@ -51,12 +52,17 @@ class FakeHttp:
         self.routes = routes
         self.token_answers = list(token_answers or [])
         self.calls: list[tuple[str, dict | None, object]] = []
+        self.registered = 0
+        self.forgotten: set[str] = set()
 
     def __call__(self, url, *, form=None, body=None):
         self.calls.append((url, form, body))
         if url.endswith("/register"):
-            return 201, {"client_id": "client-1"}
+            self.registered += 1
+            return 201, {"client_id": f"client-{self.registered}"}
         if url.endswith("/device_authorization"):
+            if form["client_id"] in self.forgotten:
+                return 400, {"error": "invalid_client"}
             return 200, {
                 "device_code": "dev_1",
                 "user_code": "BCDF-GHJK",
@@ -130,9 +136,9 @@ def test_a_refused_device_grant_is_reported(http):
 
 def test_auto_prefers_the_device_grant_when_offered(http, monkeypatch):
     http(_server(device=True))
-    monkeypatch.setattr(ol, "device_login", lambda meta, out: "fmcp_device")
+    monkeypatch.setattr(ol, "device_login", lambda meta, **_: "fmcp_device")
     monkeypatch.setattr(
-        ol, "authorization_code_login", lambda meta, out, open_browser: "fmcp_browser"
+        ol, "authorization_code_login", lambda meta, **_: "fmcp_browser"
     )
     assert ol.login(MCP) == "fmcp_device"
     http(_server(device=False))
@@ -221,3 +227,117 @@ def test_an_endpoint_query_is_kept():
     url = ol._with_query("https://as.example/authorize?tenant=a", {"state": "s"})
     query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
     assert query == {"tenant": "a", "state": "s"}
+
+
+def _registrations(fake) -> int:
+    return sum(1 for url, _, _ in fake.calls if url.endswith("/register"))
+
+
+def _device_client_used(fake) -> str:
+    return [f for u, f, _ in fake.calls if u.endswith("/device_authorization")][-1][
+        "client_id"
+    ]
+
+
+def test_a_device_login_reuses_the_client_it_registered(http, tmp_path):
+    fake = http(_server(), [(200, {"access_token": "fmcp_1"})] * 2)
+    file = tmp_path / "state" / "oauth_client.json"
+    for _ in range(2):
+        ol.device_login(
+            ol.discover(MCP),
+            out=lambda _: None,
+            sleep=lambda _: None,
+            clients=ol.ClientStore(file),
+        )
+    assert _registrations(fake) == 1
+    assert _device_client_used(fake) == "client-1"
+
+
+def test_a_client_the_server_forgot_is_registered_again(http, tmp_path):
+    fake = http(_server(), [(200, {"access_token": "fmcp_1"})] * 2)
+    clients = ol.ClientStore(tmp_path / "oauth_client.json")
+    meta = ol.discover(MCP)
+    ol.device_login(meta, out=lambda _: None, sleep=lambda _: None, clients=clients)
+    fake.forgotten.add("client-1")
+    ol.device_login(meta, out=lambda _: None, sleep=lambda _: None, clients=clients)
+    assert _device_client_used(fake) == "client-2"
+    assert clients.get(meta, "device") == {"client_id": "client-2"}
+
+
+def test_clients_are_kept_per_server_and_flow(tmp_path):
+    clients = ol.ClientStore(tmp_path / "oauth_client.json")
+    meta = ol.ServerMetadata(MCP, "a", "t", f"{ISSUER}/register", None)
+    other = ol.ServerMetadata(MCP, "a", "t", "https://other.example/register", None)
+    clients.put(meta, "device", {"client_id": "d"})
+    clients.put(meta, "browser", {"client_id": "b", "redirect_uri": "u"})
+    assert clients.get(meta, "device") == {"client_id": "d"}
+    assert clients.get(meta, "browser")["client_id"] == "b"
+    assert clients.get(other, "device") is None
+
+
+def test_an_unreadable_or_unwritable_store_keeps_nothing(tmp_path):
+    meta = ol.ServerMetadata(MCP, "a", "t", f"{ISSUER}/register", None)
+    broken = tmp_path / "oauth_client.json"
+    broken.write_text("not json")
+    assert ol.ClientStore(broken).get(meta, "device") is None
+    blocked = tmp_path / "file"
+    blocked.write_text("")
+    # Its parent is a file, so the save fails, quietly.
+    ol.ClientStore(blocked / "oauth_client.json").put(
+        meta, "device", {"client_id": "d"}
+    )
+    assert ol.ClientStore(None).get(meta, "device") is None
+
+
+def _browser_login(clients, lines):
+    result: dict = {}
+
+    def run():
+        result["token"] = ol.authorization_code_login(
+            ol.discover(MCP),
+            out=lines.append,
+            open_browser=False,
+            timeout_s=10,
+            clients=clients,
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    while not any(line.strip().startswith("https://") for line in lines):
+        pass
+    url = next(line.strip() for line in lines if line.strip().startswith("https://"))
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+    urllib.request.urlopen(
+        f"{query['redirect_uri']}?code=c1&state={query['state']}"
+    ).read()
+    thread.join(10)
+    return query
+
+
+def test_a_browser_login_reuses_its_client_on_its_port(http, monkeypatch, tmp_path):
+    fake = http(_server(), [(200, {"access_token": "fmcp_browser"})] * 2)
+    monkeypatch.setattr(ol.sys.stdin, "isatty", lambda: False)
+    clients = ol.ClientStore(tmp_path / "oauth_client.json")
+    first = _browser_login(clients, [])
+    second = _browser_login(clients, [])
+    assert _registrations(fake) == 1
+    assert second["client_id"] == first["client_id"] == "client-1"
+    assert second["redirect_uri"] == first["redirect_uri"]
+
+
+def test_a_browser_login_whose_port_is_taken_registers_again(
+    http, monkeypatch, tmp_path
+):
+    fake = http(_server(), [(200, {"access_token": "fmcp_browser"})] * 2)
+    monkeypatch.setattr(ol.sys.stdin, "isatty", lambda: False)
+    clients = ol.ClientStore(tmp_path / "oauth_client.json")
+    first = _browser_login(clients, [])
+    port = urllib.parse.urlsplit(first["redirect_uri"]).port
+    with socket.socket() as squatter:
+        squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        squatter.bind(("127.0.0.1", port))
+        squatter.listen()
+        second = _browser_login(clients, [])
+    assert _registrations(fake) == 2
+    assert second["client_id"] == "client-2"
+    assert second["redirect_uri"] != first["redirect_uri"]

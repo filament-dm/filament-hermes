@@ -647,6 +647,10 @@ def _resolve_mcp_url(url: str | None) -> str:
     return chosen.strip().rstrip("/")
 
 
+# The OAuth client this profile registered; see oauth_login.ClientStore.
+OAUTH_CLIENT_FILE = "oauth_client.json"
+
+
 def login(
     url: str | None = None,
     flow: str = "auto",
@@ -655,13 +659,19 @@ def login(
 ) -> int:
     """Sign in to Filament, then ``connect`` with the issued token. Returns an
     exit code."""
+    from .credentials import default_state_dir  # noqa: PLC0415
     from .oauth_login import LoginError  # noqa: PLC0415
     from .oauth_login import login as oauth_login  # noqa: PLC0415
 
     resolved = _resolve_mcp_url(url)
     try:
         token = oauth_login(
-            resolved, flow=flow, out=print_info, open_browser=open_browser
+            resolved,
+            flow=flow,
+            out=print_info,
+            open_browser=open_browser,
+            # Per profile, beside the FCM identity: it outlives a lost token.
+            client_file=default_state_dir() / OAUTH_CLIENT_FILE,
         )
     except LoginError as exc:
         print_warning(str(exc))
