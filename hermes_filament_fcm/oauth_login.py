@@ -10,6 +10,7 @@ import contextlib
 import hashlib
 import http.server
 import json
+import os
 import secrets
 import select
 import sys
@@ -19,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, ClassVar
 
 SCOPE = "filament:agent:control"
@@ -108,6 +110,52 @@ def discover(mcp_url: str) -> ServerMetadata:
         )
     except KeyError as exc:
         raise LoginError(f"Filament's sign-in settings lack {exc}.") from exc
+
+
+class ClientStore:
+    """The OAuth clients this agent registered, kept across logins.
+
+    Filament gives a client that signs in again the agent it signed in before,
+    so a reconnect lands on this agent rather than a new one. Kept per
+    registration endpoint and flow; a missing *path* keeps nothing.
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+
+    def _load(self) -> dict[str, Any]:
+        if self._path is None:
+            return {}
+        try:
+            doc = json.loads(self._path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return doc if isinstance(doc, dict) else {}
+
+    def get(self, meta: ServerMetadata, flow: str) -> dict[str, str] | None:
+        entry = self._load().get(meta.registration_endpoint)
+        record = entry.get(flow) if isinstance(entry, dict) else None
+        if isinstance(record, dict) and isinstance(record.get("client_id"), str):
+            return record
+        return None
+
+    def put(self, meta: ServerMetadata, flow: str, record: dict[str, str]) -> None:
+        if self._path is None:
+            return
+        doc = self._load()
+        entry = doc.get(meta.registration_endpoint)
+        entry = entry if isinstance(entry, dict) else {}
+        entry[flow] = record
+        doc[meta.registration_endpoint] = entry
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(doc, indent=2))
+            os.replace(tmp, self._path)
+        except OSError:
+            # Only costs the next login its agent: it falls back to the app's
+            # reconnect, as before clients were kept.
+            pass
 
 
 def register_client(meta: ServerMetadata, redirect_uri: str | None) -> str:
@@ -216,21 +264,52 @@ def _wait_for_redirect(
     raise LoginError("Sign-in timed out. Run the login again.")
 
 
+def _saved_port(record: dict[str, str] | None) -> int:
+    """The callback port a saved client registered, else 0 (any free one)."""
+    if record is None:
+        return 0
+    try:
+        return urllib.parse.urlsplit(record.get("redirect_uri", "")).port or 0
+    except ValueError:
+        return 0
+
+
+def _listen(handler: type[_Callback], port: int) -> http.server.ThreadingHTTPServer:
+    # Threading, so a browser's idle pre-opened connection can't block shutdown.
+    try:
+        return http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    except OSError:
+        if port == 0:
+            raise
+        return http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+
+
 def authorization_code_login(
     meta: ServerMetadata,
     *,
     out: Callable[[str], None] = print,
     open_browser: bool = True,
     timeout_s: float = 600,
+    clients: ClientStore | None = None,
 ) -> str:
     handler = type("Callback", (_Callback,), {"result": {}, "done": threading.Event()})
-    # Threading, so a browser's idle pre-opened connection can't block shutdown.
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    saved = clients.get(meta, "browser") if clients else None
+    # The saved client's own port, so its registered redirect still matches.
+    server = _listen(handler, _saved_port(saved))
     redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        client_id = register_client(meta, redirect_uri)
+        if saved is not None and saved.get("redirect_uri") == redirect_uri:
+            client_id = saved["client_id"]
+        else:
+            client_id = register_client(meta, redirect_uri)
+            if clients is not None:
+                clients.put(
+                    meta,
+                    "browser",
+                    {"client_id": client_id, "redirect_uri": redirect_uri},
+                )
         verifier, challenge = pkce_pair()
         state = secrets.token_urlsafe(16)
         handler.state = state
@@ -284,19 +363,35 @@ def authorization_code_login(
     )
 
 
+def _device_client(meta: ServerMetadata, clients: ClientStore | None) -> str:
+    client_id = register_client(meta, None)
+    if clients is not None:
+        clients.put(meta, "device", {"client_id": client_id})
+    return client_id
+
+
 def device_login(
     meta: ServerMetadata,
     *,
     out: Callable[[str], None] = print,
     sleep: Callable[[float], None] = time.sleep,
+    clients: ClientStore | None = None,
 ) -> str:
-    if not meta.device_authorization_endpoint:
+    endpoint = meta.device_authorization_endpoint
+    if not endpoint:
         raise LoginError("Filament does not offer device sign-in.")
-    client_id = register_client(meta, None)
-    status, doc = _request(
-        meta.device_authorization_endpoint,
-        form={"client_id": client_id, "scope": SCOPE, "resource": meta.resource},
-    )
+    saved = clients.get(meta, "device") if clients else None
+    client_id = saved["client_id"] if saved else _device_client(meta, clients)
+
+    def start(client_id: str) -> tuple[int, Any]:
+        form = {"client_id": client_id, "scope": SCOPE, "resource": meta.resource}
+        return _request(endpoint, form=form)
+
+    status, doc = start(client_id)
+    # A saved client the server no longer knows: register afresh, once.
+    if saved and isinstance(doc, dict) and doc.get("error") == "invalid_client":
+        client_id = _device_client(meta, clients)
+        status, doc = start(client_id)
     if (
         status != 200
         or not isinstance(doc, dict)
@@ -335,13 +430,18 @@ def login(
     flow: str = "auto",
     out: Callable[[str], None] = print,
     open_browser: bool = True,
+    client_file: Path | None = None,
 ) -> str:
     """Run the sign-in and return the agent's ``fmcp_`` token.
 
     *flow* is ``browser``, ``device``, or ``auto``: the device grant when the
-    server offers it, otherwise the browser.
+    server offers it, otherwise the browser. *client_file* keeps the
+    registered client, so signing in again reconnects the same agent.
     """
     meta = discover(mcp_url)
+    clients = ClientStore(client_file)
     if flow == "device" or (flow == "auto" and meta.device_authorization_endpoint):
-        return device_login(meta, out=out)
-    return authorization_code_login(meta, out=out, open_browser=open_browser)
+        return device_login(meta, out=out, clients=clients)
+    return authorization_code_login(
+        meta, out=out, open_browser=open_browser, clients=clients
+    )
