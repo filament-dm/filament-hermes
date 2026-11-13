@@ -7,15 +7,19 @@ unattended: any HIGH finding makes it `caution`, which needs interactive
 confirmation and so blocks the portal, and any CRITICAL makes it `dangerous`,
 which cannot be forced. MEDIUM/LOW findings are informational.
 
-The scanner is three stdlib-only modules in hermes-agent. This fetches them
-from upstream at a ref (default: main) — or reads them from a local checkout
-with --hermes-dir — and scans a copy of exactly what a clone would contain:
-tracked files plus new, non-ignored ones, as they are in the working tree.
+The scanner lives in hermes-agent's `tools/` and, since late 2026, also
+imports `hermes_cli` (to learn which env names hold model-provider keys), so
+it runs from a whole hermes-agent checkout, with that checkout's Python
+(`uv sync --frozen --no-dev --project <checkout>`, then
+`<checkout>/.venv/bin/python scripts/plugin-scan.py ...`; Hermes needs Python
+3.14). Give that checkout with --hermes-dir, or --ref to download upstream at
+a ref (its dependencies must then be installed in the Python you run). It scans a
+copy of exactly what a clone would contain: tracked files plus new,
+non-ignored ones, as they are in the working tree.
 
-    python3 scripts/plugin-scan.py              # upstream main
-    python3 scripts/plugin-scan.py --ref v2026.9.24
     python3 scripts/plugin-scan.py --hermes-dir ~/.hermes/hermes-agent
-    python3 scripts/plugin-scan.py --all        # list MEDIUM/LOW findings too
+    python3 scripts/plugin-scan.py --ref v2026.9.24   # downloads that ref
+    python3 scripts/plugin-scan.py --all ...          # list MEDIUM/LOW findings too
 
 Exits 0 on `safe`, 1 otherwise.
 """
@@ -23,28 +27,26 @@ Exits 0 on `safe`, 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import io
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SCANNER_FILES = ("plugin_guard.py", "plugin_guard_context.py", "skills_guard.py")
-UPSTREAM = "https://raw.githubusercontent.com/NousResearch/hermes-agent"
+ARCHIVE = "https://codeload.github.com/NousResearch/hermes-agent/tar.gz/{ref}"
 
 
-def _stage_scanner(dest: Path, ref: str, hermes_dir: Path | None) -> None:
-    tools = dest / "tools"
-    tools.mkdir(parents=True)
-    (tools / "__init__.py").write_text("")
-    for name in SCANNER_FILES:
-        if hermes_dir is not None:
-            shutil.copyfile(hermes_dir / "tools" / name, tools / name)
-            continue
-        with urllib.request.urlopen(f"{UPSTREAM}/{ref}/tools/{name}", timeout=30) as r:
-            (tools / name).write_bytes(r.read())
+def _download_hermes(dest: Path, ref: str) -> Path:
+    """Unpack hermes-agent at `ref` into `dest`; returns the checkout's root."""
+    with urllib.request.urlopen(ARCHIVE.format(ref=ref), timeout=60) as r:
+        data = r.read()
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        tar.extractall(dest, filter="data")
+    return next(dest.iterdir())
 
 
 def _stage_tree(dest: Path) -> None:
@@ -65,28 +67,38 @@ def _stage_tree(dest: Path) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--ref", default="main", help="hermes-agent ref (default: main)")
-    ap.add_argument("--hermes-dir", type=Path, help="use a local hermes-agent checkout")
+    where = ap.add_mutually_exclusive_group(required=True)
+    where.add_argument("--hermes-dir", type=Path, help="a hermes-agent checkout")
+    where.add_argument("--ref", help="download hermes-agent at this ref")
     ap.add_argument("--all", action="store_true", help="also list MEDIUM/LOW findings")
     args = ap.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
-        scanner, tree = Path(tmp) / "scanner", Path(tmp) / "filament"
-        _stage_scanner(scanner, args.ref, args.hermes_dir)
+        hermes = args.hermes_dir or _download_hermes(Path(tmp) / "hermes", args.ref)
+        tree = Path(tmp) / "filament"
         tree.mkdir()
         _stage_tree(tree)
 
-        sys.path.insert(0, str(scanner))
+        sys.path.insert(0, str(Path(hermes).resolve()))
         from tools.plugin_guard import (  # noqa: PLC0415
             scan_plugin,
             should_allow_plugin_install,
         )
 
-        result = scan_plugin(tree, source="filament-dm/filament-hermes")
+        try:
+            result = scan_plugin(tree, source="filament-dm/filament-hermes")
+        except ModuleNotFoundError as e:
+            print(
+                f"The scanner needs Hermes's dependencies ({e}): run "
+                f"`uv sync --frozen --no-dev --project {hermes}` and use "
+                f"{hermes}/.venv/bin/python",
+                file=sys.stderr,
+            )
+            return 2
         _, reason = should_allow_plugin_install(result)
 
-    where = args.hermes_dir or f"hermes-agent@{args.ref}"
-    print(f"Scanner: {where}")
+    scanner = args.hermes_dir or f"hermes-agent@{args.ref}"
+    print(f"Scanner: {scanner}")
     print(f"Verdict: {result.verdict.upper()} — {reason}")
     shown = [
         f for f in result.findings if args.all or f.severity in ("critical", "high")
