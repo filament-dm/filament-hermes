@@ -24,6 +24,7 @@ import os
 import re
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -355,9 +356,13 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         config: Any,
         filament_api: FilamentAPI,
         server_sync: ServerConfigSync | None = None,
+        on_connected: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         _quiet_gateway_notices(config)
         super().__init__(config, Platform("filament-fcm"))
+        # Run once the MCP session is up; registers live tools a gateway that
+        # started on the static manifest is missing.
+        self._on_connected = on_connected
 
         # ── Control plane vs reactive plane ───────────────────────────────
         # The principal (owner_id, learned in Stage 1) carries CONTROL authority
@@ -1114,6 +1119,14 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 return False
             logger.info("filament-fcm: [Stage 1] MCP session established")
             slog.info("filament_fcm.stage.complete", stage="initialize_api")
+            if self._on_connected is not None:
+                try:
+                    await self._on_connected()
+                except Exception:
+                    logger.warning(
+                        "filament-fcm: post-connect tool registration failed",
+                        exc_info=True,
+                    )
 
             # The initialize response's `instructions` is the server describing
             # itself: how Filament is organized, and how to write member and
