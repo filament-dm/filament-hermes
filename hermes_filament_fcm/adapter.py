@@ -129,6 +129,30 @@ AUTH_REFUSED_MESSAGE = (
 )
 
 
+# Set truthy to keep Hermes's own gateway notices in Filament (see below).
+GATEWAY_NOTICES_ENV = "FILAMENT_GATEWAY_NOTICES"
+
+
+def _quiet_gateway_notices(config: Any) -> None:
+    """Turn off Hermes's shutdown and restart notices for Filament.
+
+    Hermes posts "⚠️ Hermes is shutting down — your current task will be
+    interrupted…" (and "…restarting…") to every platform's home channel on
+    every gateway stop or restart, idle or not. Our home channel is the owner's
+    private chat with the agent (FILAMENT_HOME_ROOM, set at Stage 1), so the
+    owner saw it on every restart, including the sign-in's own hand-over and a
+    reconnect. Filament shows the agent's connection itself, and messages sent
+    while the gateway is down wait for it (poll_work), so the notice only
+    alarms. Hermes skips a platform whose config has
+    ``gateway_restart_notification`` false; ``config`` is that platform's live
+    config object. FILAMENT_GATEWAY_NOTICES=true keeps the notices.
+    """
+    if os.getenv(GATEWAY_NOTICES_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    if hasattr(config, "gateway_restart_notification"):
+        config.gateway_restart_notification = False
+
+
 @functools.cache  # once per gateway process, not per reconnect
 def _seed_display_defaults() -> None:
     """Apply setup's chat display defaults to an install that predates one.
@@ -332,6 +356,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         filament_api: FilamentAPI,
         server_sync: ServerConfigSync | None = None,
     ) -> None:
+        _quiet_gateway_notices(config)
         super().__init__(config, Platform("filament-fcm"))
 
         # ── Control plane vs reactive plane ───────────────────────────────
