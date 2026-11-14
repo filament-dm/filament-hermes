@@ -68,8 +68,25 @@ project is involved, so a local or staging server needs no
 `hermes filament login` or `connect` and it is saved to `.env` with the token;
 it needs a server that has `poll_work`.
 
-To update:
+To update, send `/fil-upgrade` in your agent's backchannel, or run:
 
 ```
-hermes plugins update filament && hermes gateway restart
+hermes plugins update filament && hermes filament restart
 ```
+
+### Restarting the gateway
+
+`hermes filament restart` restarts the gateway the way your host does it: through
+its s6 slot (the Docker and cloud images) or the service Hermes installed
+(launchd, systemd), and otherwise by stopping it and starting a new one, which
+is what a gateway started by hand with `hermes gateway run` needs. With no
+gateway running it starts one. It waits for running turns to finish first and
+never cuts one off (`--wait SECONDS`, default 900), and `--ensure` only starts a
+gateway when none is running. It needs Hermes v0.22.3 or later; on an older
+Hermes it restarts the way the plugin always did.
+
+Run from your agent's own terminal, it restarts from outside the gateway once
+the turn ends, so an agent can run it on itself. `hermes gateway restart` there
+is blocked by Hermes. The sign-in, `/fil-upgrade` and the installer all restart
+the gateway the same way. Its log, when it runs in the background, is
+`~/.hermes/logs/filament-gateway.log` (`$HERMES_HOME/logs/` on other homes).

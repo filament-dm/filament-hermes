@@ -457,8 +457,11 @@ def command_map_prompt(slash_enabled: bool) -> str:
         "pulls the new version, restarts you and reports the result on its "
         "own. It is one step - telling them to run /restart afterwards costs "
         "a second needless restart. Asked how to restart you, answer "
-        "/restart. Never offer to do either yourself: running them from the "
-        "terminal is blocked from inside the gateway process."
+        "/restart. Never run `hermes gateway restart` or `hermes update` in "
+        "your terminal: Hermes blocks them from inside the gateway. If your "
+        "principal asks you to restart yourself, run `hermes filament "
+        "restart` in your terminal instead. It restarts the gateway once this "
+        "turn ends, so say that it will, not that you are back."
     )
 
 

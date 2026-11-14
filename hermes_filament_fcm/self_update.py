@@ -35,6 +35,7 @@ from pathlib import Path
 
 from ._version import version_from_pyproject
 from .credentials import CredentialStore
+from .gateway_restart import proven_supervisor
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -283,22 +284,6 @@ class PendingUpgradeStore:
 # ── Restarting ourselves ─────────────────────────────────────────────
 
 
-def _under_service_manager() -> bool:
-    """True when something will restart us if we exit (systemd/launchd/container).
-
-    Mirrors the decision Hermes' own ``/restart`` slash command makes:
-    systemd sets INVOCATION_ID, launchd sets XPC_SERVICE_NAME to the job
-    label (interactive macOS shells inherit "0", which is not a service).
-    Under a supervisor the gateway exits and is restarted for us; without
-    one it has to spawn its own detached relaunch helper.
-    """
-    if os.environ.get("INVOCATION_ID"):
-        return True
-    if os.environ.get("XPC_SERVICE_NAME", "0") not in ("", "0"):
-        return True
-    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-
-
 def request_gateway_restart() -> bool:
     """Ask the running gateway to restart itself. False if we can't.
 
@@ -309,6 +294,15 @@ def request_gateway_restart() -> bool:
     is the same path Hermes' ``/restart`` command uses — it drains in-flight
     agent turns before exiting, so an upgrade never cuts off a reply
     mid-sentence.
+
+    What brings the gateway back is decided by
+    ``gateway_restart.proven_supervisor``, not guessed from the environment:
+    with a supervisor the gateway exits for it (exit 75); without one it just
+    exits, and as it stops the adapter leaves ``hermes filament restart
+    --ensure`` behind to start the new one (``leave_restart_helper``). The
+    old guess took any ``INVOCATION_ID`` or container for a supervisor, so a
+    gateway started by hand from a shell under systemd, or one of Agent37's
+    profile gateways, exited and nothing started it again.
 
     Imported lazily and defensively: ``_gateway_runner_ref`` is a Hermes
     internal, so if it moves we degrade to "tell the principal to update by
@@ -329,10 +323,14 @@ def request_gateway_restart() -> bool:
         logger.warning("filament-fcm: no live gateway runner to restart")
         return False
 
-    via_service = _under_service_manager()
+    supervisor = proven_supervisor()
+    logger.info(
+        "filament-fcm: restarting for the upgrade; supervisor: %s",
+        supervisor or "none (a helper starts the new gateway)",
+    )
     try:
         return bool(
-            runner.request_restart(detached=not via_service, via_service=via_service)
+            runner.request_restart(detached=False, via_service=supervisor is not None)
         )
     except Exception:
         logger.warning("filament-fcm: gateway restart request failed", exc_info=True)

@@ -184,3 +184,66 @@ def test_handler_propagates_failure_codes(monkeypatch, code):
     stub.connect = lambda token, url=None, restart=True, from_stdin=False: code
     monkeypatch.setitem(sys.modules, "hermes_filament_fcm.setup_cli", stub)
     assert cli._handler(_parse(["connect", "fmcp_abc"])) == code
+
+
+# ── restart ──────────────────────────────────────────────────────────
+
+
+def _stub_restart(monkeypatch, code=0):
+    calls = []
+    stub = types.ModuleType("hermes_filament_fcm.gateway_restart")
+    stub.run = lambda **kwargs: calls.append(kwargs) or code
+    monkeypatch.setitem(sys.modules, "hermes_filament_fcm.gateway_restart", stub)
+    return calls
+
+
+def test_restart_defaults(monkeypatch):
+    calls = _stub_restart(monkeypatch)
+    args = _parse(["restart"])
+    assert cli._handler(args) == 0
+    assert calls == [
+        {
+            "after_pid": None,
+            "after_timeout": 120,
+            "settle": 0,
+            "service": False,
+            "only_start": False,
+            "grace_s": 20,
+            "wait_s": 900,
+        }
+    ]
+
+
+def test_restart_flags(monkeypatch):
+    calls = _stub_restart(monkeypatch, code=1)
+    args = _parse(["restart", "--ensure", "--grace=0", "--wait", "30"])
+    assert cli._handler(args) == 1
+    assert calls[0]["only_start"] is True
+    assert calls[0]["grace_s"] == 0
+    assert calls[0]["wait_s"] == 30
+
+
+def test_restart_parses_what_the_handed_off_copy_is_given(monkeypatch):
+    # gateway_restart.schedule appends --after-pid to these flags.
+    calls = _stub_restart(monkeypatch)
+    args = _parse(
+        [
+            "restart",
+            "--wait=900",
+            "--install-service",
+            "--settle=20",
+            "--after-pid",
+            "42",
+        ]
+    )
+    cli._handler(args)
+    assert calls[0]["after_pid"] == 42
+    assert calls[0]["service"] is True
+    assert calls[0]["settle"] == 20
+
+
+def test_the_old_gateway_handoff_still_restarts(monkeypatch):
+    # A login started before an upgrade may still schedule the old command.
+    calls = _stub_restart(monkeypatch)
+    cli._handler(_parse(["gateway-handoff", "--after-pid", "42"]))
+    assert calls == [{"after_pid": 42, "settle": 20, "service": True}]

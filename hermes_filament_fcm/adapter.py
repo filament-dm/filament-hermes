@@ -57,6 +57,7 @@ from .fcm_client import (
     VouchMessage,
 )
 from .filament_api import FilamentAPI
+from .gateway_restart import leave_restart_helper
 from .observability import (
     bound_context,
     current_context,
@@ -154,6 +155,30 @@ def _quiet_gateway_notices(config: Any) -> None:
 
 
 @functools.cache  # once per gateway process, not per reconnect
+def _leave_restart_helper() -> None:
+    """Make sure a restart this stop is part of ends with a gateway running.
+
+    ``/fil-upgrade`` and Hermes's own ``/restart`` both stop the gateway with
+    ``request_restart``. When that exits for a supervisor (Hermes's
+    ``/restart`` takes any INVOCATION_ID or container for one) and none is
+    proven to exist, ``hermes filament restart --ensure`` is left running
+    outside the gateway to start the new one (``leave_restart_helper``).
+    Best-effort: a stop must never fail over it."""
+    try:
+        from gateway.run import _gateway_runner_ref  # noqa: PLC0415
+
+        log = leave_restart_helper(_gateway_runner_ref())
+    except Exception:
+        logger.debug("filament-fcm: restart helper check failed", exc_info=True)
+        return
+    if log:
+        logger.info(
+            "filament-fcm: no supervisor restarts this gateway; "
+            "`hermes filament restart --ensure` starts the new one (log: %s)",
+            log,
+        )
+
+
 def _seed_display_defaults() -> None:
     """Apply setup's chat display defaults to an install that predates one.
 
@@ -2013,6 +2038,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Stop listening and clean up."""
         self._mark_disconnected()
+        await asyncio.to_thread(_leave_restart_helper)
 
         # The publisher is module-global and outlives this adapter: drop
         # this adapter's turns so nothing publishes through an API that is
