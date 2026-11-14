@@ -11,6 +11,7 @@ Hermes); the Hermes CLI is a small simulated host.
 """
 
 import ast
+import os
 import subprocess
 import time
 import types
@@ -23,6 +24,7 @@ _SETUP_CLI = (
 
 def _load(printed):
     ns = {
+        "os": os,
         "subprocess": subprocess,
         "time": time,
         "print_info": lambda text: printed.append(("info", text)),
@@ -33,10 +35,16 @@ def _load(printed):
         "_GATEWAY_RESTART_WAIT_S": 1,
         # Polled with a no-op sleep, so these are loop bounds, not waits.
         "_GATEWAY_UP_WAIT_S": 0.02,
+        "_GATEWAY_RETRIES": 3,
     }
     tree = ast.parse(_SETUP_CLI.read_text())
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_ensure_gateway":
+        named = isinstance(node, ast.FunctionDef) and node.name == "_ensure_gateway"
+        named = named or (
+            isinstance(node, ast.Assign)
+            and [getattr(t, "id", None) for t in node.targets] == ["_SUPERVISOR_ENV"]
+        )
+        if named:
             exec(compile(ast.Module([node], []), str(_SETUP_CLI), "exec"), ns)
     return ns["_ensure_gateway"]
 
@@ -57,6 +65,12 @@ class _Host:
         self.loaded_dead = loaded_dead
         # A gateway `hermes gateway stop` does not stop.
         self.stuck = False
+        # The running gateway says a supervisor launched it (systemd's
+        # INVOCATION_ID in the shell that ran `hermes gateway run`), and none
+        # relaunches it.
+        self.claims_supervisor = False
+        # How many restarts are refused for a live turn.
+        self.busy = 0
         self.calls = []
 
     def _spawn(self):
@@ -84,8 +98,18 @@ class _Host:
 
     def popen(self, argv, **kwargs):
         self.calls.append(("popen", argv[1:], kwargs))
+        if self.pid is not None and self.busy:
+            # "Refusing to restart the gateway: 1 live session(s) ..."
+            self.busy -= 1
+            return types.SimpleNamespace(poll=lambda: 1)
+        if self.pid is not None and self.claims_supervisor:
+            # SIGUSR1: the gateway drains and exits for its supervisor; none
+            # relaunches it ("Supervisor did not relaunch the gateway").
+            self.pid = None
+            return types.SimpleNamespace(poll=lambda: 1)
         self.loaded_dead = False
         self._spawn()
+        self.claims_supervisor = "INVOCATION_ID" in kwargs.get("env", os.environ)
         return types.SimpleNamespace(poll=lambda: 0)
 
 
@@ -163,6 +187,53 @@ def test_a_gateway_started_by_hand_is_still_restarted():
     host = _Host(running=True)
     assert _ensure(host, printed, auto_started=lambda pid: False) == "running"
     assert _verbs(host) == ["gateway restart"]
+
+
+def test_a_hand_started_gateway_that_claims_a_supervisor_is_started_again():
+    # `hermes gateway run` from a shell under systemd: the restart drains it
+    # with SIGUSR1, nothing relaunches it, and the restart exits 1.
+    printed = []
+    host = _Host(running=True)
+    host.claims_supervisor = True
+    assert _ensure(host, printed, auto_started=lambda pid: False) == "running"
+    assert _verbs(host) == ["gateway restart", "gateway restart"]
+    assert ("info", "No gateway is running; starting it again...") in printed
+    assert ("success", "Gateway running (pid 101).") in printed
+
+
+def test_a_refused_restart_then_a_drained_gateway_still_ends_running():
+    # Agents E2E (run 43552649576): the first restart was refused while the
+    # chat's turn ran, the second drained the hand-started gateway for a
+    # supervisor that never came. The third starts it.
+    printed = []
+    host = _Host(running=True)
+    host.claims_supervisor = True
+    host.busy = 1
+    assert _ensure(host, printed, auto_started=lambda pid: False) == "running"
+    assert _verbs(host) == ["gateway restart"] * 3
+    assert ("success", "Gateway running (pid 101).") in printed
+
+
+def test_restarts_are_refused_while_a_long_turn_runs():
+    printed = []
+    host = _Host(running=True)
+    host.busy = 3
+    assert _ensure(host, printed, auto_started=lambda pid: False) == "running"
+    assert _verbs(host) == ["gateway restart"] * 4
+
+
+def test_the_restarted_gateway_claims_no_supervisor(monkeypatch):
+    monkeypatch.setenv("INVOCATION_ID", "0123456789abcdef")
+    monkeypatch.setenv("JOURNAL_STREAM", "8:1234")
+    monkeypatch.setenv("HERMES_S6_SUPERVISED_CHILD", "1")
+    printed = []
+    host = _Host(running=True)
+    assert _ensure(host, printed, auto_started=lambda pid: False) == "running"
+    env = host.calls[0][2]["env"]
+    assert "INVOCATION_ID" not in env and "JOURNAL_STREAM" not in env
+    assert env["HERMES_S6_SUPERVISED_CHILD"] == "1"
+    assert env["PATH"] == os.environ["PATH"]
+    assert host.claims_supervisor is False
 
 
 def test_ancestor_pids_walk_up_to_init():

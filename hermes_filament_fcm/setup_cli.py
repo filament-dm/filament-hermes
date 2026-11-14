@@ -887,8 +887,34 @@ _GATEWAY_INSTALL_TIMEOUT_S = 120
 _GATEWAY_RESTART_WAIT_S = 45
 # How long a started gateway may take to hold its lock and write its PID.
 _GATEWAY_UP_WAIT_S = 30
+# More goes after the first, each followed by another wait for a new PID. A
+# restart is refused while a turn runs ("Refusing to restart the gateway: 1
+# live session(s)"), and the chat's turn can outlast the hand-off's settle.
+_GATEWAY_RETRIES = 3
 
 _ALREADY_INSTALLED = "already installed"
+
+# Environment that makes a Hermes gateway say a supervisor launched it.
+# systemd sets INVOCATION_ID (and JOURNAL_STREAM) for every process of a unit,
+# so a shell under one (a CI runner, a desktop terminal) passes it to a
+# `hermes gateway run` started there. That gateway then answers "systemd", and
+# `hermes gateway restart` hands it back to the supervisor with SIGUSR1: it
+# exits, nothing relaunches it, and the restart exits 1. The gateways the
+# login starts have no supervisor, so they drop these, as Hermes does for its
+# own unmanaged gateways (hermes_cli/gateway_runtime_start.py). The launcher's
+# HERMES_SUPERVISED_CHILD / HERMES_S6_SUPERVISED_CHILD stay: they pin the
+# profile and route to s6.
+_SUPERVISOR_ENV = (
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "NOTIFY_SOCKET",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+    "XPC_SERVICE_NAME",
+    "LAUNCHD_SOCKET",
+    "HERMES_LAUNCHD_LABEL",
+    "HERMES_GATEWAY_EXTERNAL_SUPERVISOR",
+)
 
 
 def _ensure_gateway(
@@ -910,9 +936,14 @@ def _ensure_gateway(
       that is not running.
 
     Then it checks: a gateway is up only once it holds its lock under a new
-    PID (``gateway.status.get_running_pid``). One that isn't gets a single
-    restart and a second check (live run h9: launchd had the service loaded
-    with no process). Prints ``Gateway running (pid N).`` or says it isn't.
+    PID (``gateway.status.get_running_pid``). One that isn't gets up to
+    ``_GATEWAY_RETRIES`` more restarts, each with another check: live run h9
+    had launchd's service loaded with no process; a restart is refused while
+    a turn runs; and a gateway started by hand from a shell under systemd
+    claims a supervisor, so a restart drains it and nothing relaunches it
+    (agents E2E, "connect Hermes again after its agent was deleted"). A
+    restart with no gateway running starts one. Prints
+    ``Gateway running (pid N).`` or says it isn't.
 
     These are Hermes CLI subprocesses started directly, never through a
     shell or an agent's terminal tool, so Hermes's approval gate for shell
@@ -972,12 +1003,15 @@ def _ensure_gateway(
 
     def restart() -> bool:
         """Start ``hermes gateway restart`` detached; False if it failed.
-        Still running at the deadline is a foreground gateway: left be."""
+        Still running at the deadline is a foreground gateway: left be. It
+        runs without supervisor markers (``_SUPERVISOR_ENV``)."""
+        env = {k: v for k, v in os.environ.items() if k not in _SUPERVISOR_ENV}
         try:
             child = popen(
                 [*hermes, "gateway", "restart"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=env,
                 **detached,
             )
         except OSError as exc:
@@ -1047,9 +1081,13 @@ def _ensure_gateway(
             )
             restart()
     pid = came_up(previous)
-    if pid is None:
-        # One more go: a service can be loaded with no process behind it.
-        print_info("The gateway is not up yet; restarting it once more...")
+    for _ in range(_GATEWAY_RETRIES):
+        if pid is not None:
+            break
+        if running_pid() is None:
+            print_info("No gateway is running; starting it again...")
+        else:
+            print_info("The gateway is not up yet; restarting it once more...")
         restart()
         pid = came_up(previous)
     if pid is not None:
