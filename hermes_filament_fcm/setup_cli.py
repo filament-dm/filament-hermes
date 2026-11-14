@@ -16,9 +16,7 @@ Usage:
 
 import asyncio
 import os
-import re
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -637,7 +635,7 @@ def connect(
     if restart:
         _restart_gateway()
     else:
-        print_info("Restart the gateway to load it: hermes gateway restart")
+        print_info("Restart the gateway to load it: hermes filament restart")
     return 0
 
 
@@ -685,381 +683,38 @@ def login(
 def _restart_gateway() -> None:
     """Make sure the gateway runs with the configuration just saved.
 
-    See ``_ensure_gateway``; this binds it to the real Hermes CLI. When this
-    process runs inside that gateway (Hermes' chat runs in the gateway since
-    its unified runtime, so an agent's terminal tool is a child of it), a
-    restart from here would kill this process and the restart with it: the
-    stop sweeps its tool processes' groups and descendants (live run
-    h20-baseline: login killed, no gateway came back). The restart is then
-    handed to a helper outside the gateway's process tree, which waits for
-    this login to exit first."""
-    pid = _running_gateway_pid()
-    if pid is not None and pid in _ancestor_pids() and _schedule_gateway_handoff():
-        return
-    _ensure_gateway(
-        hermes=_hermes_argv(),
-        run=subprocess.run,
-        popen=subprocess.Popen,
-        running_pid=_running_gateway_pid,
-        auto_started=_gateway_auto_started,
+    ``hermes filament restart`` (``gateway_restart.run``) does the work,
+    starting the gateway as a service when there is none: a fresh Hermes has
+    no gateway at all, and the agent that ran the sign-in in the background
+    has ended its turn by the time it completes, so nothing else would start
+    one.
+
+    When this process runs inside that gateway (Hermes's chat runs in the
+    gateway since its unified runtime, so an agent's terminal tool is a child
+    of it), a restart from here would kill this process and the restart with
+    it (live run h20-baseline: login killed, no gateway came back). ``run``
+    then restarts from outside the gateway's process tree: after this login
+    exits, ``_HANDOFF_SETTLE_S`` more for the turn Hermes starts to report
+    it, and then until every running turn has ended."""
+    from .gateway_restart import RealHost, Say, run  # noqa: PLC0415
+
+    run(
+        service=True,
+        handoff_settle=_HANDOFF_SETTLE_S,
+        handoff_notice=(
+            "This chat runs inside the Hermes gateway, which has to restart to "
+            "load Filament: once this turn ends, the chat pauses briefly and "
+            "reconnects by itself."
+        ),
+        say=Say(info=print_info, success=print_success, warning=print_warning),
+        host=RealHost(_find_hermes_home()),
     )
 
 
-def _ancestor_pids(pid: int | None = None, *, ppid_of=None) -> set[int]:
-    """The PIDs above *pid* (default: this process), up to init."""
-    ppid_of = ppid_of or _ppid_of
-    seen: set[int] = set()
-    current = os.getpid() if pid is None else pid
-    for _ in range(64):
-        parent = ppid_of(current)
-        if parent is None or parent <= 1 or parent in seen:
-            break
-        seen.add(parent)
-        current = parent
-    return seen
-
-
-def _ppid_of(pid: int) -> int | None:
-    if pid == os.getpid():
-        return os.getppid()
-    out = _ps_field(pid, "ppid=")
-    return int(out) if out.isdigit() else None
-
-
-def _ps_field(pid: int, field: str) -> str:
-    """One ``ps -o`` field of *pid*, or "" (no ps, no such process)."""
-    try:
-        result = subprocess.run(
-            ["ps", "-o", field, "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return ""
-    return (result.stdout or "").strip()
-
-
-def _gateway_auto_started(pid: int) -> bool:
-    """Whether gateway *pid* is one a client auto-started (``--idle-exit``)."""
-    return "--idle-exit" in _ps_field(pid, "command=")
-
-
-_HANDOFF_LOG = "filament-gateway.log"
-
-
-def _schedule_gateway_handoff() -> bool:
-    """Start ``hermes filament gateway-handoff`` outside this process tree.
-
-    ``sh`` backgrounds it and exits at once, so the helper is reparented to
-    init/launchd, in a session of its own: neither the gateway's process-group
-    kill nor its descendant sweep reaches it. False if it could not start
-    (POSIX only); the caller then restarts in place as before."""
-    if os.name != "posix":
-        return False
-    log = _find_hermes_home() / "logs" / _HANDOFF_LOG
-    argv = [*_hermes_argv(), "filament", "gateway-handoff"]
-    argv += ["--after-pid", str(os.getpid())]
-    try:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["/bin/sh", "-c", 'nohup "$@" >> "$0" 2>&1 < /dev/null &', str(log), *argv],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            timeout=10,
-            check=True,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        print_warning(f"Could not hand the gateway restart off ({exc}).")
-        return False
-    print_info(
-        "This chat runs inside the Hermes gateway, which has to restart to "
-        "load Filament: in about 20 seconds the chat pauses briefly and "
-        "reconnects by itself."
-    )
-    print_success(f"Gateway restart scheduled (log: {log}).")
-    return True
-
-
-# How long the handoff waits for the login that scheduled it to exit, and
-# then before stopping anything: Hermes tells the model the background login
-# finished, and a gateway stop does not drain (restart_drain_timeout 0), so a
-# stop inside that turn cuts it off ("Your request was not processed", live
-# run h20-baseline-2). Long enough for that one short turn.
-_HANDOFF_WAIT_S = 120
+# Hermes tells the model the background sign-in finished, which starts one
+# short turn. A restart before that turn begins would refuse it, so the
+# hand-off gives it this long to start; then it waits for it to end.
 _HANDOFF_SETTLE_S = 20
-
-
-def gateway_handoff(after_pid: int | None, *, sleep=time.sleep) -> int:
-    """The scheduled half of ``_restart_gateway``: wait for *after_pid* to
-    exit, then leave a gateway running (``_ensure_gateway``). Returns an exit
-    code; its output goes to the handoff log."""
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} gateway handoff after pid {after_pid}")
-    deadline = time.monotonic() + _HANDOFF_WAIT_S
-    while after_pid and _pid_alive(after_pid) and time.monotonic() < deadline:
-        sleep(0.5)
-    sleep(_HANDOFF_SETTLE_S)
-    outcome = _ensure_gateway(
-        hermes=_hermes_argv(),
-        run=subprocess.run,
-        popen=subprocess.Popen,
-        running_pid=_running_gateway_pid,
-        auto_started=_gateway_auto_started,
-    )
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} gateway handoff: {outcome}")
-    return 0 if outcome == "running" else 1
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _hermes_argv() -> list[str]:
-    """How to invoke the Hermes CLI: ``hermes`` on PATH, else this process's
-    own entry script when it is one (an agent's terminal can lack the PATH
-    entry the installer added)."""
-    found = shutil.which("hermes")
-    if found:
-        return [found]
-    script = sys.argv[0] if sys.argv else ""
-    if os.path.basename(script).startswith("hermes") and os.path.isfile(script):
-        return [script]
-    return ["hermes"]
-
-
-def _running_gateway_pid() -> int | None:
-    """The PID of this profile's running gateway, or None.
-
-    Hermes's own check (lock + PID file verified against the live process),
-    else the PID `hermes gateway status` reports ("✓ Gateway is supervised
-    by launchd (PID 68581)") for an install whose modules aren't on this
-    process's path."""
-    try:
-        from gateway.status import get_running_pid  # noqa: PLC0415
-    except ImportError:
-        pass
-    else:
-        try:
-            return get_running_pid()
-        except Exception:
-            return None
-    try:
-        result = subprocess.run(
-            [*_hermes_argv(), "gateway", "status"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    return _pid_from_status(result.stdout or "")
-
-
-def _pid_from_status(out: str) -> int | None:
-    """The running gateway's PID in `hermes gateway status` output."""
-    for line in out.splitlines():
-        low = line.lower()
-        if "not running" in low or "stopped" in low or "\u2717" in line:
-            continue
-        match = re.search(r"\bpid:?\s*(\d+)", line, re.I)
-        if match and ("running" in low or "supervised" in low or "\u2713" in line):
-            return int(match.group(1))
-    return None
-
-
-# How long to wait for `hermes gateway install` / `start` / `restart` to
-# finish. Each returns in seconds under a service manager; without one,
-# `restart` runs the gateway in the foreground and never returns, which is
-# fine: it is detached.
-_GATEWAY_INSTALL_TIMEOUT_S = 120
-_GATEWAY_RESTART_WAIT_S = 45
-# How long a started gateway may take to hold its lock and write its PID.
-_GATEWAY_UP_WAIT_S = 30
-
-_ALREADY_INSTALLED = "already installed"
-
-
-def _ensure_gateway(
-    *, hermes, run, popen, running_pid, auto_started=None, sleep=time.sleep
-) -> str:
-    """Leave a gateway running on the configuration just saved.
-
-    - running (as a service, or by hand): restart it;
-    - installed as a service but not running: start it;
-    - not installed: install it as a service (launchd/systemd/Windows task)
-      and start it — a fresh Hermes has no gateway at all, and the agent that
-      ran the login in the background has ended its turn by the time the
-      sign-in completes, so nothing else would start one;
-    - no service manager (containers, WSL, Termux): start it in the
-      background, as before;
-    - running, but auto-started by a client (``auto_started(pid)``: the
-      dashboard chat's ``gateway run --idle-exit``, which has no service
-      behind it): stop it and put the service in its place, as for a gateway
-      that is not running.
-
-    Then it checks: a gateway is up only once it holds its lock under a new
-    PID (``gateway.status.get_running_pid``). One that isn't gets a single
-    restart and a second check (live run h9: launchd had the service loaded
-    with no process). Prints ``Gateway running (pid N).`` or says it isn't.
-
-    These are Hermes CLI subprocesses started directly, never through a
-    shell or an agent's terminal tool, so Hermes's approval gate for shell
-    commands that restart the gateway does not apply. Every child runs in its
-    own session with stdin closed, so it survives this process: the login
-    usually runs as a background child of an agent's terminal tool, which may
-    be torn down the moment the login exits. Returns ``running`` or
-    ``failed``."""
-    detached = {"stdin": subprocess.DEVNULL, "start_new_session": True}
-
-    def cli(*args: str, timeout: float) -> tuple[int | None, str]:
-        """Run ``hermes <args>``; (exit code or None on error, output)."""
-        try:
-            result = run(
-                [*hermes, *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                **detached,
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            return None, str(exc)
-        return result.returncode, f"{result.stdout or ''}\n{result.stderr or ''}"
-
-    def last_line(out: str) -> str:
-        lines = [line.strip() for line in out.splitlines() if line.strip()]
-        return lines[-1] if lines else ""
-
-    def install() -> str:
-        """``installed``, ``already``, or ``error: <why>``."""
-        code, out = cli(
-            "gateway",
-            "install",
-            "--if-missing",
-            "--start-now",
-            "--start-on-login",
-            timeout=_GATEWAY_INSTALL_TIMEOUT_S,
-        )
-        if _ALREADY_INSTALLED in out.lower():
-            return "already"
-        if code != 0:
-            return f"error: {last_line(out) or f'exit {code}'}"
-        # `install` exits 0 on hosts it can't serve too (a container says so
-        # and returns): ask again, which only an install answers with
-        # "already installed".
-        _code, again = cli(
-            "gateway",
-            "install",
-            "--if-missing",
-            "--no-start-now",
-            timeout=_GATEWAY_INSTALL_TIMEOUT_S,
-        )
-        if _ALREADY_INSTALLED in again.lower():
-            return "installed"
-        return f"error: {last_line(out) or 'no service manager'}"
-
-    def restart() -> bool:
-        """Start ``hermes gateway restart`` detached; False if it failed.
-        Still running at the deadline is a foreground gateway: left be."""
-        try:
-            child = popen(
-                [*hermes, "gateway", "restart"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **detached,
-            )
-        except OSError as exc:
-            print_warning(f"Could not restart the gateway ({exc}).")
-            return False
-        deadline = time.monotonic() + _GATEWAY_RESTART_WAIT_S
-        while time.monotonic() < deadline:
-            code = child.poll()
-            if code is not None:
-                if code != 0:
-                    print_warning(f"`hermes gateway restart` exited {code}.")
-                return code == 0
-            sleep(0.5)
-        return True
-
-    def start() -> bool:
-        code, out = cli("gateway", "start", timeout=_GATEWAY_INSTALL_TIMEOUT_S)
-        if code != 0:
-            print_warning(f"`hermes gateway start` failed: {last_line(out)}")
-        return code == 0
-
-    def came_up(previous: int | None) -> int | None:
-        deadline = time.monotonic() + _GATEWAY_UP_WAIT_S
-        while True:
-            pid = running_pid()
-            if pid is not None and pid != previous:
-                return pid
-            if time.monotonic() >= deadline:
-                return None
-            sleep(1.0)
-
-    def stopped(pid: int) -> bool:
-        cli("gateway", "stop", timeout=_GATEWAY_INSTALL_TIMEOUT_S)
-        deadline = time.monotonic() + _GATEWAY_UP_WAIT_S
-        while running_pid() == pid:
-            if time.monotonic() >= deadline:
-                return False
-            sleep(1.0)
-        return True
-
-    previous = running_pid()
-    replace = (
-        previous is not None and auto_started is not None and auto_started(previous)
-    )
-    if replace:
-        print_info(
-            f"Replacing the chat's auto-started gateway (pid {previous}) "
-            "with the gateway service..."
-        )
-        if not stopped(previous):
-            print_info("It did not stop; restarting it instead.")
-            replace = False
-    if previous is not None and not replace:
-        print_info(f"Restarting the gateway (pid {previous})...")
-        restart()
-    else:
-        print_info("Starting the gateway...")
-        installed = install()
-        if installed == "installed":
-            print_info("Installed the gateway as a service.")
-        elif installed == "already":
-            start()
-        else:
-            print_info(
-                f"Could not install the gateway as a service ({installed[7:]}); "
-                "starting it in the background instead."
-            )
-            restart()
-    pid = came_up(previous)
-    if pid is None:
-        # One more go: a service can be loaded with no process behind it.
-        print_info("The gateway is not up yet; restarting it once more...")
-        restart()
-        pid = came_up(previous)
-    if pid is not None:
-        print_success(f"Gateway running (pid {pid}).")
-        return "running"
-    print_warning(
-        "The gateway did not come up. Check: hermes gateway status "
-        "(log: ~/.hermes/logs/gateway.log)"
-    )
-    return "failed"
 
 
 def main() -> None:

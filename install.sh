@@ -568,33 +568,16 @@ info "Connecting to Filament ..."
 # dep target) on PYTHONPATH, so `hermes_filament_fcm` imports from the clone.
 # The package is not pip-installed, so there is no console script to run.
 run_setup() {
-  # When this script owns the gateway restart — an s6 bounce (any supervised
-  # slot is live, detected below before the wizard runs) or the profile
-  # flow's direct spawn — the wizard's own `hermes gateway restart` is worse
-  # than redundant: under s6 it runs inside the gateway's process tree, can't
-  # reach the supervisor, and just costs two CLI startups before the real
-  # bounce moments later.
+  # The wizard restarts the gateway itself, through `hermes filament restart`
+  # (hermes_filament_fcm/gateway_restart.py): an s6 slot, a service, a gateway
+  # started by hand, Agent37's profile gateways and no gateway at all each get
+  # the restart that works there, after the gateway's running turns end.
   PYTHONPATH="$PLUGIN_DIR${PYPATH_PREFIX:+:$PYPATH_PREFIX}${PYTHONPATH:+:$PYTHONPATH}" \
-    FILAMENT_SETUP_SKIP_RESTART="${SCRIPT_OWNS_RESTART:-}" \
     "$PY" -c 'from hermes_filament_fcm.setup_cli import main; main()' "$@"
   # Not `-m hermes_filament_fcm.setup_cli`: the package __init__ imports
   # setup_cli, so runpy then finds it already in sys.modules and prints a
   # RuntimeWarning at the top of the wizard.
 }
-
-# Decide up front whether this script will restart the gateway itself, so the
-# wizard can be told to skip its own attempt. The s6 probe is cheap and is
-# what the restart section below keys off anyway.
-S6_SVC="$(command -v s6-svc 2>/dev/null || true)"
-if [ -z "$S6_SVC" ] && [ -x /command/s6-svc ]; then
-  S6_SVC=/command/s6-svc
-fi
-SCRIPT_OWNS_RESTART="${FILAMENT_PROFILE:+1}"
-if [ -z "$SCRIPT_OWNS_RESTART" ] && [ -n "$S6_SVC" ]; then
-  for _svcdir in /run/service/gateway-* /run/service/hermes-gateway-*; do
-    if [ -p "$_svcdir/supervise/control" ]; then SCRIPT_OWNS_RESTART=1; break; fi
-  done
-fi
 
 # Re-attach the terminal so the setup wizard's prompts work even when this
 # script is piped from curl straight into bash, where stdin is the download
@@ -657,76 +640,19 @@ if changed:
 PYEOF
 fi
 
-# --- Force a supervised restart ------------------------------------------
-# On Docker/cloud images the gateway runs under an s6 supervisor
-# (s6-supervise gateway-<profile>). The setup wizard's `hermes gateway
-# restart` can't reliably cycle it there: the wizard runs inside the
-# gateway's own process tree, so it can neither SIGTERM itself cleanly nor
-# reach the supervisor — s6 just keeps (or respawns) the OLD process, which
-# started before the plugin was installed and never loads the Filament
-# adapter. Ask the supervisor directly to bounce the service so the new
-# process picks up the plugin and the saved .env.
-#
-# s6-overlay keeps its binaries in /command, which is rarely on PATH.
-# -t sends SIGTERM and the supervisor respawns the service — the same
-# action as upstream's S6ServiceManager.restart. No-op outside s6 images.
-# ($S6_SVC was resolved above, before the wizard ran.)
-
-# Restart a live service slot. Returns false only when no live slot exists
-# (a control FIFO is absent) — that's what gates the caller's naming-mismatch
-# fallback. An s6-svc failure still counts as "slot found": falling back to
-# other profiles' slots can't fix it (same s6-svc, same permissions) and
-# would only bounce gateways the wizard never touched — so warn instead.
-restart_slot() {
-  [ -d "$1" ] && [ -p "$1/supervise/control" ] || return 1
-  info "Restarting supervised gateway ($(basename "$1")) so the plugin loads ..."
-  # -u first: the slot a fresh `hermes profile create` registers is down
-  # until told to start, and -t alone is a no-op on a down service. On an
-  # already-running slot -u is the no-op and -t does the restart.
-  "$S6_SVC" -u "$1" 2>/dev/null || true
-  "$S6_SVC" -t "$1" \
-    || warn "could not restart $(basename "$1") — restart it manually: $S6_SVC -t $1"
-}
-
-# Whether some live s6 slot took the restart. s6-svc merely being installed
-# is not enough — with no supervised slot for this gateway the direct-spawn
-# and hook paths below must still run, or the profile never starts.
+# Whether an s6 supervisor runs this profile's gateway (Docker/cloud images:
+# s6-supervise gateway-<profile>). s6-overlay keeps its binaries in /command,
+# which is rarely on PATH; a live slot has a supervise/control FIFO.
+if [ "$(basename "$(dirname "$HERMES_HOME")")" = profiles ]; then
+  HERMES_PROFILE="$(basename "$HERMES_HOME")"
+else
+  HERMES_PROFILE=default
+fi
 SUPERVISED=0
-if [ -n "$S6_SVC" ]; then
-  # Each profile is an independent HERMES_HOME (the default profile at the
-  # root, named ones under <root>/profiles/<name>), and the wizard only
-  # configured this one — leave other profiles' gateways alone.
-  if [ "$(basename "$(dirname "$HERMES_HOME")")" = profiles ]; then
-    HERMES_PROFILE="$(basename "$HERMES_HOME")"
-  else
-    HERMES_PROFILE=default
-  fi
-
-  for SVCDIR in "/run/service/gateway-$HERMES_PROFILE" "/run/service/hermes-gateway-$HERMES_PROFILE"; do
-    if restart_slot "$SVCDIR"; then SUPERVISED=1; fi
-  done
-  if [ "$SUPERVISED" = 0 ]; then
-    # This provider names its slots differently — restart every live
-    # gateway rather than leave the plugin unloaded.
-    for SVCDIR in /run/service/gateway-* /run/service/hermes-gateway-*; do
-      if restart_slot "$SVCDIR"; then SUPERVISED=1; fi
-    done
-  fi
-fi
-
-# --- Start the profile gateway (no supervised slot) ---------------------------
-# The wizard's restart was skipped above (FILAMENT_SETUP_SKIP_RESTART): with
-# no supervisor, `hermes gateway restart` is two CLI startups (restart, then
-# run) where one will do. Spawn the gateway directly, detached from this
-# session; --replace hands over cleanly if one is somehow already up.
-if [ "$SUPERVISED" = 0 ] && [ -n "${FILAMENT_PROFILE:-}" ]; then
-  SETSID="$(command -v setsid 2>/dev/null || true)"
-  info "Starting the gateway ..."
-  # shellcheck disable=SC2086  # $SETSID intentionally word-splits away when absent
-  $SETSID nohup hermes gateway run --replace \
-    > "$HERMES_HOME/logs/gateway-detached.log" 2>&1 < /dev/null &
-  disown 2>/dev/null || true
-fi
+for SVCDIR in "/run/service/gateway-$HERMES_PROFILE" "/run/service/hermes-gateway-$HERMES_PROFILE" \
+    "/run/hermes-service/gateway-$HERMES_PROFILE"; do
+  if [ -p "$SVCDIR/supervise/control" ]; then SUPERVISED=1; fi
+done
 
 # --- Keep profile gateways alive across restarts (no supervised slot) --------
 # Without s6 there is no supervisor for a named profile's gateway: the setup
@@ -741,23 +667,34 @@ fi
 AGENT37_HOOK="${AGENT37_HOOKS_DIR:-$HOME/.agent37/hooks}/post-restart.sh"
 if [ "$SUPERVISED" = 0 ] && [ -n "${FILAMENT_PROFILE:-}" ] \
     && [ -d "$(dirname "$AGENT37_HOOK")" ] \
-    && ! grep -q "filament-hermes profile gateways" "$AGENT37_HOOK" 2>/dev/null; then
+    && ! grep -q "filament restart --ensure" "$AGENT37_HOOK" 2>/dev/null; then
+  # An older block ran `hermes gateway restart`, which with no gateway running
+  # runs one in the foreground and never returns: replace it.
+  if grep -q "filament-hermes profile gateways" "$AGENT37_HOOK" 2>/dev/null; then
+    sed '/^# >>> filament-hermes profile gateways/,/^# <<< filament-hermes profile gateways/d' \
+      "$AGENT37_HOOK" > "$AGENT37_HOOK.filament-tmp" \
+      && cat "$AGENT37_HOOK.filament-tmp" > "$AGENT37_HOOK"
+    rm -f "$AGENT37_HOOK.filament-tmp"
+  fi
   cat >> "$AGENT37_HOOK" <<'HOOKEOF'
 
 # >>> filament-hermes profile gateways (managed block; do not edit)
-# Revive the gateway of every Hermes profile connected to Filament: their
+# Start the gateway of every Hermes profile connected to Filament: their
 # background gateways die with the container, and the entrypoint only
-# supervises the default profile's.
+# supervises the default profile's. `hermes filament restart --ensure` starts
+# one only where none runs, and returns.
 command -v hermes >/dev/null 2>&1 \
   || PATH="/usr/local/bin:/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes/hermes-agent/venv/bin:$PATH"
 for _fil_plugin_dir in "${HERMES_HOME:-$HOME/.hermes}"/profiles/*/plugins/filament; do
   [ -d "$_fil_plugin_dir" ] || continue
-  HERMES_HOME="$(dirname "$(dirname "$_fil_plugin_dir")")" \
-    hermes gateway restart >/dev/null 2>&1 || true
+  _fil_home="$(dirname "$(dirname "$_fil_plugin_dir")")"
+  mkdir -p "$_fil_home/logs"
+  HERMES_HOME="$_fil_home" hermes filament restart --ensure --grace=0 \
+    >> "$_fil_home/logs/filament-gateway.log" 2>&1 < /dev/null || true
 done
 # <<< filament-hermes profile gateways
 HOOKEOF
-  info "Installed post-restart hook: profile gateways revive on container restarts."
+  info "Installed post-restart hook: profile gateways start again on container restarts."
 fi
 
 # --- Where to look next -------------------------------------------------------
