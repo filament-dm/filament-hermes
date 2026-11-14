@@ -582,7 +582,12 @@ class _Runner:
 
 
 class TestLeaveRestartHelper:
+    @pytest.fixture(autouse=True)
+    def _home(self, tmp_path):
+        self.home = str(tmp_path)
+
     def _leave(self, runner, env):
+        env = {**env, "HERMES_HOME": self.home}
         scheduled = []
         log = gr.leave_restart_helper(
             runner,
@@ -595,13 +600,22 @@ class TestLeaveRestartHelper:
         return log, scheduled
 
     def test_an_unsupervised_restart_leaves_a_helper(self):
-        log, scheduled = self._leave(
-            _Runner(), {"HERMES_HOME": "/opt/data", "INVOCATION_ID": "x"}
-        )
+        log, scheduled = self._leave(_Runner(), {"INVOCATION_ID": "x"})
         assert log == Path("/log")
         assert scheduled == [
-            (Path("/opt/data"), ["--ensure", "--after-timeout=2100"], 812)
+            (Path(self.home), ["--ensure", "--after-timeout=2100"], 812)
         ]
+
+    def test_one_helper_per_gateway_however_many_adapters_stop(self):
+        # A host gateway serving two profiles disconnects two adapters.
+        assert self._leave(_Runner(), {})[0] == Path("/log")
+        assert self._leave(_Runner(), {}) == (None, [])
+
+    def test_an_hour_old_claim_is_a_reused_pids(self, tmp_path):
+        assert gr.claim_helper(tmp_path, 812, now=1000.0)
+        os.utime(tmp_path / "logs" / ".filament-restart-helper-812", (1000.0, 1000.0))
+        assert not gr.claim_helper(tmp_path, 812, now=1100.0)
+        assert gr.claim_helper(tmp_path, 812, now=1000.0 + 3601)
 
     def test_a_plain_stop_does_not(self):
         assert self._leave(_Runner(requested=False), {}) == (None, [])

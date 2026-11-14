@@ -61,6 +61,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1049,13 +1050,40 @@ def leave_restart_helper(
         return None
     if proven_supervisor(environ, pid=pid):
         return None
+    pid = os.getpid() if pid is None else pid
     env = os.environ if environ is None else environ
     home = Path(env.get("HERMES_HOME") or Path.home() / ".hermes")
     schedule_fn = schedule_fn or schedule
+    # One helper per stopping gateway: a host gateway serving several
+    # profiles disconnects one Filament adapter per profile, each with its
+    # own copy of this module, so the claim is a file.
+    if not claim_helper(home, pid):
+        return None
     # The drain before the exit can run long (agent.restart_after_turn_timeout,
     # 30 min by default) when this is called early; give it that and more.
-    return schedule_fn(
-        home,
-        ["--ensure", "--after-timeout=2100"],
-        after_pid=os.getpid() if pid is None else pid,
-    )
+    return schedule_fn(home, ["--ensure", "--after-timeout=2100"], after_pid=pid)
+
+
+def claim_helper(home: Path, pid: int, *, now: float | None = None) -> bool:
+    """True for the first caller per gateway PID (an hour-old claim is a
+    reused PID's and is taken over)."""
+    path = home / "logs" / f".filament-restart-helper-{pid}"
+    now = time.time() if now is None else now
+    with _HELPERS_LOCK:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return True
+        except FileExistsError:
+            try:
+                if now - path.stat().st_mtime > 3600:
+                    os.utime(path, (now, now))
+                    return True
+            except OSError:
+                pass
+            return False
+        except OSError:
+            return True  # can't record it; a second helper is harmless
+
+
+_HELPERS_LOCK = threading.Lock()
