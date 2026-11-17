@@ -83,6 +83,35 @@ def sanitize_meta(value: str, limit: int = 80) -> str:
     return flat[:limit]
 
 
+# The whole-response tokens the core rules give the model for "I chose not to
+# reply". Hermes's gateway suppresses the same set (gateway/response_filters);
+# send() drops them too, for a Hermes that predates that or overrides it.
+SILENCE_MARKERS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
+
+
+def is_silence_marker(content: str | None) -> bool:
+    """Whether a reply is only a silence marker, so it must not be posted.
+
+    Matches the whole reply, case-insensitively, ignoring surrounding
+    whitespace and stray edge punctuation such as markdown emphasis. Prose that
+    merely mentions a marker is a real reply and does not match.
+
+    Args:
+        content: The reply text the gateway asked to send.
+
+    Returns:
+        True when the reply is exactly one of SILENCE_MARKERS.
+    """
+    text = (content or "").strip()
+    if not text or len(text) > 64:
+        return False
+    # Brackets stay: they are part of the [SILENT] marker, not punctuation.
+    stripped = text.strip("*_`.!~'\"").strip()
+    return any(
+        " ".join(form.upper().split()) in SILENCE_MARKERS for form in (text, stripped)
+    )
+
+
 def append_note(body: str | None, note: str | None) -> str:
     """Attaches a framing note on its own line below a message body.
 

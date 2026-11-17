@@ -19,6 +19,9 @@ cursor_channel
     room.
 reply_anchor
     adapter.send threads an unaddressed reply under it.
+reply_expected
+    adapter.send drops Hermes's "unexpected silence" fallback when it is False,
+    since a Hermes that predates MessageEvent.reply_expected posts it anyway.
 
 The two defaults are asymmetric on purpose. zone defaults to Zone.DATA, the
 low-privilege value, so a turn that never set a context cannot edit policy.
@@ -88,6 +91,8 @@ class TurnContext:
             under, or None to post at the top level.
         history_key: The conversation (see reactive.history_key) whose
             seen-history mark this turn's own history reads advance, or None.
+        reply_expected: False when the turn was not addressed to the agent, so
+            it may stay silent; None when unknown.
     """
 
     zone: Zone = Zone.DATA
@@ -95,6 +100,7 @@ class TurnContext:
     cursor_channel: str | None = None
     reply_anchor: tuple[str, str] | None = None
     history_key: str | None = None
+    reply_expected: bool | None = None
 
     def with_capabilities(self, capabilities: frozenset[str] | None) -> TurnContext:
         """Returns a copy carrying a different tool grant.
@@ -136,6 +142,7 @@ def data_turn(
     cursor_channel: str | None,
     reply_anchor: tuple[str, str] | None,
     history_key: str | None,
+    reply_expected: bool,
 ) -> TurnContext:
     """Builds a data-plane turn's context.
 
@@ -152,6 +159,8 @@ def data_turn(
             None to post at the top level.
         history_key: The conversation whose seen-history mark a history read
             in this turn may advance, or None to advance none.
+        reply_expected: Whether the event was addressed to the agent (an
+            @-mention or a DM). False lets the turn stay silent.
 
     Returns:
         A TurnContext in Zone.DATA.
@@ -162,6 +171,7 @@ def data_turn(
         cursor_channel=cursor_channel,
         reply_anchor=reply_anchor,
         history_key=history_key,
+        reply_expected=reply_expected,
     )
 
 
