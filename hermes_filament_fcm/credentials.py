@@ -201,6 +201,34 @@ class CredentialStore:
         except Exception:
             logger.warning("Failed to remove %s", path, exc_info=True)
 
+    def claim_look_around(self, agent_user_id: str | None) -> bool:
+        """Claim this agent's one look-around - see adapter._look_around.
+
+        True for an agent's first claim only, and only once the marker is on
+        disk: a marker that cannot be read or written means no look-around,
+        never a second one. Kept per agent because the plugin can be signed
+        in again as a new one. Never raises."""
+        if not agent_user_id:
+            return False
+        path = self._dir / "look_around.json"
+        try:
+            agents: list[str] = []
+            if path.exists():
+                with open(path) as f:
+                    data = json.load(f)
+                agents = [a for a in data["agents"] if isinstance(a, str)]
+            if agent_user_id in agents:
+                return False
+            self._ensure_dir()
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump({"agents": [*agents, agent_user_id]}, f, indent=2)
+            os.replace(tmp, path)
+            return True
+        except Exception:
+            logger.warning("Failed to claim %s", path, exc_info=True)
+            return False
+
     def load_or_create_installation_id(self) -> str:
         """Return a stable, report-safe id for this Hermes plugin install."""
         data = self._read_json("installation.json")

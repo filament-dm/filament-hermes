@@ -188,6 +188,10 @@ _NOTICE_STATUS_TIMEOUT_MS = 30_000
 # out instead: the app's connect screen is waiting on it.
 _HELLO_TIMEOUT_S = 45.0
 
+# How long after the hello the look-around turn starts: past the hello turn's
+# own end, whose status clear would otherwise wipe the look-around's line.
+_LOOK_AROUND_DELAY_S = 5.0
+
 # How long a room's details (name, loop, member names) serve poll_work rows.
 _ROOM_INFO_TTL_S = 300.0
 
@@ -340,6 +344,16 @@ def _str_field(row: dict, key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _is_final_reply(reply_to: str | None, metadata: Any, trigger: str | None) -> bool:
+    """Whether a send is the final reply of the turn *trigger* started.
+
+    Hermes marks a turn's final reply notify=True on both its delivery
+    lanes; error notices and progress lines carry neither mark."""
+    return reply_to == trigger or (
+        isinstance(metadata, dict) and metadata.get("notify") is True
+    )
+
+
 def _metadata_value(metadata: Any, key: str) -> str | None:
     if not isinstance(metadata, dict):
         return None
@@ -472,6 +486,11 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # reply or the canned fallback) has gone out. See _maybe_greet.
         self._hello_trigger_id: str | None = None
         self._hello_delivered: bool = False
+
+        # The look-around turn that follows the first hello, and whether its
+        # message has gone out. See _look_around.
+        self._look_around_trigger_id: str | None = None
+        self._look_around_posted: bool = False
 
         # Loops whose vouch is mid-accept. The startup sweep and a live
         # knock_invite_received push can name the same loop at once (the sweep
@@ -1027,6 +1046,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             if FilamentAPI.result_error(result):
                 raise RuntimeError(FilamentAPI.result_error(result))
             slog.info("filament_fcm.greet.dispatched", fallback=True)
+            self._start_look_around()
         except Exception:
             # The server's gate re-prompts on the next connect.
             self._hello_delivered = False
@@ -1043,10 +1063,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         command list appended. Anything else the side session sends (an error
         notice, tool progress) and any reply after the canned fallback went
         out is dropped: the principal sees exactly one hello."""
-        # Hermes marks a turn's final reply notify=True on both its delivery
-        # lanes; error notices and progress lines carry neither mark.
-        is_final = reply_to == getattr(self, "_hello_trigger_id", None) or (
-            isinstance(metadata, dict) and metadata.get("notify") is True
+        is_final = _is_final_reply(
+            reply_to, metadata, getattr(self, "_hello_trigger_id", None)
         )
         why = (
             "not the turn's final reply"
@@ -1081,6 +1099,119 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             self._hello_delivered = False
             return SendResult(success=False, error=error, retryable=True)
         slog.info("filament_fcm.greet.dispatched", fallback=False)
+        self._start_look_around()
+        return SendResult(success=True, raw_response=result)
+
+    def _start_look_around(self) -> None:
+        """Start the look-around in the background. Never raises."""
+        try:
+            task = asyncio.get_running_loop().create_task(self._look_around())
+            self._background_look_around_task = task
+        except Exception:
+            logger.debug("filament-fcm: look-around not started", exc_info=True)
+
+    async def _look_around(self, delay: float | None = None) -> None:
+        """Have the agent look around Filament once, after its first hello.
+
+        Called only when a first-contact hello has just landed, which the
+        server asks for once per agent (see ``_maybe_greet``), so a restart,
+        reconnect or update never gets here. The marker in the state dir
+        (``CredentialStore.claim_look_around``) is claimed before the turn is
+        dispatched: at most one look-around per agent, and one that fails is
+        not retried.
+
+        The step is one model turn (``framing.look_around_prompt``) in a
+        side session of the backchannel's, like the hello's. The backchannel
+        shows a status while it runs, and ``send`` posts the turn's reply to
+        the backchannel's main timeline. Any failure skips it silently.
+        """
+        try:
+            await asyncio.sleep(_LOOK_AROUND_DELAY_S if delay is None else delay)
+            room = self._cc_room_id
+            if not room or not self._user_id:
+                return
+            if not self._credentials.claim_look_around(self._user_id):
+                return
+            trigger = f"look-around:{room}"
+            self._look_around_trigger_id = trigger
+            self._look_around_posted = False
+            source = self.build_source(
+                chat_id=room,
+                chat_name=framing.session_label("look around"),
+                chat_type="dm",
+                user_id=self._owner_id,
+                user_name=self._owner_name or self._owner_id,
+                thread_id=framing.LOOK_AROUND_THREAD,
+                message_id=trigger,
+            )
+            event = MessageEvent(
+                text=framing.look_around_prompt(self._owner_name),
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=trigger,
+                raw_message=None,
+                channel_prompt=framing.TOOL_MAP_PROMPT,
+            )
+            # The side session's thread is no Filament event, so the status
+            # is scoped to the room alone. on_processing_complete clears it.
+            status_publisher.begin_turn(
+                trigger,
+                TurnScope(room_id=room),
+                opening=framing.LOOK_AROUND_STATUS,
+            )
+            with bound_context(
+                installation_id=self._installation_id,
+                gateway_instance_id=self._gateway_instance_id,
+                call_origin="look_around",
+                trigger_event_id=trigger,
+            ):
+                slog.info("filament_fcm.look_around.dispatch", channel_id=room)
+                await self.handle_message(event)
+        except Exception:
+            logger.debug("filament-fcm: look-around skipped", exc_info=True)
+
+    async def _send_look_around(
+        self, content: str, reply_to: str | None, metadata: Any = None
+    ) -> SendResult:
+        """``send`` for the look-around's side session (see ``_look_around``).
+
+        The turn's final reply goes to the backchannel's main timeline, once,
+        and only when it is the message the turn was asked for. Everything
+        else the side session sends (an error notice, tool progress, the
+        silent marker, an apology) is dropped, so a look-around that went
+        wrong says nothing. A failed post is dropped too, never retried."""
+        trigger = getattr(self, "_look_around_trigger_id", None)
+        why = (
+            "no look-around is running"
+            if not trigger or not self._cc_room_id
+            else "not the turn's final reply"
+            if not _is_final_reply(reply_to, metadata, trigger)
+            else "a message already went out"
+            if self._look_around_posted
+            else "it is not the look-around message"
+            if not framing.is_look_around_message(content)
+            else None
+        )
+        if why:
+            logger.info(
+                "filament-fcm: dropping a side-session send from the "
+                "look-around (%s; %d chars)",
+                why,
+                len(content or ""),
+            )
+            return SendResult(success=True)
+        self._look_around_posted = True
+        try:
+            result = await self._filament_api.post_message(
+                channel=self._cc_room_id, markdown_body=content.strip()
+            )
+            error = FilamentAPI.result_error(result)
+        except Exception as e:
+            error = str(e)
+        if error:
+            logger.info("filament-fcm: look-around post failed: %s", error)
+            return SendResult(success=True)
+        slog.info("filament_fcm.look_around.posted")
         return SendResult(success=True, raw_response=result)
 
     def _note_reserved(self) -> None:
@@ -2062,6 +2193,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         if _metadata_value(metadata, "thread_id") == framing.HELLO_THREAD:
             return await self._send_hello(content, reply_to, metadata)
+        if _metadata_value(metadata, "thread_id") == framing.LOOK_AROUND_THREAD:
+            return await self._send_look_around(content, reply_to, metadata)
 
         parent_context = current_context()
         send_id = new_id("send")
