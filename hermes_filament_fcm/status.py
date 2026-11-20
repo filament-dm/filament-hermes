@@ -417,7 +417,10 @@ class StatusPublisher:
 
     # -- turn lifecycle (called from the adapter) --
 
-    def begin_turn(self, trigger_event_id: str, scope: TurnScope) -> None:
+    def begin_turn(
+        self, trigger_event_id: str, scope: TurnScope, opening: str = "processing"
+    ) -> None:
+        """Park a turn's scope and publish *opening* as its first line."""
         if not enabled() or not hasattr(self._api, "set_status"):
             return
         # Dispatch runs on the gateway loop; hook-thread publishes are
@@ -428,7 +431,7 @@ class StatusPublisher:
             self._prune()
             entry = _Pending(scope=scope, created=time.monotonic(), api=self._api)
             self._pending[trigger_event_id] = entry
-        self._publish(entry, "processing")
+        self._publish(entry, opening)
         # Exempt the first real phrase from the floor, or a single-tool
         # turn's only phrase would be suppressed.
         entry.last_ts = time.monotonic() - MIN_INTERVAL_SECONDS

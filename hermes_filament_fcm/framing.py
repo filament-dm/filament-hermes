@@ -423,6 +423,87 @@ def first_contact_prompt(agent_name: str | None, owner_name: str | None) -> str:
     )
 
 
+# The side session the look-around turn runs in, kept apart from the
+# backchannel's own conversation like HELLO_THREAD. send() routes its reply to
+# the backchannel's main timeline (adapter._send_look_around).
+LOOK_AROUND_THREAD = "filament-look-around"
+
+# The status line the backchannel shows when the look-around starts. The
+# auto-status narrates the turn's tool calls after it and clears at the end.
+LOOK_AROUND_STATUS = "Looking around Filament\u2026"
+
+# What the look-around's message opens with. The adapter posts only a reply
+# that does, so a turn that went wrong stays silent.
+LOOK_AROUND_OPENING = "I took a look around Filament"
+
+# What the turn answers with when it has nothing to post.
+LOOK_AROUND_SILENT = "[SILENT]"
+
+
+def look_around_prompt(owner_name: str | None) -> str:
+    """The one-time turn after the first-contact hello: the agent reads its
+    Filament tools and Filament's description and tells its principal what
+    makes Filament different.
+
+    The wording is the look-around step every Filament agent guide carries,
+    changed only where Hermes differs: the status line is published by the
+    plugin, deferred tools are read through tool_search and tool_describe,
+    the server's instructions are the filament-links skill, and the turn's
+    reply is the message (send() posts it to the backchannel). Read by the
+    model as its principal's message, so it says it is the gateway speaking."""
+    owner = f", {sanitize_meta(owner_name)}" if owner_name else ""
+    return (
+        "[system: This is the Filament gateway speaking, not your "
+        f"principal{owner}. You have just said hello in your private chat "
+        "with them, your backchannel.\n\n"
+        "Find out what makes Filament different, decide what you think of it, "
+        "and tell your owner in a second message, separate from your hello. "
+        "Take a few minutes and dig. If any step fails, skip the rest and say "
+        f"nothing about it: reply with only {LOOK_AROUND_SILENT}.\n\n"
+        "Your owner is watching the chat while you look. Your backchannel "
+        f"already shows the status `{LOOK_AROUND_STATUS}`; it follows your "
+        "tool calls and clears when you finish, so do not call `set_status` "
+        "yourself.\n\n"
+        "1. Start from your own tools: they are the ground truth. Read every "
+        "Filament tool you have, with its description and input schema "
+        "(`tool_search` and `tool_describe` show the ones that are not in "
+        "front of you), and the server's instructions (your `filament-links` "
+        "skill). Note each field, argument and rule that a Slack or Discord "
+        "bot API has no counterpart for.\n"
+        "2. Then read `https://filament.dm/llms.txt` and the full description "
+        "it links (`https://filament.dm/llms-full.txt`; if that fails, "
+        "`https://raw.githubusercontent.com/filament-dm/filament-agent-kit/"
+        "main/site/llms-full.txt`), with whatever you have for fetching a "
+        "page, for how Filament compares itself with other chat apps. Check "
+        "its claims against the tools. If you cannot fetch pages, go on from "
+        "the tools alone. Call `get_settings` and `list_channels` too.\n"
+        '3. Reply with one message, answering "How would you describe '
+        'Filament, and what makes it different from other chat platforms?" '
+        "as if your owner had just asked. Your reply to this turn is posted "
+        "to your backchannel as that message, so do not post it with "
+        "`message_principal` or `post_message` as well. Open with "
+        f'"{LOOK_AROUND_OPENING}." and one sentence that sums up what '
+        "Filament really is, as you see it. Then give the four to seven "
+        "differences you find most significant, most important first. For "
+        "each, lead with the difference in bold, name the tool or field that "
+        "shows it in `code`, say how a bot on Slack or Discord handles the "
+        "same thing, and say why it matters. Write like an expert explaining "
+        "it to a curious colleague: concrete and opinionated, with no "
+        "marketing phrases. Claim only what a tool, its schema, the "
+        "instructions or the description says, and add no guarantees they "
+        "don't state, such as encryption or security. Leave out ids.]"
+    )
+
+
+def is_look_around_message(content: str | None) -> bool:
+    """Whether a look-around turn's reply is the message it was asked for.
+
+    Anything else (an apology, an error, the silent marker) is not posted.
+    Markdown emphasis around the opening is allowed."""
+    head = (content or "").lstrip(" \t\r\n*_#>").casefold()
+    return head.startswith(LOOK_AROUND_OPENING.casefold())
+
+
 def first_contact_hello(agent_name: str | None, slash_enabled: bool) -> str:
     """The canned first-contact hello — the connect flow's finish line when
     the hello turn (first_contact_prompt) fails or is too slow.
