@@ -708,6 +708,12 @@ def _restart_gateway() -> None:
     h20-baseline: login killed, no gateway came back). The restart is then
     handed to a helper outside the gateway's process tree, which waits for
     this login to exit first."""
+    if _served_by_multiplexer():
+        print_success(
+            "The running Hermes gateway serves this profile, so it starts the "
+            "profile's Filament connection now, with no restart."
+        )
+        return
     pid = _running_gateway_pid()
     if pid is not None and pid in _ancestor_pids() and _schedule_gateway_handoff():
         return
@@ -718,6 +724,22 @@ def _restart_gateway() -> None:
         running_pid=_running_gateway_pid,
         auto_started=_gateway_auto_started,
     )
+
+
+def _served_by_multiplexer() -> bool:
+    """Whether a running multiplexed gateway serves this named profile. It
+    starts the profile's adapters again when the profile's .env changes, so a
+    restart would only interrupt every other profile it serves."""
+    try:
+        from hermes_cli.gateway import (  # noqa: PLC0415
+            named_profile_served_by_running_multiplexer,
+        )
+    except ImportError:
+        return False
+    try:
+        return bool(named_profile_served_by_running_multiplexer())
+    except Exception:
+        return False
 
 
 def _ancestor_pids(pid: int | None = None, *, ppid_of=None) -> set[int]:
