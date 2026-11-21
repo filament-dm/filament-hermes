@@ -24,6 +24,8 @@ _Adapter = adapter.FCMFilamentAdapter
 
 class _Api:
     _mcp_url = "http://server/mcp/agents"
+    mcp_url = _mcp_url
+    token_hash = "ab12"
 
     def __init__(self, init):
         self._init = init
@@ -39,7 +41,12 @@ class _Api:
 
 def _stub(init):
     fatal = []
+    recorded = []
     stub = types.SimpleNamespace(
+        _credentials=types.SimpleNamespace(
+            save_connection=lambda *args, **kwargs: recorded.append((args, kwargs))
+        ),
+        recorded=recorded,
         _filament_api=_Api(init),
         _reserved=False,
         _auth_refused=None,
@@ -71,6 +78,10 @@ def test_a_refused_sign_in_is_fatal_and_not_retried(monkeypatch):
     assert asyncio.run(_Adapter._connect_attempt(stub, False, "conn")) is False
     assert fatal == [("auth_refused", adapter.AUTH_REFUSED_MESSAGE, False)]
     assert "press Connect" in adapter.AUTH_REFUSED_MESSAGE
+    # The Filament app's list of Hermes profiles reads this.
+    assert stub.recorded == [
+        ((None, "http://server/mcp/agents", "ab12"), {"refused": True})
+    ]
 
 
 def test_other_initialize_failures_stay_retryable():

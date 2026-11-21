@@ -36,4 +36,16 @@ def test_connection_names_the_agent_and_hashes_the_token(tmp_path):
         "agent_id": "@a_1:filament.dm",
         "mcp_url": "https://api.filament.dm/mcp/agents",
         "token_sha256": digest,
+        "refused": False,
     }
+
+
+def test_a_refused_token_is_recorded_as_refused(tmp_path):
+    credentials = _credentials()
+    store = credentials.CredentialStore(str(tmp_path))
+    store.save_connection(
+        None, "https://api.filament.dm/mcp/agents", "ab", refused=True
+    )
+    saved = json.loads((tmp_path / credentials.CONNECTION_FILE).read_text())
+    assert saved["refused"] is True
+    assert saved["agent_id"] is None

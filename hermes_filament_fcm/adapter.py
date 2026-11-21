@@ -802,6 +802,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     # (live run h20-r4-delete). A new sign-in writes a new
                     # token and restarts the gateway, which clears this.
                     logger.error("filament-fcm: %s", AUTH_REFUSED_MESSAGE)
+                    self._credentials.save_connection(
+                        None,
+                        self._filament_api.mcp_url,
+                        self._filament_api.token_hash,
+                        refused=True,
+                    )
                     slog.error(
                         "filament_fcm.connect.auth_refused", error=self._auth_refused
                     )

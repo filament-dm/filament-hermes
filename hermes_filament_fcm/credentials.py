@@ -135,14 +135,24 @@ class CredentialStore:
             logger.warning("Failed to write %s", path, exc_info=True)
 
     def save_connection(
-        self, agent_user_id: str, mcp_url: str, token_hash: str
+        self,
+        agent_user_id: str | None,
+        mcp_url: str,
+        token_hash: str,
+        refused: bool = False,
     ) -> None:
-        """Record which Filament agent this profile is, for the Filament desktop
-        app's list of Hermes profiles. *token_hash* tells that app whether the
-        token in .env now is the one this agent connected with."""
+        """Record which Filament agent this profile is, or that Filament refused
+        its token, for the Filament desktop app's list of Hermes profiles.
+        *token_hash* tells that app whether the token in .env now is the one
+        this record is about."""
         self._write_json(
             CONNECTION_FILE,
-            {"agent_id": agent_user_id, "mcp_url": mcp_url, "token_sha256": token_hash},
+            {
+                "agent_id": agent_user_id,
+                "mcp_url": mcp_url,
+                "token_sha256": token_hash,
+                "refused": refused,
+            },
         )
 
     def load_fcm_credentials(self) -> dict[str, Any] | None:
