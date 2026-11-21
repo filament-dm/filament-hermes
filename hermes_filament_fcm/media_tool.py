@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .filament_api import FilamentAPI
+from .profile_env import setting
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -71,7 +72,7 @@ def _safe_filename(name: str) -> str:
 
 def media_dir() -> Path:
     """Directory downloaded attachments are saved to."""
-    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    home = setting("HERMES_HOME") or str(Path.home() / ".hermes")
     return Path(home) / "filament_media"
 
 
