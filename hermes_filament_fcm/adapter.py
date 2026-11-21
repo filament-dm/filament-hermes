@@ -1302,6 +1302,12 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                             "owner.user_id — cannot determine principal"
                         )
                     logger.info("filament-fcm: [Stage 1] principal is %s", principal_id)
+                    if self._user_id:
+                        self._credentials.save_connection(
+                            self._user_id,
+                            self._filament_api.mcp_url,
+                            self._filament_api.token_hash,
+                        )
                     slog.info(
                         "filament_fcm.identity.loaded",
                         agent_id=self._user_id,

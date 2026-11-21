@@ -35,6 +35,9 @@ except ImportError:  # loaded standalone by the tests
 
 logger = logging.getLogger("gateway.filament_fcm")
 
+# Read by the Filament desktop app; see save_connection.
+CONNECTION_FILE = "connection.json"
+
 _STATE_DIR_NAME = "filament-fcm"
 
 # Cap on how many received persistent ids we keep. MCS only redelivers
@@ -130,6 +133,17 @@ class CredentialStore:
             logger.debug("Wrote %s", path)
         except Exception:
             logger.warning("Failed to write %s", path, exc_info=True)
+
+    def save_connection(
+        self, agent_user_id: str, mcp_url: str, token_hash: str
+    ) -> None:
+        """Record which Filament agent this profile is, for the Filament desktop
+        app's list of Hermes profiles. *token_hash* tells that app whether the
+        token in .env now is the one this agent connected with."""
+        self._write_json(
+            CONNECTION_FILE,
+            {"agent_id": agent_user_id, "mcp_url": mcp_url, "token_sha256": token_hash},
+        )
 
     def load_fcm_credentials(self) -> dict[str, Any] | None:
         """Load saved FCM registration credentials."""
