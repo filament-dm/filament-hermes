@@ -71,6 +71,16 @@ class FilamentAPI:
         # by offers_tool so a per-message choice costs no network call.
         self.server_tools: frozenset[str] = frozenset()
 
+    def use_credentials(self, mcp_url: str, mcp_token: str) -> None:
+        """Talk to *mcp_url* as *mcp_token* from the next session on: the
+        profile was connected, or reconnected, after the plugin registered."""
+        if (mcp_url, mcp_token) == (self._mcp_url, self._mcp_token):
+            return
+        self._mcp_url = mcp_url
+        self._mcp_token = mcp_token
+        self._session_id = None
+        self._initialized = False
+
     def offers_tool(self, name: str) -> bool:
         """Whether the server's tool list, as registered, includes *name*."""
         return name in self.server_tools

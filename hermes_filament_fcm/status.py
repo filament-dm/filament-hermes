@@ -32,6 +32,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    from .profile_env import setting
+except ImportError:  # loaded standalone by the tests
+    setting = os.environ.get
+
 logger = logging.getLogger("gateway.filament_fcm")
 
 # One status per this many seconds when the phrase is unchanged: a resend
@@ -66,7 +71,7 @@ STALE_SECONDS = 15 * 60
 
 
 def enabled() -> bool:
-    return os.environ.get("FILAMENT_STATUS_UPDATES", "1").strip() != "0"
+    return (setting("FILAMENT_STATUS_UPDATES") or "1").strip() != "0"
 
 
 # System notices the gateway emits mid-work ("💾 Self-improvement review: …",

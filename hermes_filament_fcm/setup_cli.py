@@ -472,6 +472,7 @@ def _run_interactive_setup() -> bool | None:
     # delivery to the old agent's backchannel. Clear it — the adapter
     # re-derives and persists the right backchannel at the next connect.
     save_env_value("FILAMENT_HOME_ROOM", "")
+    _default_data_users()
 
     # Carry the Firebase project through to the gateway (see _FIREBASE_ENV_KEYS),
     # and the transport choice with it.
@@ -536,6 +537,19 @@ def _run_interactive_setup() -> bool | None:
     return True
 
 
+def _default_data_users() -> None:
+    """Write the gateway's admit-everyone default into this profile's .env,
+    unless it already holds a choice. ``register()`` defaults it in the
+    environment, but a multiplexed gateway reads a non-launch profile's own
+    .env instead."""
+    try:
+        from hermes_cli.config import load_env  # noqa: PLC0415
+    except ImportError:
+        return
+    if not (load_env().get("FILAMENT_ALLOW_DATA_USERS") or "").strip():
+        save_env_value("FILAMENT_ALLOW_DATA_USERS", "true")
+
+
 def _persist(token: str, url: str, principal_id: str | None) -> None:
     """Write the validated connection to the engine's .env.
 
@@ -548,6 +562,7 @@ def _persist(token: str, url: str, principal_id: str | None) -> None:
     # Same stale-identity guard as the interactive path: a cloned or
     # reconnected .env must not keep the previous agent's home room.
     save_env_value("FILAMENT_HOME_ROOM", "")
+    _default_data_users()
 
     # Carry the Firebase project through, as the interactive path does (see
     # _FIREBASE_ENV_KEYS). Against a non-production homeserver these come from

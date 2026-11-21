@@ -25,11 +25,10 @@ exchange endpoint.
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
-from . import framing, timeline, turn_context
+from . import framing, profile_env, timeline, turn_context
 from . import reactive as reactive_mod
 from .adapter import _MAX_MESSAGE_LENGTH, FCMFilamentAdapter
 from .cli import register_cli
@@ -42,6 +41,7 @@ from .deps import (
 from .filament_api import MEDIA_UPLOAD_TOOL, FilamentAPI
 from .media_tool import DOWNLOAD_MEDIA_SCHEMA, make_download_media_handler
 from .observability import bound_context
+from .profile_env import setting
 from .reactive import (
     BUILTIN_BUNDLES,
     FEATURE_ADVANCED_TOOL_CONTROLS,
@@ -283,7 +283,7 @@ def check_requirements() -> bool:
     in ``connect()``; here it surfaces as an actionable warning and the platform
     simply stays down until it is resolved.
     """
-    if not os.environ.get("FILAMENT_MCP_TOKEN"):
+    if not setting("FILAMENT_MCP_TOKEN"):
         logger.debug("filament-fcm: missing env var: FILAMENT_MCP_TOKEN")
         return False
     problem = dep_problem()
@@ -315,14 +315,14 @@ def _env_enablement() -> dict | None:
     proper ``HomeChannel`` on the ``PlatformConfig`` — used by cron
     delivery and ``hermes gateway status``.
     """
-    mcp_token = os.environ.get("FILAMENT_MCP_TOKEN", "").strip()
+    mcp_token = (setting("FILAMENT_MCP_TOKEN") or "").strip()
     if not mcp_token:
         return None
     seed: dict = {
-        "mcp_url": os.environ.get("FILAMENT_MCP_URL", "").strip(),
+        "mcp_url": (setting("FILAMENT_MCP_URL") or "").strip(),
         "mcp_token": mcp_token,
     }
-    home_room = os.environ.get("FILAMENT_HOME_ROOM", "").strip()
+    home_room = (setting("FILAMENT_HOME_ROOM") or "").strip()
     if home_room:
         seed["home_channel"] = {"chat_id": home_room, "name": "Home"}
     return seed
@@ -338,6 +338,19 @@ def interactive_setup() -> None:
     _run_interactive_setup()
 
 
+def _make_adapter(
+    cfg: Any, api: FilamentAPI, server_sync: ServerConfigSync
+) -> FCMFilamentAdapter:
+    """The platform's adapter, talking to the server and token this profile
+    holds now: a multiplexed gateway starts a profile connected after the
+    plugin registered without registering it again."""
+    api.use_credentials(
+        (setting("FILAMENT_MCP_URL") or "").strip() or _DEFAULT_MCP_URL,
+        (setting("FILAMENT_MCP_TOKEN") or "").strip(),
+    )
+    return FCMFilamentAdapter(cfg, filament_api=api, server_sync=server_sync)
+
+
 def register(ctx: Any) -> None:
     """Hermes plugin entry point.  Register the Filament FCM platform.
 
@@ -350,14 +363,20 @@ def register(ctx: Any) -> None:
     ``_resolve_tools``, falling back to the bundled static manifest if the
     server is unreachable.
     """
-    mcp_url = os.environ.get("FILAMENT_MCP_URL", "").strip() or _DEFAULT_MCP_URL
-    mcp_token = os.environ.get("FILAMENT_MCP_TOKEN", "").strip()
+    # First: Hermes scopes this call to the profile being loaded, and nothing
+    # after registration is (see profile_env.py).
+    profile_env.pin()
+    mcp_url = (setting("FILAMENT_MCP_URL") or "").strip() or _DEFAULT_MCP_URL
+    mcp_token = (setting("FILAMENT_MCP_TOKEN") or "").strip()
 
     # Public by default: admit untrusted participants in the loops the agent is
     # in (their messages are framed as data, not commands — see adapter.py).
     # The gateway reads this from the environment, so we default it here; an
     # operator can pin a control-plane-only agent with FILAMENT_ALLOW_DATA_USERS=false.
-    os.environ.setdefault("FILAMENT_ALLOW_DATA_USERS", "true")
+    # A multiplexed gateway reads a non-launch profile's own .env instead,
+    # where setup writes it.
+    if setting("FILAMENT_ALLOW_DATA_USERS") is None:
+        profile_env.set_setting("FILAMENT_ALLOW_DATA_USERS", "true")
 
     # Create the API client early so both the adapter and tool handlers
     # share the same instance.  No network calls here — the session is
@@ -388,9 +407,7 @@ def register(ctx: Any) -> None:
     ctx.register_platform(
         name="filament-fcm",
         label="Filament (FCM)",
-        adapter_factory=lambda cfg: FCMFilamentAdapter(
-            cfg, filament_api=api, server_sync=server_sync
-        ),
+        adapter_factory=lambda cfg: _make_adapter(cfg, api, server_sync),
         check_fn=check_requirements,
         setup_fn=interactive_setup,
         plugin_name=PLUGIN_ID,

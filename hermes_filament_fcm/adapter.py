@@ -41,6 +41,7 @@ from . import (
     framing,
     media_tool,
     poll_transport,
+    profile_env,
     profile_seed,
     slash,
     timeline,
@@ -64,6 +65,7 @@ from .observability import (
     get_logger,
     new_id,
 )
+from .profile_env import setting
 from .reactive import (
     BREADCRUMB_LIMIT,
     FEATURE_ADVANCED_TOOL_CONTROLS,
@@ -147,7 +149,12 @@ def _quiet_gateway_notices(config: Any) -> None:
     ``gateway_restart_notification`` false; ``config`` is that platform's live
     config object. FILAMENT_GATEWAY_NOTICES=true keeps the notices.
     """
-    if os.getenv(GATEWAY_NOTICES_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+    if (setting(GATEWAY_NOTICES_ENV) or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
         return
     if hasattr(config, "gateway_restart_notification"):
         config.gateway_restart_notification = False
@@ -219,17 +226,8 @@ _UNSET: object = object()
 def _hermes_identity_paths() -> tuple[Path, str | None, Path | None]:
     """(HERMES_HOME, active profile id, hermes-agent checkout) for seeding the
     Filament profile. Only the home is required; the rest is best-effort."""
-    try:
-        from hermes_constants import get_hermes_home  # noqa: PLC0415
-
-        home = Path(get_hermes_home())
-    except ImportError:
-        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    profile_name: str | None = None
-    with contextlib.suppress(Exception):
-        from hermes_cli.profiles import get_active_profile_name  # noqa: PLC0415
-
-        profile_name = get_active_profile_name()
+    home = profile_env.hermes_home()
+    profile_name: str | None = profile_env.profile_name()
     root: Path | None = None
     with contextlib.suppress(Exception):
         import hermes_cli  # noqa: PLC0415
@@ -454,7 +452,9 @@ class FCMFilamentAdapter(BasePlatformAdapter):
         # long poll (FILAMENT_TRANSPORT=poll; see poll_transport.py). Read
         # once: switching transports takes a gateway restart.
         self._polling = (
-            poll_transport.transport_from_env(os.environ)
+            poll_transport.transport_from_env(
+                {poll_transport.TRANSPORT_ENV: setting(poll_transport.TRANSPORT_ENV)}
+            )
             == poll_transport.TRANSPORT_POLL
         )
         self._poll_task: asyncio.Task | None = None
@@ -1322,8 +1322,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                     # find no home room). Persisting closes both gaps. An
                     # explicit FILAMENT_HOME_ROOM (operator-set, or our own value
                     # from a prior run) always wins, so this never churns.
-                    if self._cc_room_id and not os.getenv("FILAMENT_HOME_ROOM"):
-                        os.environ["FILAMENT_HOME_ROOM"] = self._cc_room_id
+                    if self._cc_room_id and not setting("FILAMENT_HOME_ROOM"):
+                        profile_env.set_setting("FILAMENT_HOME_ROOM", self._cc_room_id)
                         try:
                             # Lazy + guarded: don't hard-couple the runtime
                             # adapter to the CLI setup module at import time.
@@ -1331,7 +1331,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                                 save_env_value,
                             )
 
-                            save_env_value("FILAMENT_HOME_ROOM", self._cc_room_id)
+                            with profile_env.home_scope():
+                                save_env_value("FILAMENT_HOME_ROOM", self._cc_room_id)
                             logger.info(
                                 "filament-fcm: [Stage 1] home channel set to "
                                 "backchannel %s (persisted to .env)",

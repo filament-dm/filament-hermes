@@ -17,7 +17,6 @@ don't re-nag.
 """
 
 import logging
-import os
 import time
 
 import httpx
@@ -31,6 +30,7 @@ from ._version import (
     version_from_pyproject,
 )
 from .credentials import CredentialStore
+from .profile_env import setting
 
 logger = logging.getLogger("gateway.filament_fcm")
 
@@ -38,7 +38,7 @@ CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 def update_check_disabled() -> bool:
-    return os.environ.get("FILAMENT_DISABLE_UPDATE_CHECK", "").strip().lower() in (
+    return (setting("FILAMENT_DISABLE_UPDATE_CHECK") or "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -67,7 +67,7 @@ async def fetch_latest_version(timeout: float = 10.0) -> str | None:
     Read per call (not at import time) so tests and harnesses can set it
     after the module is loaded.
     """
-    url = os.environ.get("FILAMENT_UPDATE_CHECK_URL") or LATEST_PYPROJECT_URL
+    url = setting("FILAMENT_UPDATE_CHECK_URL") or LATEST_PYPROJECT_URL
     try:
         async with httpx.AsyncClient(
             timeout=timeout,

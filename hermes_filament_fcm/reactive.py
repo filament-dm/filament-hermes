@@ -23,6 +23,11 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import ClassVar
 
+try:
+    from .profile_env import setting
+except ImportError:  # loaded standalone by the tests
+    setting = os.environ.get
+
 # Worklist sentinel: distinguishes "iterator exhausted" from a literal None
 # entry in a (malformed) bundle member list.
 _EXHAUSTED = object()
@@ -570,10 +575,10 @@ def _default_dir() -> Path:
     same preference here keeps instructions and policies beside the identity
     instead of resolving to an empty directory.
     """
-    override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
+    override = setting("FILAMENT_FCM_CREDENTIALS_DIR")
     if override:
         return Path(override)
-    home = os.environ.get("HERMES_HOME")
+    home = setting("HERMES_HOME")
     hermes_home = Path(home) if home else Path.home() / ".hermes"
     state_dir = hermes_home / "filament-fcm"
     legacy = Path.home() / ".hermes" / "filament-fcm"
@@ -592,7 +597,7 @@ def _explicit_path(path: str | os.PathLike | None, env: str) -> Path | None:
     its one-time legacy migration, and a path captured at construction would
     keep pointing at the pre-migration directory after the move.
     """
-    value = path or os.environ.get(env)
+    value = path or setting(env)
     return Path(value) if value else None
 
 
@@ -738,9 +743,7 @@ def write_server_guide_skill(text: str, hermes_home: Path | None = None) -> bool
     Returns True when the skill was written.
     """
     body = (text or "").strip()
-    home = hermes_home or Path(
-        os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")
-    )
+    home = hermes_home or Path(setting("HERMES_HOME") or (Path.home() / ".hermes"))
     skill_dir = home / "skills" / SERVER_GUIDE_SKILL
     skill_file = skill_dir / "SKILL.md"
     if skill_file.exists() and not _is_our_skill(skill_file):

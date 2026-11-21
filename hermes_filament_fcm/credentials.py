@@ -28,6 +28,11 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any
 
+try:
+    from .profile_env import setting
+except ImportError:  # loaded standalone by the tests
+    setting = os.environ.get
+
 logger = logging.getLogger("gateway.filament_fcm")
 
 _STATE_DIR_NAME = "filament-fcm"
@@ -60,10 +65,10 @@ def default_state_dir() -> Path:
     which this module owns and runs first at gateway start via the adapter's
     CredentialStore) — keep them in sync.
     """
-    override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
+    override = setting("FILAMENT_FCM_CREDENTIALS_DIR")
     if override:
         return Path(override)
-    home = os.environ.get("HERMES_HOME")
+    home = setting("HERMES_HOME")
     hermes_home = Path(home) if home else Path.home() / ".hermes"
     state_dir = hermes_home / _STATE_DIR_NAME
     legacy = Path.home() / ".hermes" / _STATE_DIR_NAME
