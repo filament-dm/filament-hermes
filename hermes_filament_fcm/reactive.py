@@ -155,6 +155,46 @@ def sender_is_agent_in_thread(
     return by_sender
 
 
+def message_row_in_thread(thread: object, event_id: str) -> dict | None:
+    """The row for ``event_id`` in a ``get_thread`` payload, or None."""
+    if not isinstance(thread, dict) or not event_id:
+        return None
+    root = thread.get("root")
+    replies = thread.get("replies")
+    rows = ([root] if isinstance(root, dict) else []) + (
+        [m for m in replies if isinstance(m, dict)] if isinstance(replies, list) else []
+    )
+    return next((m for m in rows if m.get("event_id") == event_id), None)
+
+
+def judged_for_agent(row: object, sender_is_agent: bool | None) -> str | None:
+    """Why the server's addressing judgement says a message is for the agent.
+
+    ``row`` is the message as a read tool or ``poll_work`` returns it. The
+    server judges each message in a channel with agents and marks the row for
+    the calling agent: ``is_implicitly_mentioned`` (aimed at it without an
+    @-mention), ``reply_expected`` (wants its answer) and
+    ``consider_forwarding_to_principal`` ("fyi" or "decide").
+
+    Returns "addressed", "forward" or None. The rules mirror the server's own
+    wake gate, so the plugin agrees with it on every transport: a message from
+    another agent counts only when it wants this agent's reply, or when the
+    agent should check with its principal before acting on it. An unknown
+    sender is treated as an agent, as for engaged threads.
+    """
+    if not isinstance(row, dict):
+        return None
+    from_person = sender_is_agent is False
+    if row.get("is_implicitly_mentioned") is True and (
+        from_person or row.get("reply_expected") is True
+    ):
+        return "addressed"
+    hint = row.get("consider_forwarding_to_principal")
+    if hint == "decide" or (hint == "fyi" and from_person):
+        return "forward"
+    return None
+
+
 # Server tools a grant names by another tool's capability, mirroring the
 # server's ``ToolAuth(capability_tool=...)``: the signed-URL download
 # (filament-dm/synapse#1157) is governed by the ``download_media`` grant the
@@ -871,6 +911,7 @@ class WakePolicyStore:
           "reactive_wake": "mention",               # "mention" | "all" | "off"
           "reply_style": "thread",                  # "thread" | "channel"
           "thread_wake": "engaged",                 # "engaged" | "off"
+          "smart_wake": "on",                       # "on" | "off"
           "per_channel": {"<room_id>": {"reactive_wake": "all",
                                          "reply_style": "channel",
                                          "trigger_emojis": [...]}}
@@ -889,6 +930,12 @@ class WakePolicyStore:
     filament-hermes#20), and "non-agent" is checked against the server's
     sender classification, failing closed to "agent" when unknown. Agents
     therefore never wake each other without an explicit @-mention.
+
+    ``smart_wake`` also defaults on: a message the server judged as meant for
+    this agent counts as a mention (see ``judged_for_agent``). That is a
+    per-message verdict from the server, not delivery, and from another agent
+    it requires that a reply is wanted. "off" goes back to @-mentions and
+    engaged threads only.
     """
 
     _DEFAULTS: ClassVar[dict] = {
@@ -896,6 +943,7 @@ class WakePolicyStore:
         "reactive_wake": "mention",
         "reply_style": "thread",
         "thread_wake": "engaged",
+        "smart_wake": "on",
         "per_channel": {},
     }
 
@@ -978,6 +1026,22 @@ class WakePolicyStore:
             room_id,
             style,
             resolved,
+        )
+        return resolved
+
+    def smart_wake(self, room_id: str) -> str:
+        """Whether the server's addressing judgement counts as a mention,
+        resolved per-channel then global.
+
+        "on" (default) — a message the server judged as meant for this agent
+        wakes it without an @-mention. "off" — the judgement is ignored. An
+        unrecognized value fails safe to "off"."""
+        policy = self.read()
+        ch = self._channel(policy, room_id)
+        mode = ch.get("smart_wake", policy.get("smart_wake", "on"))
+        resolved = mode if mode in ("on", "off") else "off"
+        logger.info(
+            "filament-fcm: smart_wake room=%s mode=%s → %s", room_id, mode, resolved
         )
         return resolved
 

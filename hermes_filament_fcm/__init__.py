@@ -824,6 +824,9 @@ def _wake_policy_error(policy: dict) -> str | None:
         tw = scope.get("thread_wake")
         if tw is not None and tw not in ("engaged", "off"):
             return f"thread_wake{where} must be 'engaged' or 'off'."
+        sw = scope.get("smart_wake")
+        if sw is not None and sw not in ("on", "off"):
+            return f"smart_wake{where} must be 'on' or 'off'."
         te = scope.get("trigger_emojis")
         if te is not None and not (
             isinstance(te, list) and all(isinstance(e, str) for e in te)
@@ -1279,7 +1282,10 @@ def _register_reactive_tools(
         "backchannel), thread_wake ('engaged', the default — a non-agent's "
         "reply in a thread you were already @-mentioned in counts as a "
         "mention, so people don't have to re-tag you every turn | 'off' for "
-        "mention-only even there), and optional per_channel overrides keyed "
+        "mention-only even there), smart_wake ('on', the default — a message "
+        "Filament's server judged as meant for you wakes you without an "
+        "@-mention | 'off' to ignore that judgement), and optional "
+        "per_channel overrides keyed "
         "by room id. Backchannel/owner only.",
         {
             "type": "object",

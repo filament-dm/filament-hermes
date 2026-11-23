@@ -88,7 +88,9 @@ from .reactive import (
     history_key,
     is_agent_mention,
     is_system_sender,
+    judged_for_agent,
     keying_and_reply,
+    message_row_in_thread,
     principal_note,
     reply_thread_for_send,
     sender_is_agent_in_thread,
@@ -2766,18 +2768,28 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             and self._wake_policy.thread_wake(msg.room_id) == "engaged"
             and await self._sender_is_agent(msg) is False
         )
-        if not self._wake_policy.should_wake_message(
+        # The server's own reading of who the message is for counts as a
+        # mention too. It is a verdict on this message, never mere delivery.
+        # Consulted only when nothing else admits the message and the channel
+        # is not muted, so a channel on "all" or "off" never pays for the read.
+        judged = None
+        admitted = self._wake_policy.should_wake_message(
             msg.room_id, mentioned or thread_follow_up
-        ):
+        )
+        if not admitted and self._wake_policy.should_wake_message(msg.room_id, True):
+            judged = await self._judged_for_me(msg)
+            admitted = judged is not None
+        if not admitted:
             logger.info(
                 "filament-fcm: skipping message in %s (wake policy: not woken; "
                 "mention=%s, everyone=%s, thread_follow_up=%s, "
-                "reply_to_me=%s)",
+                "reply_to_me=%s, judged=%s)",
                 msg.room_name,
                 mentioned,
                 msg.is_everyone_mention,
                 thread_follow_up,
                 msg.is_reply_to_me,
+                judged,
             )
             slog.info(
                 "filament_fcm.turn.skipped",
@@ -2843,7 +2855,7 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             group_name=msg.loop_name,
             sender=msg.sender,
             sender_name=msg.sender_display_name or msg.sender,
-            trigger="message",
+            trigger=framing.JUDGED_TRIGGER.get(judged, "message"),
             # Always a string (never None) so a message — even an empty/
             # mention-only one — is never mistaken for a reaction in _wake.
             data=data,
@@ -3060,6 +3072,45 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             len(messages),
         )
         return rendered, None, newest
+
+    async def _judged_for_me(self, msg: PushMessage) -> str | None:
+        """Why the server judged this message as meant for the agent
+        ("addressed" or "forward"), or None.
+
+        A poll_work row carries the judgement. A push does not, so the row is
+        read with ``get_thread``, which the server has already judged by the
+        time it pushes. Any failure leaves the agent asleep.
+        """
+        if self._wake_policy.smart_wake(msg.room_id) != "on":
+            return None
+        row = msg.raw.get("poll_work") if isinstance(msg.raw, dict) else None
+        if not isinstance(row, dict):
+            if not self._filament_api:
+                return None
+            try:
+                raw = await self._filament_api.get_thread(msg.thread_id or msg.event_id)
+                row = message_row_in_thread(
+                    FilamentAPI.parse_tool_result(raw), msg.event_id
+                )
+            except Exception:
+                logger.warning(
+                    "filament-fcm: get_thread failed reading the judgement of %s",
+                    msg.event_id,
+                    exc_info=True,
+                )
+                return None
+        if not isinstance(row, dict):
+            return None
+        sender_is_agent = msg.sender_is_agent
+        if sender_is_agent is None and isinstance(row.get("is_from_agent"), bool):
+            sender_is_agent = row["is_from_agent"]
+        verdict = judged_for_agent(row, sender_is_agent)
+        logger.info(
+            "filament-fcm: server judgement of %s for this agent: %s",
+            msg.event_id,
+            verdict,
+        )
+        return verdict
 
     async def _sender_is_agent(self, msg: PushMessage) -> bool | None:
         """Whether the message's sender is an agent (bot) — the storm-guard
