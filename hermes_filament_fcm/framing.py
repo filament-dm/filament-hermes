@@ -590,10 +590,12 @@ _SMART_WAKE_GLOSS = {
 }
 
 # What the wake-up signal's trigger line says for a message admitted on the
-# server's judgement, by ``reactive.judged_for_agent`` verdict.
+# server's judgement, by ``reactive.judged_for_agent`` verdict. It names what
+# to do, since standing instructions saved before these wakes existed treat an
+# unmentioned message as chatter. Each fits within ``sanitize_meta``'s limit.
 JUDGED_TRIGGER = {
-    "addressed": "message (Filament read it as meant for you; no @-mention)",
-    "forward": "message (Filament read it as one your principal would want to see)",
+    "addressed": "message, no @-mention: Filament read it as meant for you, answer it",
+    "forward": "message, not for you: tell your principal with message_principal",
 }
 
 

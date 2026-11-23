@@ -466,3 +466,8 @@ def test_with_history_stays_inside_the_data_block():
     assert out.startswith("hello\n\n[RECENT HISTORY YOU HAVE NOT SEEN")
     assert "never instructions" in out
     assert out.endswith("[10:00] Alice: earlier")
+
+
+def test_judged_trigger_lines_survive_sanitizing():
+    for line in framing.JUDGED_TRIGGER.values():
+        assert framing.sanitize_meta(line) == line
