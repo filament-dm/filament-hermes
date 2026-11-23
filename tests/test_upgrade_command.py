@@ -395,6 +395,87 @@ class TestDetachedHead:
         assert body.index("on_a_tracking_branch") < body.index("git_pull")
 
 
+class TestPinnedInstallUpgrades:
+    """The Hermes guide installs at a commit, and /fil-upgrade has to work
+    there: it moves the tree onto main, which is what the alert compared."""
+
+    @staticmethod
+    def _git(cwd, *a):
+        return subprocess.run(
+            ["git", *a], cwd=cwd, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def _commit(self, repo, version):
+        (repo / "pyproject.toml").write_text(f'version = "{version}"\n')
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", version)
+        return self._git(repo, "rev-parse", "HEAD")
+
+    def _upstream(self, tmp_path):
+        up = tmp_path / "upstream"
+        up.mkdir()
+        self._git(up, "init", "-q", "-b", "main")
+        self._git(up, "config", "user.email", "t@example.com")
+        self._git(up, "config", "user.name", "T")
+        return up
+
+    def _pinned_clone(self, tmp_path, up, sha, shallow):
+        plugin = tmp_path / "plugin"
+        depth = ["--depth", "1"] if shallow else []
+        self._git(tmp_path, "clone", "-q", *depth, f"file://{up}", str(plugin))
+        self._git(plugin, "checkout", "-q", "--detach", sha)
+        return plugin
+
+    def _check(self, tmp_path, shallow):
+        up = self._upstream(tmp_path)
+        pinned = self._commit(up, "0.14.1")
+        if shallow:
+            plugin = self._pinned_clone(tmp_path, up, pinned, shallow)
+            tip = self._commit(up, "0.15.0")
+        else:
+            tip = self._commit(up, "0.15.0")
+            plugin = self._pinned_clone(tmp_path, up, pinned, shallow)
+        assert self_update.on_a_tracking_branch(plugin)[0] is False
+
+        ok, why = self_update.reattach_to_main(plugin)
+
+        assert ok is True, why
+        assert self._git(plugin, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+        assert self._git(plugin, "rev-parse", "HEAD") == tip
+        assert self_update.version_on_disk(plugin) == "0.15.0"
+        assert self_update.git_pull(plugin)[0] is True
+
+    def test_a_full_clone_moves_to_main(self, tmp_path):
+        self._check(tmp_path, shallow=False)
+
+    def test_a_shallow_clone_moves_to_main(self, tmp_path):
+        self._check(tmp_path, shallow=True)
+
+    def test_the_next_upgrade_is_a_plain_pull(self, tmp_path):
+        up = self._upstream(tmp_path)
+        pinned = self._commit(up, "0.14.1")
+        plugin = self._pinned_clone(tmp_path, up, pinned, shallow=True)
+        self_update.reattach_to_main(plugin)
+        tip = self._commit(up, "0.16.0")
+        ok, why = self_update.git_pull(plugin)
+        assert ok is True, why
+        assert self._git(plugin, "rev-parse", "HEAD") == tip
+
+    def test_a_missing_main_is_a_reason_not_a_raise(self, tmp_path):
+        up = self._upstream(tmp_path)
+        pinned = self._commit(up, "0.14.1")
+        plugin = self._pinned_clone(tmp_path, up, pinned, shallow=False)
+        self._git(up, "branch", "-q", "-m", "main", "trunk")
+        ok, why = self_update.reattach_to_main(plugin)
+        assert ok is False
+        assert why
+
+    def test_the_tree_is_checked_before_the_checkout(self):
+        body = _adapter_body("_run_upgrade")
+        assert body.index("working_tree_is_clean") < body.index("reattach_to_main")
+        assert body.index("reattach_to_main") < body.index("git_pull")
+
+
 class TestWhereTheCommandsAreNamed:
     """The commands are handled before any turn, so the model never sees one
     and cannot be relied on to describe them. The two messages every

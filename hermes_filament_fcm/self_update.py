@@ -165,9 +165,8 @@ def on_a_tracking_branch(root: Path | None = None) -> tuple[bool, str]:
     """Whether the tree is on a branch that tracks a remote.
 
     ``FILAMENT_FCM_REF`` accepts a commit as well as a branch, and installing
-    at a commit leaves a detached HEAD. ``git pull`` there fails with "you are
-    not currently on a branch" after printing its whole fetch - naming the
-    situation is far more use to the principal than that.
+    at a commit leaves a detached HEAD, where ``git pull`` cannot work. The
+    upgrade then runs ``reattach_to_main`` first.
     """
     target = root or plugin_root()
     git_exe = _git_executable()
@@ -183,6 +182,58 @@ def on_a_tracking_branch(root: Path | None = None) -> tuple[bool, str]:
             "this plugin is checked out at a fixed commit rather than a "
             "branch, so there is nothing to pull"
         )
+    return True, ""
+
+
+# The branch the update check reads the latest version from (_version.py), so
+# the branch a pinned install moves onto when its principal asks to upgrade.
+UPGRADE_BRANCH = "main"
+
+
+def reattach_to_main(root: Path | None = None) -> tuple[bool, str]:
+    """Move a tree pinned at a commit onto ``main``, tracking ``origin/main``.
+
+    The Hermes guide installs at a fixed commit (``--ref <sha>``) so every new
+    agent gets the same reviewed code, and that leaves a detached HEAD. The
+    update alert compares against ``main``, so ``/fil-upgrade`` asks for
+    ``main``: fetch it, check it out as a local branch that tracks the
+    remote, and the ordinary pull afterwards is a no-op. Later upgrades are
+    plain pulls. Run only on a clean tree, so the checkout rewrites nothing.
+    """
+    target = root or plugin_root()
+    git_exe = _git_executable()
+    if not git_exe:
+        return False, "git is not installed or not on PATH"
+    remote_ref = f"refs/remotes/origin/{UPGRADE_BRANCH}"
+    try:
+        shallow = _git(git_exe, target, "rev-parse", "--is-shallow-repository")
+        depth = ["--depth=1"] if (shallow.stdout or "").strip() == "true" else []
+        # An explicit refspec: a clone made for one ref may not fetch main.
+        steps = (
+            [
+                "fetch",
+                "-q",
+                *depth,
+                "origin",
+                f"+refs/heads/{UPGRADE_BRANCH}:{remote_ref}",
+            ],
+            ["checkout", "-q", "-B", UPGRADE_BRANCH, remote_ref],
+            ["config", f"branch.{UPGRADE_BRANCH}.remote", "origin"],
+            [
+                "config",
+                f"branch.{UPGRADE_BRANCH}.merge",
+                f"refs/heads/{UPGRADE_BRANCH}",
+            ],
+        )
+        for args in steps:
+            result = _git(git_exe, target, *args)
+            if result.returncode != 0:
+                reason = (result.stderr or "").strip() or (result.stdout or "").strip()
+                return False, reason or f"git {args[0]} failed"
+    except subprocess.TimeoutExpired:
+        return False, f"git timed out after {GIT_PULL_TIMEOUT_SECONDS}s"
+    except Exception as exc:  # pragma: no cover — defensive
+        return False, f"git failed to run ({exc})"
     return True, ""
 
 

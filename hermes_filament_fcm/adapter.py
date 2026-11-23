@@ -105,6 +105,7 @@ from .self_update import (
     git_pull,
     is_git_checkout,
     on_a_tracking_branch,
+    reattach_to_main,
     request_gateway_restart,
     version_on_disk,
     working_tree_is_clean,
@@ -2048,9 +2049,19 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             )
             return
 
-        for precondition in (on_a_tracking_branch, working_tree_is_clean):
-            ok, why = await asyncio.to_thread(precondition)
+        ok, why = await asyncio.to_thread(working_tree_is_clean)
+        if not ok:
+            await self._post_backchannel(build_failure_notice(None, why))
+            return
+
+        # A guide install is pinned at a commit (detached HEAD). The principal
+        # asked for the version the alert named, which is main's, so move the
+        # tree onto main first; the pull below then has nothing left to do.
+        on_branch, _ = await asyncio.to_thread(on_a_tracking_branch)
+        if not on_branch:
+            ok, why = await asyncio.to_thread(reattach_to_main)
             if not ok:
+                logger.error("filament-fcm: upgrade reattach to main failed: %s", why)
                 await self._post_backchannel(build_failure_notice(None, why))
                 return
 
