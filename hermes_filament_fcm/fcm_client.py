@@ -23,7 +23,6 @@ The "body" field contains the full PushPayload from the Filament server.
 import asyncio
 import json
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar
 
@@ -36,6 +35,7 @@ from typing import Any, Callable, ClassVar
 # triggers.
 from .credentials import CredentialStore, ReceivedPersistentIds
 from .observability import fingerprint, get_logger, new_id
+from .profile_env import setting
 
 logger = logging.getLogger("gateway.filament_fcm")
 slog = get_logger()
@@ -64,7 +64,7 @@ class _DropHeartbeats(logging.Filter):
 
 _fb_logger = logging.getLogger("firebase_messaging")
 _fb_logger.setLevel(logging.DEBUG)
-if not os.environ.get("FILAMENT_FCM_LOG_HEARTBEAT"):
+if not setting("FILAMENT_FCM_LOG_HEARTBEAT"):
     # On the logger, not the handler, so it applies wherever these records go.
     _fb_logger.addFilter(_DropHeartbeats())
 if not _fb_logger.handlers:
@@ -110,7 +110,7 @@ def _register_retry_sleep(attempt: int) -> float:
 
 
 def _register_attempts() -> int:
-    raw = os.environ.get("FILAMENT_FCM_REGISTER_ATTEMPTS")
+    raw = setting("FILAMENT_FCM_REGISTER_ATTEMPTS")
     if raw:
         try:
             return max(1, int(raw))
@@ -132,13 +132,11 @@ class FCMConfig:
     def from_env(cls) -> "FCMConfig":
         """Read config from environment variables, falling back to defaults."""
         return cls(
-            project_id=os.environ.get("FILAMENT_FIREBASE_PROJECT_ID")
+            project_id=setting("FILAMENT_FIREBASE_PROJECT_ID")
             or _DEFAULT_FIREBASE_PROJECT_ID,
-            app_id=os.environ.get("FILAMENT_FIREBASE_APP_ID")
-            or _DEFAULT_FIREBASE_APP_ID,
-            api_key=os.environ.get("FILAMENT_FIREBASE_API_KEY")
-            or _DEFAULT_FIREBASE_PUB_KEY,
-            sender_id=os.environ.get("FILAMENT_FIREBASE_SENDER_ID")
+            app_id=setting("FILAMENT_FIREBASE_APP_ID") or _DEFAULT_FIREBASE_APP_ID,
+            api_key=setting("FILAMENT_FIREBASE_API_KEY") or _DEFAULT_FIREBASE_PUB_KEY,
+            sender_id=setting("FILAMENT_FIREBASE_SENDER_ID")
             or _DEFAULT_FIREBASE_SENDER_ID,
         )
 

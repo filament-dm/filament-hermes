@@ -42,12 +42,12 @@ without Hermes.
 import asyncio
 import json
 import logging
-import os
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .profile_env import setting
 from .reactive import (
     CapabilityPolicyStore,
     ChannelInstructionsStore,
@@ -167,7 +167,7 @@ def server_config_disabled() -> bool:
     Any of off/false/0/no/disabled counts; unset or anything else leaves the
     sync enabled.
     """
-    value = os.environ.get("FILAMENT_SERVER_CONFIG", "").strip().lower()
+    value = (setting("FILAMENT_SERVER_CONFIG") or "").strip().lower()
     return value in ("off", "false", "0", "no", "disabled")
 
 

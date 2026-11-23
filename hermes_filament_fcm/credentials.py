@@ -28,7 +28,15 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any
 
+try:
+    from .profile_env import setting
+except ImportError:  # loaded standalone by the tests
+    setting = os.environ.get
+
 logger = logging.getLogger("gateway.filament_fcm")
+
+# Read by the Filament desktop app; see save_connection.
+CONNECTION_FILE = "connection.json"
 
 _STATE_DIR_NAME = "filament-fcm"
 
@@ -60,10 +68,10 @@ def default_state_dir() -> Path:
     which this module owns and runs first at gateway start via the adapter's
     CredentialStore) — keep them in sync.
     """
-    override = os.environ.get("FILAMENT_FCM_CREDENTIALS_DIR")
+    override = setting("FILAMENT_FCM_CREDENTIALS_DIR")
     if override:
         return Path(override)
-    home = os.environ.get("HERMES_HOME")
+    home = setting("HERMES_HOME")
     hermes_home = Path(home) if home else Path.home() / ".hermes"
     state_dir = hermes_home / _STATE_DIR_NAME
     legacy = Path.home() / ".hermes" / _STATE_DIR_NAME
@@ -125,6 +133,27 @@ class CredentialStore:
             logger.debug("Wrote %s", path)
         except Exception:
             logger.warning("Failed to write %s", path, exc_info=True)
+
+    def save_connection(
+        self,
+        agent_user_id: str | None,
+        mcp_url: str,
+        token_hash: str,
+        refused: bool = False,
+    ) -> None:
+        """Record which Filament agent this profile is, or that Filament refused
+        its token, for the Filament desktop app's list of Hermes profiles.
+        *token_hash* tells that app whether the token in .env now is the one
+        this record is about."""
+        self._write_json(
+            CONNECTION_FILE,
+            {
+                "agent_id": agent_user_id,
+                "mcp_url": mcp_url,
+                "token_sha256": token_hash,
+                "refused": refused,
+            },
+        )
 
     def load_fcm_credentials(self) -> dict[str, Any] | None:
         """Load saved FCM registration credentials."""

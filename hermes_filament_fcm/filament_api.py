@@ -7,6 +7,7 @@ via the FILAMENT_MCP_TOKEN environment variable.
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import mimetypes
@@ -70,6 +71,25 @@ class FilamentAPI:
         # back to the bundled manifest, which predates the media tools). Read
         # by offers_tool so a per-message choice costs no network call.
         self.server_tools: frozenset[str] = frozenset()
+
+    @property
+    def mcp_url(self) -> str:
+        return self._mcp_url
+
+    @property
+    def token_hash(self) -> str:
+        """The token's SHA-256, hex: names it without giving it away."""
+        return hashlib.sha256(self._mcp_token.encode()).hexdigest()
+
+    def use_credentials(self, mcp_url: str, mcp_token: str) -> None:
+        """Talk to *mcp_url* as *mcp_token* from the next session on: the
+        profile was connected, or reconnected, after the plugin registered."""
+        if (mcp_url, mcp_token) == (self._mcp_url, self._mcp_token):
+            return
+        self._mcp_url = mcp_url
+        self._mcp_token = mcp_token
+        self._session_id = None
+        self._initialized = False
 
     def offers_tool(self, name: str) -> bool:
         """Whether the server's tool list, as registered, includes *name*."""
