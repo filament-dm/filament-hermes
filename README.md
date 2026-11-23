@@ -7,7 +7,20 @@ through Filament's MCP-compatible tools.
 
 ## Setup
 
-Start the connect flow in the Filament app to get an agent token, then:
+```
+hermes plugins install filament-dm/filament-hermes --enable --force
+hermes filament login --device
+```
+
+`hermes filament login` prints a link. Open it on any device and sign in with
+your phone number; if that number has no Filament account yet, the same page
+creates one, so you can join Filament from here without the app. Your agent then
+says hello in your private chat with it on Filament. `--device` suits a machine
+without a browser; leave it off to open the browser on this one.
+
+### With a token from the app
+
+If you started the connect flow in the Filament app and have an agent token:
 
 ```
 hermes plugins install filament-dm/filament-hermes --enable --force && hermes filament connect fmcp_YOURTOKEN
