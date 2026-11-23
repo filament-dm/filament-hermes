@@ -3,10 +3,12 @@
 hermes plugins install filament-dm/filament-hermes --enable --force
 hermes filament connect fmcp_YOURTOKEN
 hermes filament login
+hermes filament restart
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 from typing import Any
 
@@ -87,8 +89,48 @@ def _setup(parser: Any) -> None:
         action="store_true",
         help="save the configuration but leave the gateway alone",
     )
-    # Internal: the second half of a login run from inside the gateway it
-    # has to restart (setup_cli._restart_gateway). Not for owners.
+    restart = sub.add_parser(
+        "restart",
+        help="Restart the Hermes gateway the way this host restarts it",
+        description=(
+            "Restart this profile's gateway: through its s6 slot or service "
+            "when it has one, otherwise by stopping it and starting a new one; "
+            "start one when none is running. Waits for running turns to end "
+            "first and never interrupts one. Run inside the gateway (from an "
+            "agent's terminal), it restarts from outside it once the turn ends."
+        ),
+    )
+    restart.add_argument(
+        "--wait",
+        type=float,
+        default=900,
+        metavar="SECONDS",
+        help="how long to wait for running turns to end (default: 900)",
+    )
+    restart.add_argument(
+        "--ensure",
+        action="store_true",
+        help="only start the gateway when none is running; never restart one",
+    )
+    restart.add_argument(
+        "--grace",
+        type=float,
+        default=20,
+        metavar="SECONDS",
+        help="with --ensure: how long to give a supervisor to bring an exited "
+        "gateway back first (default: 20)",
+    )
+    # Internal: set by the copy that runs outside the gateway.
+    restart.add_argument("--after-pid", type=int, default=None, help=argparse.SUPPRESS)
+    restart.add_argument(
+        "--after-timeout", type=float, default=120, help=argparse.SUPPRESS
+    )
+    restart.add_argument("--settle", type=float, default=0, help=argparse.SUPPRESS)
+    restart.add_argument(
+        "--install-service", action="store_true", help=argparse.SUPPRESS
+    )
+    # Internal, from plugin versions before `restart`: a login started inside
+    # the gateway ran this to restart it from outside.
     handoff = sub.add_parser("gateway-handoff")
     handoff.add_argument("--after-pid", type=int, default=None)
 
@@ -105,12 +147,27 @@ def _handler(args: Any) -> int:
             open_browser=not args.no_open,
             restart=not args.no_restart,
         )
-    if command == "gateway-handoff":
-        from .setup_cli import gateway_handoff  # noqa: PLC0415
+    if command == "restart":
+        from .gateway_restart import run  # noqa: PLC0415
 
-        return gateway_handoff(args.after_pid)
+        return run(
+            after_pid=args.after_pid,
+            after_timeout=args.after_timeout,
+            settle=args.settle,
+            service=args.install_service,
+            only_start=args.ensure,
+            grace_s=args.grace,
+            wait_s=args.wait,
+        )
+    if command == "gateway-handoff":
+        from .gateway_restart import run  # noqa: PLC0415
+
+        return run(after_pid=args.after_pid, settle=20, service=True)
     if command != "connect":
-        print("usage: hermes filament connect <token> | hermes filament login")
+        print(
+            "usage: hermes filament connect <token> | hermes filament login | "
+            "hermes filament restart"
+        )
         return 2
 
     from .setup_cli import connect  # noqa: PLC0415 — keep CLI import off the load path

@@ -6,8 +6,11 @@ Connect it with the agent token from Filament's connect flow:
 hermes filament connect fmcp_YOURTOKEN
 ```
 
-That saves the token and restarts the gateway. If you are still naming your
-agent in the app, run it anyway — it waits, then connects as soon as you finish.
+That saves the token and restarts the gateway (or starts it, when none is
+running). If you are still naming your agent in the app, run it anyway — it
+waits, then connects as soon as you finish. To restart the gateway later, run
+`hermes filament restart`: it works the same on every host and waits for
+running turns to finish.
 
 ## On a shared machine, use `-p`
 

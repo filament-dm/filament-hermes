@@ -461,3 +461,42 @@ def test_version_on_disk_reads_the_tree_not_the_import():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class TestRestartRequest:
+    """``request_gateway_restart`` exits for a supervisor only when one is
+    proven (``gateway_restart.proven_supervisor``). The old guess took any
+    INVOCATION_ID or container for one: a gateway started by hand from a
+    shell under systemd, or one of Agent37's profile gateways, exited for a
+    supervisor that did not exist and stayed down."""
+
+    def _request(self, monkeypatch, supervisor):
+        requested = []
+
+        class Runner:
+            def request_restart(self, *, detached, via_service):
+                requested.append((detached, via_service))
+                return True
+
+        runner = Runner()
+        fake_run = types.ModuleType("gateway.run")
+        fake_run._gateway_runner_ref = lambda: runner
+        monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
+        monkeypatch.setattr(self_update, "proven_supervisor", lambda: supervisor)
+        assert self_update.request_gateway_restart() is True
+        return requested
+
+    def test_with_a_supervisor_the_gateway_exits_for_it(self, monkeypatch):
+        assert self._request(monkeypatch, "systemd") == [(False, True)]
+
+    def test_without_one_it_just_exits_and_the_helper_starts_it(self, monkeypatch):
+        # The adapter leaves `hermes filament restart --ensure` as it stops.
+        assert self._request(monkeypatch, None) == [(False, False)]
+
+    def test_the_old_environment_guess_is_gone(self):
+        assert not hasattr(self_update, "_under_service_manager")
+
+    def test_the_adapter_leaves_the_helper_as_it_stops(self):
+        body = _adapter_body("disconnect")
+        assert "_leave_restart_helper" in body
