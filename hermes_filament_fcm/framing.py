@@ -581,6 +581,24 @@ _THREAD_WAKE_GLOSS = {
 }
 
 
+_SMART_WAKE_GLOSS = {
+    "on": (
+        "a message Filament's server judged as meant for you wakes you "
+        "without an @-mention"
+    ),
+    "off": "the server's judgement of who a message is for never wakes you",
+}
+
+# What the wake-up signal's trigger line says for a message admitted on the
+# server's judgement, by ``reactive.judged_for_agent`` verdict. It names what
+# to do, since standing instructions saved before these wakes existed treat an
+# unmentioned message as chatter. Each fits within ``sanitize_meta``'s limit.
+JUDGED_TRIGGER = {
+    "addressed": "message, no @-mention: Filament read it as meant for you, answer it",
+    "forward": "message, not for you: tell your principal with message_principal",
+}
+
+
 def wake_policy_prompt(policy: dict, set_keys: frozenset) -> str:
     """The control turn's rendering of the live wake policy.
 
@@ -659,6 +677,7 @@ def wake_policy_prompt(policy: dict, set_keys: frozenset) -> str:
         f"- {emoji_line}\n"
         f"- {gloss('reply_style', _REPLY_STYLE_GLOSS, 'thread')}\n"
         f"- {gloss('thread_wake', _THREAD_WAKE_GLOSS, 'engaged')}\n"
+        f"- {gloss('smart_wake', _SMART_WAKE_GLOSS, 'off')}\n"
         f"- {per_line}\n"
         "Your principal changes any of this by asking you here, globally or "
         "per channel (e.g. 'wake on 🐞 reactions in the bug channel', 'reply "

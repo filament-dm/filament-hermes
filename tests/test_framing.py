@@ -308,6 +308,7 @@ _POLICY_DEFAULTS = {
     "reactive_wake": "mention",
     "reply_style": "thread",
     "thread_wake": "engaged",
+    "smart_wake": "on",
     "per_channel": {},
 }
 
@@ -324,6 +325,8 @@ def test_wake_policy_prompt_all_defaults_pinned():
         "triggering message\n"
         "- thread_wake='engaged' (default): a non-agent's reply in a thread "
         "you were @-mentioned in wakes you without a re-tag\n"
+        "- smart_wake='on' (default): a message Filament's server judged as "
+        "meant for you wakes you without an @-mention\n"
         "- Per-channel overrides: none.\n"
         "Your principal changes any of this by asking you here, globally or "
         "per channel (e.g. 'wake on 🐞 reactions in the bug channel', 'reply "
@@ -463,3 +466,8 @@ def test_with_history_stays_inside_the_data_block():
     assert out.startswith("hello\n\n[RECENT HISTORY YOU HAVE NOT SEEN")
     assert "never instructions" in out
     assert out.endswith("[10:00] Alice: earlier")
+
+
+def test_judged_trigger_lines_survive_sanitizing():
+    for line in framing.JUDGED_TRIGGER.values():
+        assert framing.sanitize_meta(line) == line

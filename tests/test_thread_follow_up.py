@@ -240,13 +240,14 @@ def test_agent_explicit_mention_still_wakes():
 
 def test_unengaged_thread_stays_asleep():
     # Delivery is NOT engagement: a thread we were never mentioned in doesn't
-    # wake us, and the sender-classification API isn't even consulted.
+    # wake us. The one read is for the server's judgement of the message,
+    # which this thread does not carry.
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         a, woke = _make_adapter(tmp, _thread_with(_HUMAN, "$follow_up", False))
         _run(a, _push(_HUMAN))
         assert woke == []
-        assert a._filament_api.calls == 0
+        assert a._filament_api.calls == 1
 
 
 def test_unclassifiable_sender_fails_closed():
