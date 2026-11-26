@@ -22,6 +22,7 @@ import functools
 import logging
 import os
 import re
+import socket
 import time
 from collections import deque
 from pathlib import Path
@@ -264,6 +265,52 @@ def _is_not_finalized(result: dict | None) -> bool:
     """True if a tool result is the reserved-but-not-finalized error."""
     err = (result or {}).get("error")
     return isinstance(err, dict) and err.get("code") == _NOT_FINALIZED_CODE
+
+
+# report_runtime is a nicety for the owner and the agents admin, so it gets a
+# short budget: a slow server must not hold up the connect behind it.
+_REPORT_RUNTIME_TIMEOUT_S = 10.0
+
+
+def _short_hostname() -> str | None:
+    """This computer's short name (``hostname -s``), or None when unknown."""
+    try:
+        name = socket.gethostname()
+    except OSError:
+        return None
+    return name.split(".", 1)[0].strip() or None
+
+
+def _runtime_report() -> dict[str, str]:
+    """The ``report_runtime`` arguments: harness, plugin version, machine.
+
+    ``folder`` and ``server`` are left out: they describe a CLI agent's
+    working directory and its MCP server entry, which a Hermes gateway
+    plugin does not have.
+    """
+    report = {"harness": "hermes", "version": PLUGIN_VERSION}
+    machine = _short_hostname()
+    if machine:
+        report["machine"] = machine
+    return report
+
+
+def _tool_failure(result: Any) -> str | None:
+    """Why a tool call failed, or None if it succeeded.
+
+    A refusal comes back two ways: a JSON-RPC ``error`` (unknown tool,
+    invalid arguments, transport) or a result flagged ``isError`` whose
+    first text content says why."""
+    err = FilamentAPI.result_error(result)
+    if err:
+        return err
+    body = result.get("result") if isinstance(result, dict) else None
+    if isinstance(body, dict) and body.get("isError"):
+        content = body.get("content") or []
+        if content and isinstance(content[0], dict):
+            return str(content[0].get("text") or "tool error")
+        return "tool error"
+    return None
 
 
 def _registry_toolset_tools(toolset: str) -> list[str]:
@@ -1383,6 +1430,8 @@ class FCMFilamentAdapter(BasePlatformAdapter):
                 )
                 raise
 
+            await self._report_runtime()
+
             # Auto-accept any pending loop invites so the agent joins rooms
             # it's been invited to while it was offline.
             await self._accept_pending_invites()
@@ -1392,6 +1441,47 @@ class FCMFilamentAdapter(BasePlatformAdapter):
             logger.exception("filament-fcm: [Stage 1] MCP initialization failed")
             slog.exception("filament_fcm.stage.failed", stage="initialize_api")
             return False
+
+    async def _report_runtime(self) -> None:
+        """Tell the server which harness, plugin version and machine this
+        agent runs on, once per connection.
+
+        The owner and the agents admin read it from get_self's ``runtime``,
+        as they do for Claude Code, Codex and OpenClaw agents. Best-effort:
+        any failure, including a server that predates the tool, is logged and
+        startup goes on. No retry; the next connection reports again.
+        """
+        report = _runtime_report()
+        try:
+            with bound_context(call_origin="startup"):
+                result = await asyncio.wait_for(
+                    self._filament_api.report_runtime(report),
+                    timeout=_REPORT_RUNTIME_TIMEOUT_S,
+                )
+        except Exception as exc:
+            logger.warning(
+                "filament-fcm: [Stage 1] could not report runtime: %s",
+                exc or type(exc).__name__,
+            )
+            return
+        # The success result echoes the stored row ({"ok", "runtime"}); it is
+        # exactly what was sent plus a timestamp, so nothing in it is read.
+        failure = _tool_failure(result)
+        if failure and "unknown tool" in failure.lower():
+            logger.info(
+                "filament-fcm: [Stage 1] server has no report_runtime tool; "
+                "not reporting the runtime"
+            )
+        elif failure:
+            logger.warning(
+                "filament-fcm: [Stage 1] report_runtime refused: %s", failure
+            )
+        else:
+            logger.info(
+                "filament-fcm: [Stage 1] reported runtime hermes v%s on %s",
+                report["version"],
+                report.get("machine", "an unnamed machine"),
+            )
 
     async def _accept_pending_invites(self) -> None:
         """Accept all pending loop invites via MCP tools.
