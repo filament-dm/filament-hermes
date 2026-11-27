@@ -448,6 +448,14 @@ class FilamentAPI:
         """Get the authenticated agent's own profile (mxid, display name)."""
         return await self.call_tool("get_self", {})
 
+    async def report_runtime(self, runtime: dict[str, str]) -> dict[str, Any]:
+        """Report where this agent runs (harness, version, machine).
+
+        The server keeps only the latest report and returns it from get_self
+        as ``runtime``. Servers that predate the tool answer "Unknown tool".
+        """
+        return await self.call_tool("report_runtime", runtime)
+
     async def register_push_token(
         self, token: str, platform: str = "android"
     ) -> dict[str, Any]:
