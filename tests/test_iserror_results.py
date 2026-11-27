@@ -39,9 +39,9 @@ FilamentAPI = fa.FilamentAPI
 
 class _Resp:
     status_code = 200
-    headers: dict = {}
 
     def __init__(self, body):
+        self.headers = {}
         self._body = body
         self.text = json.dumps(body)
 

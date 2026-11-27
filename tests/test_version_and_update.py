@@ -265,7 +265,7 @@ def test_async_client_carries_version_headers():
     assert "x-filament-plugin-version" in headers
 
 
-def test_initialize_sends_client_info():
+def test_discover_sends_client_info():
     api = filament_api.FilamentAPI("https://example.test/mcp/agents", "tok")
     posted = []
 
@@ -276,9 +276,11 @@ def test_initialize_sends_client_info():
     api._post = fake_post
     asyncio.run(api.initialize())
 
-    init = posted[0]
-    assert init["method"] == "initialize"
-    client_info = init["params"]["clientInfo"]
+    # initialize() is server/discover under MCP 2026-07-28; _post adds the
+    # per-request _meta carrying clientInfo (see test_mcp_2026_07_28).
+    assert posted[0]["method"] == "server/discover"
+    meta = filament_api.with_request_meta(posted[0])["params"]["_meta"]
+    client_info = meta["io.modelcontextprotocol/clientInfo"]
     assert client_info["name"] == "hermes-filament-fcm"
     assert client_info["version"] == _version.PLUGIN_VERSION
 
@@ -321,7 +323,11 @@ def test_fetch_tools_sends_version(monkeypatch):
     for headers in seen["headers"]:
         assert headers.get("User-Agent", "").startswith("hermes-filament-fcm/")
         assert "X-Filament-Plugin-Version" in headers
-    assert seen["bodies"][0]["params"]["clientInfo"]["name"] == "hermes-filament-fcm"
+    assert [b["method"] for b in seen["bodies"]] == ["tools/list"]
+    meta = seen["bodies"][0]["params"]["_meta"]
+    assert meta["io.modelcontextprotocol/clientInfo"]["name"] == "hermes-filament-fcm"
+    assert seen["headers"][0]["MCP-Protocol-Version"] == "2026-07-28"
+    assert seen["headers"][0]["Mcp-Method"] == "tools/list"
 
 
 def test_adapter_imports_what_the_reminder_delivery_uses():

@@ -356,8 +356,8 @@ def register(ctx: Any) -> None:
 
     Creates a ``FilamentAPI`` instance and passes it to both the adapter
     factory and the tool handler closures.  The adapter calls
-    ``api.initialize()`` during ``connect()`` to establish the MCP
-    session; until then, tool handlers return "not connected."
+    ``api.initialize()`` (MCP ``server/discover``) during ``connect()``;
+    until then, tool handlers return "not connected."
 
     The tool list is fetched from the MCP server (``tools/list``) via
     ``_resolve_tools``, falling back to the bundled static manifest if the

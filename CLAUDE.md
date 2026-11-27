@@ -36,7 +36,7 @@ The package imports `gateway.*`, `agent.*`, and `hermes_cli.*` from hermes-agent
 
 `__init__.py` — Hermes plugin entry point (`register()` via the `hermes_agent.plugins` entry point). Registers the platform adapter plus every Filament MCP tool as a Hermes tool. The tool list is fetched live from the MCP server, falling back to the bundled `tool_manifest.json` (regenerate with `filament mcp dump-tools`). `BLOCKED_TOOLS` documents tools deliberately hidden from the LLM — keep the "why" comments. Also registers the control-plane-only reactive tools (`set_instructions`/`get_instructions`/`set_wake_policy`/`get_wake_policy`, plus `set_capabilities`/`get_capabilities` and `set_feature`/`get_features`), and installs the data-plane capability gate as a `pre_tool_call` hook (`_register_capability_gate`). The whole capability surface is gated behind the `advanced_tool_controls` **feature flag (default OFF)** — the hook is always registered but stays inert until the flag is on (see below).
 
-`adapter.py` — `FCMFilamentAdapter`, the platform adapter. Startup is staged in `connect()`: initialize MCP session → FCM checkin/registration → register the FCM token as a pusher with Filament → open the persistent MCS listener. Handles pushes, invites (auto-accepted — membership is not a security boundary), and emoji reactions. The agent's own reactions are never wake triggers or it would re-wake itself forever.
+`adapter.py` — `FCMFilamentAdapter`, the platform adapter. Startup is staged in `connect()`: discover the MCP server (`server/discover`) → FCM checkin/registration → register the FCM token as a pusher with Filament → open the persistent MCS listener. Handles pushes, invites (auto-accepted — membership is not a security boundary), and emoji reactions. The agent's own reactions are never wake triggers or it would re-wake itself forever.
 
 After the first-contact hello lands (the model's or the canned one), the adapter runs the look-around once (`_look_around`): one model turn in its own side session (`framing.LOOK_AROUND_THREAD`, prompt `framing.look_around_prompt`, the step every Filament agent guide carries) whose reply `send()` posts to the backchannel's main timeline, with a status line while it runs. It hangs off the hello, which the server asks for once per agent, so a restart, reconnect or update never triggers it; `look_around.json` in the state dir records the agents that have had theirs and is claimed before dispatch, so it runs at most once per agent and a failed one is not retried. Every failure is silent, and a reply that does not open with `framing.LOOK_AROUND_OPENING` is dropped. Tests: `tests/test_look_around.py`.
 
@@ -85,14 +85,18 @@ Load-bearing invariants:
 ## Reading server payloads
 
 Account for the whole payload. When code reads a response the server sends — the
-MCP `initialize` result, a push branch, a tool result, the config document —
+MCP `server/discover` result, a push branch, a tool result, the config document —
 every field is either consumed or named as deliberately ignored. A value read
 only for a substring or boolean test is a discard: say in a comment what else is
-in it and why that part is dropped. This is not style. The `initialize` response
+in it and why that part is dropped. This is not style. The discovery response
 carries the server's own explanation of Filament plus the link/mention authoring
 guide, and it was read for one substring and thrown away, so agents never learned
 to write `[Name](channel:!id:server)` and asked principals to paste raw ids
 instead.
+
+## MCP protocol version
+
+The plugin speaks MCP **2026-07-28** (stateless) to Filament: no `initialize` or session; every request carries `params._meta` (protocol version, client capabilities, clientInfo) and the `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers, and `FilamentAPI.initialize()` sends `server/discover`. A known tool's failure arrives as an `isError` result; `_post` turns plain-text ones into `{"error": {code, message}}`, taking the code from `result._meta["dm.filament/errorCode"]`. Filament's own codes are out of the reserved range in this version (-31001 auth, -31002 not set up, -31003..-31006 policy, -31007 throttle); match on `NOT_SET_UP_CODES` / `AUTH_REQUIRED_CODES`, which also hold the older -3200x codes. Client bumps go straight to the newest spec version, never an intermediate one.
 
 ## Server-side agent config sync (`server_config.py`)
 
@@ -110,4 +114,4 @@ The server holds one revisioned config document per agent on bearer-authenticate
 
 ## Versioning
 
-Every HTTP request to the Filament server carries the installed plugin version (`User-Agent` + `X-Filament-Plugin-Version` headers set client-wide in `filament_api.py`, plus MCP `clientInfo` on `initialize`) so the server can tell what version deployed agents run. `_version.py` owns the helpers (stdlib-only). Installs come from git main. **Only bump `version` when a required update is intended; ordinary user-visible changes do not require a version bump.** `update_check.py` compares the installed version against pyproject.toml on main daily and reminds the principal (once per version, via backchannel) to update.
+Every HTTP request to the Filament server carries the installed plugin version (`User-Agent` + `X-Filament-Plugin-Version` headers set client-wide in `filament_api.py`, plus MCP `clientInfo` in every request's `_meta`) so the server can tell what version deployed agents run. `_version.py` owns the helpers (stdlib-only). Installs come from git main. **Only bump `version` when a required update is intended; ordinary user-visible changes do not require a version bump.** `update_check.py` compares the installed version against pyproject.toml on main daily and reminds the principal (once per version, via backchannel) to update.

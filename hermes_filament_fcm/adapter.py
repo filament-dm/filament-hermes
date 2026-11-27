@@ -57,7 +57,7 @@ from .fcm_client import (
     ReactionMessage,
     VouchMessage,
 )
-from .filament_api import FilamentAPI
+from .filament_api import NOT_SET_UP_CODES, FilamentAPI
 from .observability import (
     bound_context,
     current_context,
@@ -211,10 +211,6 @@ _ROOM_INFO_TTL_S = 300.0
 _PROBE_REQUEST_INTERVAL_S = 600
 
 
-# ENG-429: the JSON-RPC error code agents_mcp returns while an agent is reserved
-# but not finalized (connect token valid, account not created yet).
-_NOT_FINALIZED_CODE = -32002
-
 # accept_vouch retry budget. A vouch that fails to be accepted leaves the loop
 # admin with nothing to approve, so a blip is worth riding out; the waits are
 # linear (2s, 4s) to stay well inside a connect attempt.
@@ -262,8 +258,11 @@ def _read_text(path: Path) -> str | None:
 
 def _is_not_finalized(result: dict | None) -> bool:
     """True if a tool result is the reserved-but-not-finalized error."""
+    # ENG-429: agents_mcp's code while an agent is reserved but not finalized
+    # (-32002, or -31002 under MCP 2026-07-28; an isError result keeps it in
+    # _meta, which FilamentAPI._post moves into ``error.code``).
     err = (result or {}).get("error")
-    return isinstance(err, dict) and err.get("code") == _NOT_FINALIZED_CODE
+    return isinstance(err, dict) and err.get("code") in NOT_SET_UP_CODES
 
 
 def _registry_toolset_tools(toolset: str) -> list[str]:

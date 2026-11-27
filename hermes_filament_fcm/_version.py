@@ -2,7 +2,7 @@
 
 The installed version is attached to every HTTP request the plugin makes to
 the Filament server — as a ``User-Agent`` / ``X-Filament-Plugin-Version``
-header pair plus the MCP ``clientInfo`` on ``initialize`` — so the server can
+header pair plus the MCP ``clientInfo`` in every request's ``_meta`` — so the server can
 tell what version deployed agents are running. ``update_check.py`` builds the
 update-available reminder on the same helpers.
 

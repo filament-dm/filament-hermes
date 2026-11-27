@@ -35,7 +35,7 @@ from hermes_cli.setup import (
     save_env_value,
 )
 
-from .filament_api import FilamentAPI
+from .filament_api import AUTH_REQUIRED_CODES, NOT_SET_UP_CODES, FilamentAPI
 
 # PyYAML on the venv-layout Hermes every existing host runs. Hermes on its newer
 # pm-managed layout no longer ships PyYAML and routes all YAML through its own
@@ -278,11 +278,6 @@ def seed_display_defaults(*, announce: bool = True) -> list[str]:
     ]
 
 
-# JSON-RPC codes from the agents MCP. -32002: token valid but the account
-# doesn't exist yet ("reserved" — the principal hasn't finished the connect
-# flow). Anything else (e.g. -32001) means the token isn't usable.
-_RESERVED_CODE = -32002
-
 # How long to keep trying an endpoint that never answers before giving up.
 # Generous, because a laptop waking from sleep or a VPN reconnecting can take
 # tens of seconds and neither means the URL is wrong.
@@ -301,15 +296,14 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
     - ``(False, None)`` when the token is definitively rejected (auth
       error) or the user pressed Ctrl+C.
 
-    While the agent is reserved, ``get_self`` returns -32002; we nudge once and
+    While the agent is reserved, ``get_self`` returns -31002 (-32002 from
+    servers older than MCP 2026-07-28); we nudge once and
     keep polling, unbounded, because that wait is paced by a human naming the
     agent in the app. Being unreachable is bounded at ``UNREACHABLE_BUDGET_S``
     instead — a bad URL never resolves itself. Any reply resets that budget. An
-    endpoint that answers but errs is retried forever; only -32001 aborts.
+    endpoint that answers but errs is retried forever; only -31001 (-32001)
+    aborts: it alone means the token itself is bad.
     """
-    # Only this specific error code means the token itself is bad and
-    # retrying won't help. Everything else is transient or reserved.
-    _AUTH_REQUIRED_CODE = -32001
 
     async def _poll() -> tuple[bool, str | None]:
         api = FilamentAPI(url, token)
@@ -375,7 +369,7 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
                     continue
 
                 code = err.get("code")
-                if code == _RESERVED_CODE:
+                if code in NOT_SET_UP_CODES:
                     if not nudged:
                         print_info(
                             "This agent isn't finished setting up yet — please "
@@ -386,7 +380,7 @@ def _wait_for_finalization(token: str, url: str) -> tuple[bool, str | None]:
                         nudged = True
                     await asyncio.sleep(3)
                     continue
-                if code == _AUTH_REQUIRED_CODE:
+                if code in AUTH_REQUIRED_CODES:
                     print_warning(
                         "The server rejected this token. Reconnect in the "
                         "Filament app to get a fresh one, then re-run setup."

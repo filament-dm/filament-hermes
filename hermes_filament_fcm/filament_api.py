@@ -6,6 +6,7 @@ via the FILAMENT_MCP_TOKEN environment variable.
 """
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -23,14 +24,64 @@ from .observability import Stopwatch, current_context, get_logger
 logger = logging.getLogger("gateway.filament_fcm")
 slog = get_logger()
 
-# Standard MCP initialize params. clientInfo tells the server exactly what
-# plugin version this agent runs (the same version also rides on every
-# request as User-Agent / X-Filament-Plugin-Version — see version_headers).
-_INITIALIZE_PARAMS: dict[str, Any] = {
-    "protocolVersion": "2025-03-26",
-    "capabilities": {},
-    "clientInfo": {"name": DIST_NAME, "version": PLUGIN_VERSION},
-}
+# MCP 2026-07-28 is stateless: no initialize handshake and no session. Every
+# request carries the protocol version, client capabilities and clientInfo in
+# params._meta, and mirrors its routing in the MCP-Protocol-Version, Mcp-Method
+# and Mcp-Name headers. clientInfo tells the server exactly what plugin
+# version this agent runs (also sent as User-Agent / X-Filament-Plugin-Version).
+PROTOCOL_VERSION = "2026-07-28"
+_META_PREFIX = "io.modelcontextprotocol/"
+_CLIENT_INFO: dict[str, str] = {"name": DIST_NAME, "version": PLUGIN_VERSION}
+
+# An isError tool result keeps the JSON-RPC code its failure would have had.
+TOOL_ERROR_CODE_META = "dm.filament/errorCode"
+# Filament's own codes. 2026-07-28 moves them out of the JSON-RPC reserved
+# range (-32002 -> -31002 and so on); older servers send the old ones.
+NOT_SET_UP_CODES = frozenset({-32002, -31002})
+AUTH_REQUIRED_CODES = frozenset({-32001, -31001})
+
+
+def request_meta() -> dict[str, Any]:
+    """The ``params._meta`` every 2026-07-28 request carries."""
+    return {
+        _META_PREFIX + "protocolVersion": PROTOCOL_VERSION,
+        _META_PREFIX + "clientCapabilities": {},
+        _META_PREFIX + "clientInfo": dict(_CLIENT_INFO),
+    }
+
+
+def _encode_header_value(value: str) -> str:
+    """A header-safe value: Base64-wrapped when not plain printable ASCII."""
+    if (
+        value != value.strip()
+        or any((ord(c) < 32 and c != "\t") or ord(c) > 126 for c in value)
+        or (value.startswith("=?base64?") and value.endswith("?="))
+    ):
+        return "=?base64?" + base64.b64encode(value.encode()).decode() + "?="
+    return value
+
+
+def with_request_meta(body: dict) -> dict:
+    """*body* with this client's ``_meta`` merged into its params."""
+    params = body.get("params")
+    params = dict(params) if isinstance(params, dict) else {}
+    meta = params.get("_meta")
+    params["_meta"] = {**request_meta(), **(meta if isinstance(meta, dict) else {})}
+    return {**body, "params": params}
+
+
+def mcp_headers(body: dict) -> dict[str, str]:
+    """The 2026-07-28 routing headers for a JSON-RPC *body*."""
+    headers = {"MCP-Protocol-Version": PROTOCOL_VERSION}
+    method = body.get("method")
+    if isinstance(method, str):
+        headers["Mcp-Method"] = method
+    params = body.get("params")
+    name = params.get("name") if isinstance(params, dict) else None
+    if method == "tools/call" and isinstance(name, str):
+        headers["Mcp-Name"] = _encode_header_value(name)
+    return headers
+
 
 # The signed-URL media tools (filament-dm/synapse#1157). A server that offers
 # them gets media moved through them; one that doesn't gets the bearer
@@ -51,7 +102,6 @@ class FilamentAPI:
     def __init__(self, mcp_url: str, mcp_token: str) -> None:
         self._mcp_url = mcp_url
         self._mcp_token = mcp_token
-        self._session_id: str | None = None
         self._initialized = False
         self._next_id = 1
         # The httpx client is created lazily and bound to the event loop that
@@ -88,7 +138,6 @@ class FilamentAPI:
             return
         self._mcp_url = mcp_url
         self._mcp_token = mcp_token
-        self._session_id = None
         self._initialized = False
 
     def offers_tool(self, name: str) -> bool:
@@ -175,52 +224,35 @@ class FilamentAPI:
         )
 
     async def initialize(self) -> dict[str, Any]:
-        """Perform the MCP initialize handshake."""
+        """Discover the server (``server/discover``, MCP 2026-07-28).
+
+        Stateless MCP has no handshake; discovery stands in for it. Its result
+        carries ``instructions`` (the server explaining Filament; see
+        adapter._initialize_api), ``supportedVersions`` and ``capabilities``,
+        which this client does not act on: it only speaks 2026-07-28.
+        """
         result = await self._post(
             {
                 "jsonrpc": "2.0",
                 "id": self._next_rpc_id(),
-                "method": "initialize",
-                "params": _INITIALIZE_PARAMS,
-            }
-        )
-
-        # Only latch initialized on a successful handshake — otherwise a failed
-        # initialize (error/non-200) would set is_connected True permanently and
-        # subsequent calls would skip re-initialization on a dead session.
-        if not (isinstance(result, dict) and isinstance(result.get("result"), dict)):
-            logger.warning("filament-fcm: MCP initialize did not succeed: %s", result)
-            return result
-
-        # Session ID may come from header or body.
-        if self._session_id is None:
-            sid = result.get("result", {}).get("_sessionId")
-            if sid:
-                self._session_id = sid
-
-        # Send initialized notification.
-        await self._post(
-            {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
+                "method": "server/discover",
                 "params": {},
             }
         )
-
+        # Only latch on a successful discovery, or a failed one would leave
+        # is_connected True and later calls would never retry it.
+        if not (isinstance(result, dict) and isinstance(result.get("result"), dict)):
+            logger.warning(
+                "filament-fcm: MCP server/discover did not succeed: %s", result
+            )
+            return result
         self._initialized = True
-        logger.info("MCP session initialized (session_id=%s)", self._session_id)
+        logger.info("MCP server discovered (protocol %s)", PROTOCOL_VERSION)
         return result
 
     @property
     def is_connected(self) -> bool:
-        """Whether the MCP initialize handshake has completed.
-
-        Keyed on the handshake itself, not ``_session_id``: the Filament agents
-        endpoint doesn't hand out a session id, so keying on it left
-        ``is_connected`` permanently False and re-ran ``initialize()`` before
-        every tool call. The session id is still captured and sent when the
-        server does provide one (see ``_post`` / ``initialize``).
-        """
+        """Whether ``server/discover`` (``initialize()``) has succeeded."""
         return self._initialized
 
     @staticmethod
@@ -272,8 +304,8 @@ class FilamentAPI:
     def fetch_tools(
         cls, mcp_url: str, mcp_token: str, timeout: float = 15.0
     ) -> list[dict[str, Any]]:
-        """Synchronously fetch the MCP tool list (``initialize`` +
-        ``tools/list``).
+        """Synchronously fetch the MCP tool list (``tools/list``; stateless
+        2026-07-28 needs no handshake first).
 
         Used at plugin-registration time, where there is no event loop and
         we need the tool list before the async adapter session exists. Uses
@@ -289,50 +321,14 @@ class FilamentAPI:
             "Accept": "application/json, text/event-stream",
             **version_headers(),
         }
+        body = with_request_meta(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
         with httpx.Client(timeout=timeout) as client:
-            init_resp = client.post(
-                mcp_url,
-                headers=headers,
-                content=json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "initialize",
-                        "params": _INITIALIZE_PARAMS,
-                    }
-                ),
-            )
-            init_resp.raise_for_status()
-            # Session ID may come from the header or the JSON body — match
-            # the async initialize() path, which checks both.
-            session_id = init_resp.headers.get("mcp-session-id")
-            if not session_id:
-                try:
-                    session_id = init_resp.json().get("result", {}).get("_sessionId")
-                except Exception:
-                    session_id = None
-            if session_id:
-                headers["Mcp-Session-Id"] = session_id
-
-            # Notify the server the session is ready (no response expected).
-            client.post(
-                mcp_url,
-                headers=headers,
-                content=json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "method": "notifications/initialized",
-                        "params": {},
-                    }
-                ),
-            )
-
             list_resp = client.post(
                 mcp_url,
-                headers=headers,
-                content=json.dumps(
-                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-                ),
+                headers={**headers, **mcp_headers(body)},
+                content=json.dumps(body),
             )
             list_resp.raise_for_status()
             data = list_resp.json()
@@ -974,13 +970,13 @@ class FilamentAPI:
         params = body.get("params") if isinstance(body.get("params"), dict) else {}
         tool_name = params.get("name") if method == "tools/call" else None
         rpc_id = body.get("id")
+        body = with_request_meta(body)
         headers = {
             "Authorization": f"Bearer {self._mcp_token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            **mcp_headers(body),
         }
-        if self._session_id:
-            headers["Mcp-Session-Id"] = self._session_id
 
         timer = Stopwatch.start()
         slog.debug(
@@ -988,7 +984,6 @@ class FilamentAPI:
             rpc_id=rpc_id,
             method=method,
             tool_name=tool_name,
-            has_session_id=bool(self._session_id),
         )
         resp = await (client or self._client_for_loop()).post(
             self._mcp_url,
@@ -997,12 +992,7 @@ class FilamentAPI:
         )
         duration_ms = timer.elapsed_ms()
 
-        # Capture session ID from response header.
-        sid = resp.headers.get("mcp-session-id")
-        if sid:
-            self._session_id = sid
-
-        # 202 (MCP 2025-03-26) and 204 (MCP 2024-11-05) both indicate
+        # 202 (MCP 2025-03-26 on) and 204 (MCP 2024-11-05) both indicate
         # a notification was accepted — no response body expected.
         if resp.status_code in (202, 204):
             slog.debug(
@@ -1082,12 +1072,14 @@ class FilamentAPI:
         From MCP 2025-11-25 (SEP-1303) the server reports a known tool's
         failure as a result with ``isError: true`` and the message as text,
         where older protocol versions get a JSON-RPC error. Callers read
-        ``error`` (result_error), so the message is moved there, under
-        ``-32000``. A result whose text is a JSON object with an ``error`` key
-        is a tool turning the call down in-band; those exist in every version
-        and callers already read them from the parsed result, so they are
-        returned unchanged."""
-        content = parsed["result"].get("content")
+        ``error`` (result_error), so the message is moved there, under the
+        code the server kept in ``_meta`` (TOOL_ERROR_CODE_META, e.g. -31002
+        "not set up yet"), else ``-32000``. A result whose text is a JSON
+        object with an ``error`` key is a tool turning the call down in-band;
+        those exist in every version and callers already read them from the
+        parsed result, so they are returned unchanged."""
+        result = parsed["result"]
+        content = result.get("content")
         texts = [
             c["text"]
             for c in (content if isinstance(content, list) else [])
@@ -1099,8 +1091,13 @@ class FilamentAPI:
                 if isinstance(inner, dict) and "error" in inner:
                     return parsed
         message = "\n".join(t for t in texts if t) or f"{tool_name or 'tool'} failed"
+        # The rest of _meta (serverInfo) describes the server, not the failure.
+        meta = result.get("_meta")
+        code = meta.get(TOOL_ERROR_CODE_META) if isinstance(meta, dict) else None
+        if not isinstance(code, int) or isinstance(code, bool):
+            code = -32000
         return {
             "jsonrpc": parsed.get("jsonrpc", "2.0"),
             "id": parsed.get("id", rpc_id),
-            "error": {"code": -32000, "message": message, "data": {"isError": True}},
+            "error": {"code": code, "message": message, "data": {"isError": True}},
         }
