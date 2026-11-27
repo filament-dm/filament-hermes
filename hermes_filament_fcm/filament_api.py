@@ -1043,14 +1043,19 @@ class FilamentAPI:
                 error="invalid_json",
             )
             return {"error": "invalid response"}
+        tool_is_error = method == "tools/call" and self._is_error_result(parsed)
+        if tool_is_error:
+            parsed = self._tool_error_as_rpc_error(parsed, rpc_id, tool_name)
         error = parsed.get("error") if isinstance(parsed, dict) else None
         error_code = error.get("code") if isinstance(error, dict) else None
+        failed = error_code is not None or tool_is_error
         event = (
             "filament_fcm.mcp.request.error"
-            if error_code is not None
+            if failed
             else "filament_fcm.mcp.request.complete"
         )
-        log = slog.warning if error_code is not None else slog.debug
+        log = slog.warning if failed else slog.debug
+        extra = {"tool_is_error": True} if tool_is_error else {}
         log(
             event,
             rpc_id=rpc_id,
@@ -1059,5 +1064,43 @@ class FilamentAPI:
             http_status=resp.status_code,
             jsonrpc_error_code=error_code,
             duration_ms=duration_ms,
+            **extra,
         )
         return parsed
+
+    @staticmethod
+    def _is_error_result(parsed: Any) -> bool:
+        result = parsed.get("result") if isinstance(parsed, dict) else None
+        return isinstance(result, dict) and result.get("isError") is True
+
+    @staticmethod
+    def _tool_error_as_rpc_error(
+        parsed: dict[str, Any], rpc_id: Any, tool_name: str | None
+    ) -> dict[str, Any]:
+        """An ``isError`` tools/call result in the JSON-RPC error shape.
+
+        From MCP 2025-11-25 (SEP-1303) the server reports a known tool's
+        failure as a result with ``isError: true`` and the message as text,
+        where older protocol versions get a JSON-RPC error. Callers read
+        ``error`` (result_error), so the message is moved there, under
+        ``-32000``. A result whose text is a JSON object with an ``error`` key
+        is a tool turning the call down in-band; those exist in every version
+        and callers already read them from the parsed result, so they are
+        returned unchanged."""
+        content = parsed["result"].get("content")
+        texts = [
+            c["text"]
+            for c in (content if isinstance(content, list) else [])
+            if isinstance(c, dict) and isinstance(c.get("text"), str)
+        ]
+        if len(texts) == 1:
+            with contextlib.suppress(ValueError, TypeError, RecursionError):
+                inner = json.loads(texts[0])
+                if isinstance(inner, dict) and "error" in inner:
+                    return parsed
+        message = "\n".join(t for t in texts if t) or f"{tool_name or 'tool'} failed"
+        return {
+            "jsonrpc": parsed.get("jsonrpc", "2.0"),
+            "id": parsed.get("id", rpc_id),
+            "error": {"code": -32000, "message": message, "data": {"isError": True}},
+        }
